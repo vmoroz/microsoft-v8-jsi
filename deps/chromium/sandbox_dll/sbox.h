@@ -58,6 +58,9 @@ typedef struct SboxPolicy {
   const wchar_t* app_container_sid;  // stable AppContainer profile name
   const wchar_t* const* capabilities;  // capability SID strings
   size_t capability_count;
+  // Test-only; honored only when sbox.dll is built with SBOX_ENABLE_TEST_HOOKS
+  // (a no-op in production). 1 = relax the inherited MS-signed-only enforcement.
+  int32_t allow_unsigned;
 } SboxPolicy;
 
 // Bootstrap struct: the target EXE exports an instance named `g_sbox_bootstrap`;

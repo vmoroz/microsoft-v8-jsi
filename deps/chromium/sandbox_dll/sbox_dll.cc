@@ -383,6 +383,21 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
 
   std::unique_ptr<sandbox::TargetPolicy> sb_policy = broker->CreatePolicy();
   sandbox::TargetConfig* config = sb_policy->GetConfig();
+#if defined(SBOX_ENABLE_TEST_HOOKS)
+  // Test-only (compile-gated): policy->allow_unsigned relaxes the inherited
+  // MS-signed-only enforcement so an unsigned local build can load.
+  if (policy->allow_unsigned) {
+    ::OutputDebugStringA("[sbox][broker] unsigned override active\n");
+    const sandbox::ResultCode mitigation_rc = config->SetProcessMitigations(
+        config->GetProcessMitigations() |
+        sandbox::MITIGATION_ALLOW_UNSIGNED_BINARIES);
+    if (mitigation_rc != sandbox::SBOX_ALL_OK) {
+      printf("[broker] unsigned test policy failed: rc=%d\n", mitigation_rc);
+      return nullptr;
+    }
+    printf("[broker] WARNING: unsigned binaries allowed for this test target\n");
+  }
+#endif  // defined(SBOX_ENABLE_TEST_HOOKS)
   if (config->SetTokenLevel(MapToken(policy->initial_token),
                             MapToken(policy->lockdown_token)) !=
           sandbox::SBOX_ALL_OK ||

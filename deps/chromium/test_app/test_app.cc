@@ -160,9 +160,12 @@ int main() {
   policy.app_container_sid = L"Microsoft.V8Jsi.Sandbox.TestApp";
   policy.capabilities = use_lpac ? kTestCapabilities : nullptr;
   policy.capability_count = use_lpac ? std::size(kTestCapabilities) : 0;
-    printf("[test_app] tier = %s, token = %s\n",
-      trusted ? "Trusted (JIT, ACG off)" : "Untrusted (jitless + ACG)",
-      use_lpac ? "LPAC" : "restricted");
+  // Test harness: mirror the CheckTrust opt-in into the ABI flag so a hooks-on
+  // sbox.dll allows the unsigned local trio (a default build ignores it).
+  policy.allow_unsigned = allow_unsigned ? 1 : 0;
+  printf("[test_app] tier = %s, token = %s\n",
+         trusted ? "Trusted (JIT, ACG off)" : "Untrusted (jitless + ACG)",
+         use_lpac ? "LPAC" : "restricted");
 
   const std::wstring target = TargetExeBesideUs(L"v8host.exe");
   printf("[test_app] test_app.exe -> sbox_broker_run\n");
