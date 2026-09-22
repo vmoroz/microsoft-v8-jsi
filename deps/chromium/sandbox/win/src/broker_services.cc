@@ -5,10 +5,8 @@
 #include "sandbox/win/src/broker_services.h"
 
 #include <stddef.h>
-#include <tlhelp32.h>
 
 #include <algorithm>
-#include <cstdio>
 #include <optional>
 #include <utility>
 
@@ -35,57 +33,6 @@
 namespace sandbox {
 
 namespace {
-
-// Opt-in reparenting of the sandboxed target. When SBOX_REPARENT_TO_SHELL=1,
-// the broker creates the child with the interactive shell (explorer.exe) as its
-// creation parent instead of the host process, so the child is not born inside
-// the host's process-creation context. The child still receives the lockdown
-// token, integrity level, ACG, sandbox job, and broker file policy configured
-// elsewhere; only the recorded creation parent changes.
-bool ReparentToShellEnabled() {
-  wchar_t value[2] = {};
-  return ::GetEnvironmentVariableW(L"SBOX_REPARENT_TO_SHELL", value, 2) == 1 &&
-         value[0] == L'1';
-}
-
-// Opens the interactive shell process (explorer.exe) in the caller's session
-// with PROCESS_CREATE_PROCESS rights, or returns nullptr if none can be opened.
-// The caller takes ownership of the returned handle.
-HANDLE OpenShellProcessForReparent() {
-  DWORD our_session = 0;
-  if (!::ProcessIdToSessionId(::GetCurrentProcessId(), &our_session))
-    return nullptr;
-
-  HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-  if (snapshot == INVALID_HANDLE_VALUE)
-    return nullptr;
-
-  HANDLE parent = nullptr;
-  PROCESSENTRY32W entry = {};
-  entry.dwSize = sizeof(entry);
-  if (::Process32FirstW(snapshot, &entry)) {
-    do {
-      if (::CompareStringOrdinal(entry.szExeFile, -1, L"explorer.exe", -1,
-                                 TRUE) != CSTR_EQUAL) {
-        continue;
-      }
-      DWORD session = 0;
-      if (!::ProcessIdToSessionId(entry.th32ProcessID, &session) ||
-          session != our_session) {
-        continue;
-      }
-      // PROCESS_CREATE_PROCESS is required for the parent attribute;
-      // PROCESS_QUERY_LIMITED_INFORMATION lets the broker log the chosen PID.
-      parent = ::OpenProcess(
-          PROCESS_CREATE_PROCESS | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
-          entry.th32ProcessID);
-      if (parent)
-        break;
-    } while (::Process32NextW(snapshot, &entry));
-  }
-  ::CloseHandle(snapshot);
-  return parent;
-}
 
 // Utility function to associate a completion port to a job object.
 bool AssociateCompletionPort(HANDLE job, HANDLE port, void* key) {
@@ -603,23 +550,6 @@ BrokerServicesBase::PreSpawnTarget(PolicyBase* policy_base) {
   }
 
   startup_info->AddJobToAssociate(policy_base->GetJobHandle());
-
-  if (ReparentToShellEnabled()) {
-    HANDLE shell_parent = OpenShellProcessForReparent();
-    if (shell_parent) {
-      startup_info->SetParentProcess(shell_parent);
-      char marker[96] = {};
-      std::snprintf(marker, sizeof(marker),
-                    "[sbox][broker] reparenting target to shell pid=%lu\n",
-                    ::GetProcessId(shell_parent));
-      ::OutputDebugStringA(marker);
-    } else {
-      // Fall back to normal creation off the host process.
-      ::OutputDebugStringA(
-          "[sbox][broker] reparent requested but no shell parent found; "
-          "using default parent\n");
-    }
-  }
 
   if (!startup_info->BuildStartupInformation()) {
     return base::unexpected(SBOX_ERROR_PROC_THREAD_ATTRIBUTES);

@@ -452,11 +452,7 @@ void ConvertProcessMitigationsToPolicy(MitigationFlags flags,
   // Mitigations >= Win10 TH2:
   //----------------------------------------------------------------------------
   if (version >= base::win::Version::WIN10_TH2) {
-    if (flags & MITIGATION_ALLOW_UNSIGNED_BINARIES) {
-      DCHECK(!(flags & MITIGATION_FORCE_MS_SIGNED_BINS));
-      *policy_value_1 |=
-          PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_OFF;
-    } else if (flags & MITIGATION_FORCE_MS_SIGNED_BINS) {
+    if (flags & MITIGATION_FORCE_MS_SIGNED_BINS) {
       *policy_value_1 |=
           PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
     }

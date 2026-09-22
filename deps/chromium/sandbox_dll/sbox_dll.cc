@@ -112,11 +112,6 @@ void EnsureBase() {
   (void)base;
 }
 
-bool EnvFlagEnabled(const wchar_t* name) {
-  wchar_t value[2] = {};
-  return ::GetEnvironmentVariableW(name, value, 2) == 1 && value[0] == L'1';
-}
-
 // BrokerServices::Init() is a strictly once-per-process call (Chrome inits it in
 // the browser process exactly once, then SpawnTarget()s many times). A second
 // Init() returns non-OK, which is what broke one-broker -> N-targets. Guard it
@@ -388,17 +383,6 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
 
   std::unique_ptr<sandbox::TargetPolicy> sb_policy = broker->CreatePolicy();
   sandbox::TargetConfig* config = sb_policy->GetConfig();
-  if (EnvFlagEnabled(L"SBOX_ALLOW_UNSIGNED")) {
-    ::OutputDebugStringA("[sbox][broker] unsigned override active\n");
-    const sandbox::ResultCode mitigation_rc = config->SetProcessMitigations(
-        config->GetProcessMitigations() |
-        sandbox::MITIGATION_ALLOW_UNSIGNED_BINARIES);
-    if (mitigation_rc != sandbox::SBOX_ALL_OK) {
-      printf("[broker] unsigned test policy failed: rc=%d\n", mitigation_rc);
-      return nullptr;
-    }
-    printf("[broker] WARNING: unsigned binaries allowed for this test target\n");
-  }
   if (config->SetTokenLevel(MapToken(policy->initial_token),
                             MapToken(policy->lockdown_token)) !=
           sandbox::SBOX_ALL_OK ||

@@ -297,10 +297,6 @@ const MitigationFlags MITIGATION_RESTRICT_CORE_SHARING = 0x08000000;
 // PROCESS_CREATION_MITIGATION_POLICY2_MODULE_TAMPERING_PROTECTION_ALWAYS_ON.
 const MitigationFlags MITIGATION_MODULE_TAMPERING_PROTECTION = 0x10000000;
 
-// Explicitly disables Microsoft-signed-only binary enforcement inherited from
-// the broker. Test-only; production policies must not set this flag.
-const MitigationFlags MITIGATION_ALLOW_UNSIGNED_BINARIES = 0x20000000;
-
 }  // namespace sandbox
 
 #endif  // SANDBOX_WIN_SRC_SECURITY_LEVEL_H_
