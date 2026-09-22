@@ -24,7 +24,10 @@ namespace sandbox {
 using base::win::StartupInformation;
 
 StartupInformationHelper::StartupInformationHelper() {}
-StartupInformationHelper::~StartupInformationHelper() {}
+StartupInformationHelper::~StartupInformationHelper() {
+  if (parent_process_)
+    ::CloseHandle(parent_process_);
+}
 
 void StartupInformationHelper::UpdateFlags(DWORD flags) {
   startup_info_.startup_info()->dwFlags |= flags;
@@ -90,6 +93,10 @@ void StartupInformationHelper::AddJobToAssociate(HANDLE job_handle) {
   job_handle_list_.push_back(job_handle);
 }
 
+void StartupInformationHelper::SetParentProcess(HANDLE parent_process) {
+  parent_process_ = parent_process;
+}
+
 DWORD StartupInformationHelper::CountAttributes() {
   DWORD attribute_count = 0;
   if (mitigations_[0] || mitigations_[1])
@@ -101,7 +108,7 @@ DWORD StartupInformationHelper::CountAttributes() {
   if (restrict_child_process_creation_)
     ++attribute_count;
 
-  if (!inherited_handle_list_.empty())
+  if (!inherited_handle_list_.empty() && !parent_process_)
     ++attribute_count;
 
   if (security_capabilities_) {
@@ -113,6 +120,9 @@ DWORD StartupInformationHelper::CountAttributes() {
   }
 
   if (!job_handle_list_.empty())
+    ++attribute_count;
+
+  if (parent_process_)
     ++attribute_count;
 
   return attribute_count;
@@ -155,7 +165,11 @@ bool StartupInformationHelper::BuildStartupInformation() {
     expected_attributes--;
   }
 
-  if (inherited_handle_list_.size()) {
+  // A reparented child (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS) inherits handles
+  // from the specified parent, not the caller, so the caller's std handles
+  // cannot be passed this way. The message channel does not rely on inherited
+  // handles (it is duplicated into the child after creation), so skip the list.
+  if (inherited_handle_list_.size() && !parent_process_) {
     if (!startup_info_.UpdateProcThreadAttribute(
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherited_handle_list_[0],
             sizeof(HANDLE) * inherited_handle_list_.size())) {
@@ -175,6 +189,15 @@ bool StartupInformationHelper::BuildStartupInformation() {
     if (!startup_info_.UpdateProcThreadAttribute(
             PROC_THREAD_ATTRIBUTE_JOB_LIST, &job_handle_list_[0],
             sizeof(HANDLE) * job_handle_list_.size())) {
+      return false;
+    }
+    expected_attributes--;
+  }
+
+  if (parent_process_) {
+    if (!startup_info_.UpdateProcThreadAttribute(
+            PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &parent_process_,
+            sizeof(parent_process_))) {
       return false;
     }
     expected_attributes--;

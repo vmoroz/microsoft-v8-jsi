@@ -30,6 +30,7 @@
 #include "base/functional/bind.h"
 #include "base/no_destructor.h"
 #include "base/win/scoped_process_information.h"
+#include "sandbox/win/src/app_container.h"
 #include "sandbox/win/src/handle_closer.h"  // HandleCloserConfig, g_handle_closer_info
 #include "sandbox/win/src/interception.h"   // SelfInstallInterceptions
 #include "sandbox/win/src/sandbox.h"
@@ -109,6 +110,11 @@ struct BaseBootstrap {
 void EnsureBase() {
   static BaseBootstrap* base = new BaseBootstrap();  // leak intentionally
   (void)base;
+}
+
+bool EnvFlagEnabled(const wchar_t* name) {
+  wchar_t value[2] = {};
+  return ::GetEnvironmentVariableW(name, value, 2) == 1 && value[0] == L'1';
 }
 
 // BrokerServices::Init() is a strictly once-per-process call (Chrome inits it in
@@ -382,11 +388,32 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
 
   std::unique_ptr<sandbox::TargetPolicy> sb_policy = broker->CreatePolicy();
   sandbox::TargetConfig* config = sb_policy->GetConfig();
+  if (EnvFlagEnabled(L"SBOX_ALLOW_UNSIGNED")) {
+    ::OutputDebugStringA("[sbox][broker] unsigned override active\n");
+    const sandbox::ResultCode mitigation_rc = config->SetProcessMitigations(
+        config->GetProcessMitigations() |
+        sandbox::MITIGATION_ALLOW_UNSIGNED_BINARIES);
+    if (mitigation_rc != sandbox::SBOX_ALL_OK) {
+      printf("[broker] unsigned test policy failed: rc=%d\n", mitigation_rc);
+      return nullptr;
+    }
+    printf("[broker] WARNING: unsigned binaries allowed for this test target\n");
+  }
   if (config->SetTokenLevel(MapToken(policy->initial_token),
                             MapToken(policy->lockdown_token)) !=
           sandbox::SBOX_ALL_OK ||
       config->SetJobLevel(sandbox::JobLevel::kLockdown, 0) !=
-          sandbox::SBOX_ALL_OK ||
+          sandbox::SBOX_ALL_OK) {
+    printf("[broker] policy configuration failed\n");
+    return nullptr;
+  }
+
+  if (policy->use_app_container &&
+      policy->integrity != SBOX_INTEGRITY_LOW) {
+    printf("[broker] AppContainer requires low integrity\n");
+    return nullptr;
+  }
+  if (!policy->use_app_container &&
       config->SetIntegrityLevel(MapIntegrity(policy->integrity)) !=
           sandbox::SBOX_ALL_OK) {
     printf("[broker] policy configuration failed\n");
@@ -394,6 +421,37 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
   }
   config->SetDelayedIntegrityLevel(MapIntegrity(policy->delayed_integrity));
   config->SetLockdownDefaultDacl();
+
+  if (policy->use_app_container) {
+    if (!policy->app_container_sid || !policy->app_container_sid[0] ||
+        (policy->capability_count && !policy->capabilities)) {
+      printf("[broker] invalid AppContainer policy\n");
+      return nullptr;
+    }
+    const sandbox::ResultCode app_container_rc =
+        config->AddAppContainerProfile(
+            base::wcstring_view(policy->app_container_sid));
+    if (app_container_rc != sandbox::SBOX_ALL_OK) {
+      printf("[broker] AddAppContainerProfile failed: rc=%d\n",
+             app_container_rc);
+      return nullptr;
+    }
+    sandbox::AppContainer* app_container = config->GetAppContainer();
+    if (!app_container) {
+      printf("[broker] AppContainer profile unavailable\n");
+      return nullptr;
+    }
+    app_container->SetEnableLowPrivilegeAppContainer(
+        policy->low_privilege_app_container != 0);
+    for (size_t i = 0; i < policy->capability_count; ++i) {
+      const wchar_t* capability = policy->capabilities[i];
+      if (!capability || !capability[0] ||
+          !app_container->AddCapabilitySddl(base::wcstring_view(capability))) {
+        printf("[broker] invalid AppContainer capability at index %zu\n", i);
+        return nullptr;
+      }
+    }
+  }
 
   for (size_t i = 0; i < policy->file_rule_count; ++i) {
     const SboxFileRule& rule = policy->file_rules[i];

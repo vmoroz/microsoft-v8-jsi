@@ -47,6 +47,11 @@ class StartupInformationHelper {
   // Creates PROC_THREAD_ATTRIBUTE_JOB_LIST with |job_handle|.
   void AddJobToAssociate(HANDLE job_handle);
 
+  // Sets the process used as the child's creation parent via
+  // PROC_THREAD_ATTRIBUTE_PARENT_PROCESS. Takes ownership of |parent_process|
+  // and closes it when this helper is destroyed. Passing nullptr is a no-op.
+  void SetParentProcess(HANDLE parent_process);
+
   // Will one or more jobs be associated via the wrapped StartupInformation.
   bool HasJobsToAssociate() { return !job_handle_list_.empty(); }
   // Have handles been provided for secure inheritance?
@@ -99,6 +104,9 @@ class StartupInformationHelper {
   DWORD all_applications_package_policy_ = 0;
   std::vector<HANDLE> inherited_handle_list_;
   std::vector<HANDLE> job_handle_list_;
+  // Optional creation parent (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS). Owned by
+  // this helper: closed in the destructor. Null when no reparenting requested.
+  HANDLE parent_process_ = nullptr;
   std::unique_ptr<SecurityCapabilities> security_capabilities_;
 };
 }  // namespace sandbox
