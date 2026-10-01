@@ -1,0 +1,50 @@
+# THROWAWAY spike targets — see kb spike-plan.md. Single-image sbox.exe that is
+# BOTH sandbox broker and worker (persona by argv), statically linking the same
+# Chromium sandbox core as sbox.dll (via a local copy of sbox_dll.cc). Used only
+# to validate the sbox.exe + v8host.dll topology.
+#
+# testonly, and reachable ONLY from the root group("sbox_spike") — never from the
+# product group("generic") or NuGet staging. Tear down = delete this directory
+# and the root group.
+
+# sbox.exe — the single-image container (broker + worker).
+executable("sbox") {
+  testonly = true
+  sources = [
+    "sbox_core.cc",  # verbatim copy of //sandbox_dll/sbox_dll.cc (+ spike edits)
+    "sbox_main.cc",
+  ]
+  include_dirs = [
+    "//sandbox_dll",  # sbox.h, msg_channel.h, sbox_harden.h
+    "//sbox_spike",   # sbox_plugin_abi.h
+  ]
+  deps = [
+    "//base",
+    "//sandbox/win:sandbox",
+  ]
+
+  # Dev-only: tolerate UNSIGNED spike binaries (compile-time; no runtime bypass).
+  defines = [ "SBOX_DEV_ALLOW_UNSIGNED" ]
+  libs = [
+    "advapi32.lib",  # token / SID plumbing pulled in by the sandbox core
+    "wintrust.lib",  # WinVerifyTrust (sbox_harden.h)
+  ]
+
+  # Resolve statically-imported DLLs only from System32 + the app dir.
+  ldflags = [ "/DEPENDENTLOADFLAG:0xA00" ]
+
+  # Stage the stub payload beside sbox.exe so the worker can load it.
+  data_deps = [ ":v8host" ]
+}
+
+# v8host.dll — the STUB payload. Proves the plugin ABI + ACG lifecycle without
+# V8. Links ONLY the plugin header (no sandbox core, no base) — it is driven by
+# sbox.exe, the inversion of control from today's payload-owns-main() shape.
+shared_library("v8host") {
+  testonly = true
+  sources = [ "v8host_stub.cc" ]
+  include_dirs = [ "//sbox_spike" ]  # sbox_plugin_abi.h
+  defines = [ "V8HOST_PLUGIN_IMPL" ]
+  ldflags = [ "/DEPENDENTLOADFLAG:0xA00" ]
+}
+

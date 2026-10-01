@@ -26,3 +26,11 @@ if (current_cpu == "x64") {
     ]
   }
 }
+
+# THROWAWAY spike (kb spike-plan.md): single-image sbox.exe (broker+worker by
+# argv) + a stub v8host.dll payload. testonly and intentionally kept OUT of
+# group("generic") so it can never reach the product build or NuGet staging.
+group("sbox_spike") {
+  testonly = true
+  deps = [ "//sbox_spike:sbox" ]
+}
