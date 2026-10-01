@@ -53,7 +53,8 @@ void OnInbound(void* ctx, int kind, const void* data, size_t len) {
   (void)ctx;
   (void)kind;
   ++g_inbound;
-  std::string reply = "v8host.dll echo: ";
+  std::string reply = "v8host.dll[pid=" + std::to_string(::GetCurrentProcessId()) +
+                      "] echo: ";
   reply.append(static_cast<const char*>(data), len);
   if (g_host->post_message(g_host->target, SBOX_PLUGIN_MSG_STRING, reply.data(),
                            reply.size()) == 0) {

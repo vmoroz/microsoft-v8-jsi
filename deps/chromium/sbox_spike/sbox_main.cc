@@ -24,6 +24,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <memory>
 #include <string>
 
 // SPIKE S4 (H1a): the broker seeds this worker's sandbox globals + message
@@ -147,6 +149,7 @@ struct BrokerMsgCtx {
   HANDLE reply_event = nullptr;
   int replies = 0;
   bool unexpected = false;
+  std::string last_reply;  // H5: worker reply text, forwarded to the pipe client
 };
 
 void OnBrokerReply(void* ctx, int kind, const void* data, size_t len) {
@@ -154,10 +157,12 @@ void OnBrokerReply(void* ctx, int kind, const void* data, size_t len) {
   if (kind == SBOX_MSG_STRING) {
     const std::string text(static_cast<const char*>(data), len);
     printf("[sbox-spike] broker: worker reply = \"%s\"\n", text.c_str());
-    if (text.rfind("v8host.dll echo: ", 0) == 0)
+    if (text.rfind("v8host.dll[pid=", 0) == 0) {
       ++c->replies;
-    else
+      c->last_reply = text;
+    } else {
       c->unexpected = true;
+    }
   } else {
     c->unexpected = true;
   }
@@ -336,15 +341,244 @@ int RunPipeBench() {
   return n > 0 ? 0 : 1;
 }
 
+// ===== H5: shared-broker rendezvous, fan-in, per-tenant worker, lifetime =====
+
+// Worker policy (same tier as the single-shot broker above).
+SboxPolicy MakeWorkerPolicy() {
+  SboxPolicy policy = {};
+  policy.struct_size = sizeof(policy);
+  policy.initial_token = SBOX_TOKEN_RESTRICTED_SAME_ACCESS;
+  policy.lockdown_token = SBOX_TOKEN_LOCKDOWN;
+  policy.integrity = SBOX_INTEGRITY_LOW;
+  policy.delayed_integrity = SBOX_INTEGRITY_UNTRUSTED;
+  policy.prohibit_dynamic_code = 1;
+  return policy;
+}
+
+// Per-user rendezvous point: a well-known, user-scoped pipe name.
+std::wstring BrokerPipeName() {
+  wchar_t user[256] = {};
+  DWORD n = 256;
+  const std::wstring u = ::GetUserNameW(user, &n) ? user : L"default";
+  return L"\\\\.\\pipe\\sbox_spike_broker_" + u;
+}
+
+std::atomic<int> g_active_clients{0};
+
+// One connected client: read its request, spawn a DEDICATED sandbox worker, relay
+// one round-trip, and reply with the broker + worker PIDs so the client can prove
+// rendezvous fan-in (same broker) and per-tenant isolation (distinct workers).
+struct ClientJob {
+  HANDLE pipe;
+  std::wstring self;
+};
+
+DWORD WINAPI HandleClientThread(void* arg) {
+  std::unique_ptr<ClientJob> job(static_cast<ClientJob*>(arg));
+  HANDLE pipe = job->pipe;
+
+  char req[256] = {};
+  DWORD got = 0;
+  std::string reply;
+  if (::ReadFile(pipe, req, sizeof(req) - 1, &got, nullptr) && got > 0) {
+    SboxPolicy policy = MakeWorkerPolicy();
+    BrokerMsgCtx mctx;
+    mctx.reply_event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    SboxSession* session = sbox_broker_spawn(job->self.c_str(), &policy,
+                                             &OnBrokerReply, &mctx);
+    if (session) {
+      sbox_broker_post_message(session, SBOX_MSG_STRING, req, got);
+      ::WaitForSingleObject(mctx.reply_event, 15000);
+      sbox_broker_close(session);
+      sbox_broker_wait(session);
+      reply = "broker[pid=" + std::to_string(::GetCurrentProcessId()) + "] -> " +
+              (mctx.last_reply.empty() ? std::string("(no worker reply)")
+                                       : mctx.last_reply);
+    } else {
+      reply = "broker[pid=" + std::to_string(::GetCurrentProcessId()) +
+              "] -> spawn FAILED";
+    }
+    ::CloseHandle(mctx.reply_event);
+  } else {
+    reply = "broker: empty request";
+  }
+
+  DWORD wrote = 0;
+  ::WriteFile(pipe, reply.data(), static_cast<DWORD>(reply.size()), &wrote,
+              nullptr);
+  ::FlushFileBuffers(pipe);
+  ::DisconnectNamedPipe(pipe);
+  ::CloseHandle(pipe);
+  g_active_clients.fetch_sub(1);
+  return 0;
+}
+
+// Long-lived broker: ONE per user. Race-free create-or-lose via
+// FILE_FLAG_FIRST_PIPE_INSTANCE; serves many clients concurrently; idle-exits.
+int RunBrokerService() {
+  printf("[sbox-spike] role=broker-service pid=%lu\n", ::GetCurrentProcessId());
+  sbox_harden::HardenDllSearch();
+  const std::wstring self = SelfPath();
+  const std::wstring name = BrokerPipeName();
+
+  const DWORD kIdleMs = 3000;      // idle shutdown once no clients remain
+  const DWORD kMaxLifeMs = 60000;  // hard safety cap
+  const DWORD t_start = ::GetTickCount();
+  bool first = true;
+  int served = 0;
+
+  for (;;) {
+    HANDLE pipe = ::CreateNamedPipeW(
+        name.c_str(),
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
+            (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
+            PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE) {
+      const DWORD e = ::GetLastError();
+      if (first && e == ERROR_ACCESS_DENIED) {
+        printf("[sbox-spike] broker-service: pipe already owned -> lost race, "
+               "exit 0\n");
+        return 0;  // another broker won the rendezvous
+      }
+      printf("[sbox-spike] broker-service: CreateNamedPipe failed: %lu\n", e);
+      return 2;
+    }
+    if (first) {
+      printf("[sbox-spike] broker-service: WON rendezvous, listening (%ls)\n",
+             name.c_str());
+      first = false;
+    }
+
+    OVERLAPPED ov = {};
+    ov.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    bool have_client = false;
+    if (::ConnectNamedPipe(pipe, &ov)) {
+      have_client = true;
+    } else {
+      const DWORD e = ::GetLastError();
+      if (e == ERROR_PIPE_CONNECTED) {
+        have_client = true;
+      } else if (e == ERROR_IO_PENDING) {
+        if (::WaitForSingleObject(ov.hEvent, kIdleMs) == WAIT_OBJECT_0) {
+          DWORD xfer = 0;
+          have_client = ::GetOverlappedResult(pipe, &ov, &xfer, FALSE);
+        } else {
+          ::CancelIo(pipe);
+        }
+      }
+    }
+    ::CloseHandle(ov.hEvent);
+
+    if (have_client) {
+      ++served;
+      g_active_clients.fetch_add(1);
+      auto* job = new ClientJob{pipe, self};
+      HANDLE th = ::CreateThread(nullptr, 0, &HandleClientThread, job, 0, nullptr);
+      if (th) {
+        ::CloseHandle(th);
+      } else {
+        g_active_clients.fetch_sub(1);
+        delete job;
+        ::CloseHandle(pipe);
+      }
+    } else {
+      ::CloseHandle(pipe);  // idle instance
+      if (g_active_clients.load() == 0) {
+        printf("[sbox-spike] broker-service: idle %lums, no clients -> shutdown "
+               "(served=%d)\n", kIdleMs, served);
+        return 0;
+      }
+    }
+    if (::GetTickCount() - t_start > kMaxLifeMs) {
+      printf("[sbox-spike] broker-service: max lifetime -> exit (served=%d)\n",
+             served);
+      return 0;
+    }
+  }
+}
+
+// Client: connect to the per-user broker, launching one if absent (the launched
+// broker then wins-or-loses the create race). One request -> one response.
+int RunClient() {
+  printf("[sbox-spike] role=client pid=%lu\n", ::GetCurrentProcessId());
+  const std::wstring name = BrokerPipeName();
+  const std::wstring self = SelfPath();
+
+  HANDLE pipe = INVALID_HANDLE_VALUE;
+  bool launched = false;
+  const DWORD deadline = ::GetTickCount() + 10000;
+  for (;;) {
+    pipe = ::CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                         OPEN_EXISTING, 0, nullptr);
+    if (pipe != INVALID_HANDLE_VALUE) break;
+    const DWORD e = ::GetLastError();
+    if (e == ERROR_PIPE_BUSY) {
+      ::WaitNamedPipeW(name.c_str(), 2000);
+    } else if (e == ERROR_FILE_NOT_FOUND) {
+      if (!launched) {
+        std::wstring cmd = L"\"" + self + L"\" --broker-service";
+        STARTUPINFOW si = {sizeof(si)};
+        PROCESS_INFORMATION pi = {};
+        if (::CreateProcessW(self.c_str(), &cmd[0], nullptr, nullptr, FALSE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+          ::CloseHandle(pi.hProcess);
+          ::CloseHandle(pi.hThread);
+        }
+        launched = true;
+      }
+      ::Sleep(50);
+    } else {
+      printf("[sbox-spike] client %lu: connect failed: %lu\n",
+             ::GetCurrentProcessId(), e);
+      return 2;
+    }
+    if (::GetTickCount() > deadline) {
+      printf("[sbox-spike] client %lu: broker unavailable\n",
+             ::GetCurrentProcessId());
+      return 2;
+    }
+  }
+
+  DWORD mode = PIPE_READMODE_MESSAGE;
+  ::SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr);
+  const std::string req =
+      "ping from client " + std::to_string(::GetCurrentProcessId());
+  DWORD wrote = 0, got = 0;
+  char resp[512] = {};
+  ::WriteFile(pipe, req.data(), static_cast<DWORD>(req.size()), &wrote, nullptr);
+  const bool ok =
+      ::ReadFile(pipe, resp, sizeof(resp) - 1, &got, nullptr) && got > 0;
+  ::CloseHandle(pipe);
+  if (!ok) {
+    printf("[sbox-spike] client %lu: no response\n", ::GetCurrentProcessId());
+    return 1;
+  }
+  printf("[sbox-spike] client %lu got: %.*s\n", ::GetCurrentProcessId(),
+         static_cast<int>(got), resp);
+  return 0;
+}
+
 // Role dispatch. Kept deliberately dumb and FIRST so neither persona can fall
 // through into the other's init (spike H2).
-enum class Role { kNone, kBroker, kWorker, kPipeBench };
+enum class Role {
+  kNone,
+  kBroker,
+  kWorker,
+  kPipeBench,
+  kBrokerService,
+  kClient
+};
 
 Role ParseRole(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--worker") == 0) return Role::kWorker;
     if (std::strcmp(argv[i], "--broker") == 0) return Role::kBroker;
     if (std::strcmp(argv[i], "--pipe-bench") == 0) return Role::kPipeBench;
+    if (std::strcmp(argv[i], "--broker-service") == 0)
+      return Role::kBrokerService;
+    if (std::strcmp(argv[i], "--client") == 0) return Role::kClient;
   }
   return Role::kNone;
 }
@@ -360,9 +594,14 @@ int main(int argc, char** argv) {
       return RunWorker();
     case Role::kPipeBench:
       return RunPipeBench();
+    case Role::kBrokerService:
+      return RunBrokerService();
+    case Role::kClient:
+      return RunClient();
     case Role::kNone:
     default:
-      printf("Usage: sbox.exe --broker | --worker | --pipe-bench\n");
+      printf("Usage: sbox.exe --broker | --worker | --pipe-bench | "
+             "--broker-service | --client\n");
       return 2;
   }
 }
