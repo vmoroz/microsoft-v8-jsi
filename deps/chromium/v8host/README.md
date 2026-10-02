@@ -1,42 +1,71 @@
-# Sandbox guest host
+# Sandbox engine payload (`v8host.dll`)
 
-`v8host.exe` loads the selected JSI engine, completes sandbox lockdown, and runs
-JavaScript. The broker owns the policy and closes the message channel when the
-run is finished.
+`v8host.dll` is the engine payload driven by the product `sbox.exe` worker. The
+container owns `main()` and drives the plugin-ABI lifecycle
+(`warmup` pre-lockdown → `lower_token` → `run` post-lockdown → `shutdown`); the
+payload exports only the `v8host_worker_*` entrypoints (see
+[`sbox_plugin_abi.h`](../sandbox_dll/sbox_plugin_abi.h)). It links the JSI C++
+API (`jsi_cpp`) but **never the sandbox core** — it reaches the message channel
+only through the `SboxHostServices` function pointers the container hands it.
+This replaces the retired two-image topology where a `v8host.exe` target owned
+`main()` and loaded `sbox.dll`.
 
-## Results
+## Status: real V8/JSI engine
 
-- With no nonempty `V8HOST_GUEST_JS`, the host runs its built-in demo. Success
-  requires the demo file probes and both string and binary message exchanges.
-  The existing x86 exception for unsupported file brokering is unchanged.
-- With `V8HOST_GUEST_JS`, the host reads that file before lockdown and runs it
-  as the custom guest. An empty file is valid. A requested file that cannot be
-  read is an input error, not permission to fall back to the demo.
-- Custom guests do not need demo files or any particular number or type of
-  messages. Exit `0` means the required sandbox checks passed, guest evaluation
-  completed, and the message loop ended normally when the broker closed it.
-  It does **not** certify an application-specific result sent by the guest.
-  The broker and guest define that protocol; the host does not interpret it.
-- Exit `13` reports a demo-check, JavaScript evaluation/callback, message, or
-  message-loop failure. Failed message sends throw a JavaScript error.
-- Exit `23` reports a returned lockdown or security-validation failure. Fatal
-  failures inside the sandbox may terminate with their own nonzero codes.
-- Exit `24` reports an unreadable guest path or guest file.
+The current `v8host.dll` is built from
+[`v8host_engine.cc`](./v8host_engine.cc) — the **real V8/JSI engine** carved from
+the retired `v8host.exe` main, split at the `LowerToken` boundary into the three
+plugin-ABI entrypoints:
 
-All modes retain mandatory lockdown and verification of requested ACG.
-Neither custom-guest selection nor result reporting disables security checks.
+- **`v8host_worker_warmup` (pre-lockdown):** loads the engine DLL by full path
+  from the app dir — `v8jsisb.dll` (jitless) for the Untrusted tier, `v8jsi.dll`
+  (full-JIT) for Trusted, overridable via `V8HOST_ENGINE_DLL` — sets `--jitless`
+  for the Untrusted tier, optionally loads and prechecks a startup snapshot,
+  reads the guest JS, creates the JSI runtime (`makeJsiAbiRuntime` over
+  `v8_create_runtime`), and installs the `host` object. All codegen (engine load,
+  snapshot deserialize, runtime create) happens **here**, because ACG forbids it
+  after `lower_token`.
+- **`v8host_worker_run` (post-lockdown):** proves ACG is in force with a blocked
+  executable allocation, evaluates the guest (interpreted under jitless, so safe
+  post-ACG), then owns the JS thread in the WebView2-style message loop
+  (`host.postMessage` / `host.postMessageBinary` → the channel;
+  inbound frames → `host.onmessage`) until the broker closes the channel.
+- **`v8host_worker_shutdown`:** tears down the runtime and the engine handle.
 
-## Tests
+## Engine host behavior
 
-After the sandbox engine has been built and staged beside the host, run from
-the repository root:
+- With no nonempty `V8HOST_GUEST_JS`, the host installs a small built-in demo
+  guest (`host.onmessage = m => host.postMessage('js echo: ' + m)`, with a binary
+  branch that tags byte 0 of an in-cage `ArrayBuffer`). It posts nothing
+  unprompted, so each broker request maps to exactly one `js echo:` reply.
+- With `V8HOST_GUEST_JS`, the host reads that file before lockdown and runs it as
+  the custom guest. An empty file is valid. A requested file that cannot be read
+  is an input error, not permission to fall back to the demo.
+- The host stays a neutral JS host: it installs the `host` object and evaluates
+  whatever guest it is handed. A clean worker exit (`0`) means the ACG check
+  passed, guest evaluation completed, and the message loop ended normally when
+  the broker closed it. It does **not** certify an application-specific result
+  sent by the guest — the broker and guest define that protocol.
+- Failed message sends throw a JavaScript error (surfaced as a run failure).
+
+Mandatory lockdown and verification of requested ACG are retained. Neither
+custom-guest selection nor result reporting disables any security check; all
+engine setup (the only place codegen is allowed) completes before
+`lower_token`.
+
+## Smoke test
+
+Build the `generic` group and drive the single-image container, which spawns its
+own `--worker`, loads `v8host.dll`, and runs the warmup → `lower_token` → run
+round trip from the repository root:
 
 ```powershell
-node .\scripts\sbox-build.ts --target-cpu x64 --target v8host_tests
-& .\deps\chromium\out\sandbox-x64\v8host_tests.exe --all
+node .\scripts\sbox-build.ts --target-cpu x64 --target generic
+& .\deps\chromium\out\sandbox-x64\sbox.exe --broker
 ```
 
-Use `--case custom-strings-only` to run one case. The tests exercise the
-production sandbox DLL and host with synthetic scripts, check child exit codes
-and replies, and cover both guest modes and failure paths. The runner is
-`testonly`; it is not included in the production build group or NuGet staging.
+A passing run shows the real-engine signals: `engine = v8jsisb.dll`, `v8jsi
+runtime created (warmup, pre-lockdown)`, `LowerToken survived`,
+`exec-alloc(post)=BLOCKED (ACG in force) (err=1655)`, the guest `JS evaluated =
+OK`, the broker's `worker reply = "js echo: ping from broker"` (real guest JS
+executed under lockdown), and `worker_exit=0 ... -> PASS`.

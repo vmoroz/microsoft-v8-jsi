@@ -1,18 +1,19 @@
-// sbox_main.cc — THROWAWAY spike (see spike-plan.md). Single-image sbox.exe:
-// one binary that is BOTH the sandbox broker and the sandbox worker, selected by
-// argv. It statically links the same Chromium sandbox core as sbox.dll (via the
-// sbox_core.cc copy) so the broker and worker share one image and one set of
-// sandbox globals — the topology the spike is validating.
+// sbox_main.cc — the product single-image sbox.exe: one binary that is BOTH the
+// sandbox broker and the sandbox worker, selected by argv. It statically links
+// the same Chromium sandbox core as the DLL did (via sbox_dll.cc) so the broker
+// and worker share one image and one set of sandbox globals.
 //
-// Personas (spike H2 — no cross-contamination):
+// Personas (role is chosen first; neither falls through into the other's init):
 //   sbox.exe --broker   : EnsureBroker + spawn "sbox.exe --worker" + round-trip.
 //                         Calls ONLY sbox_broker_*.
 //   sbox.exe --worker    : sbox_target_begin -> warmup -> lower_token -> run.
 //                         Calls ONLY sbox_target_*.
+//   sbox.exe --broker-service / --client / --pipe-bench : the shared-broker
+//                         rendezvous + a transport-latency probe (used by later
+//                         stages).
 //
-// This is NOT product code: not signed, not in the product build group, testonly.
-
-#define SBOX_DLL_IMPL  // match sbox_core.cc: sbox_* are defined in THIS image.
+// SBOX_API is plain extern "C" here (the target defines SBOX_STATIC), so the
+// sbox_* core compiled into this EXE stays out of its export table.
 #include "sbox.h"
 #include "sbox_harden.h"
 #include "sbox_plugin_abi.h"
@@ -28,10 +29,10 @@
 #include <memory>
 #include <string>
 
-// SPIKE S4 (H1a): the broker seeds this worker's sandbox globals + message
-// channel directly at their shared RVAs (same image), so there is no exported
-// g_sbox_bootstrap struct and no FindRemoteExport PE parse. sbox_target_begin
-// reads the same-image seed; the argument is vestigial.
+// Same-image seed: the broker writes this worker's sandbox globals + message
+// channel directly at their shared RVAs while the worker is suspended, so there
+// is no exported bootstrap struct and no export-table walk. sbox_target_begin
+// adopts that seed (and fails closed if its magic is absent).
 
 namespace {
 
@@ -46,7 +47,7 @@ enum WorkerExit {
   kWarmupFailed = 14,
   kLowerTokenFailed = 15,
   kPingPostFailed = 16,
-  kRunFailed = 17,  // payload run failed; rc=3 means ACG NOT enforced -> H3 FAIL
+  kRunFailed = 17,  // payload run failed; rc=3 means ACG was NOT enforced
 };
 
 std::wstring SelfPath() {
@@ -55,8 +56,19 @@ std::wstring SelfPath() {
   return std::wstring(buf, n);
 }
 
+// The broker runs UNRESTRICTED, so it (not the token-restricted worker, which
+// cannot reliably reach the crypto/catalog services) verifies the payload chain
+// the worker will load. Fail-closed on a tampered/invalid signature; dev builds
+// tolerate UNSIGNED only via the compile-time SBOX_DEV_ALLOW_UNSIGNED (no runtime
+// bypass). Call before spawning a worker.
+bool VerifyPayloadChain() {
+  const std::wstring dir = sbox_harden::ExeDir();
+  return sbox_harden::CheckTrust(dir + L"v8host.dll", "v8host.dll") &&
+         sbox_harden::CheckTrust(dir + L"v8jsisb.dll", "v8jsisb.dll");
+}
+
 // --- host services bridge: thin wrappers so v8host.dll uses the sandbox
-// message channel WITHOUT linking the sandbox core (plugin ABI §3.3). ---
+// message channel WITHOUT linking the sandbox core (see sbox_plugin_abi.h). ---
 int HostPost(void* t, int kind, const void* data, size_t len) {
   return sbox_target_post_message(static_cast<SboxTarget*>(t), kind, data, len);
 }
@@ -75,16 +87,16 @@ void* HostClose(void* t) {
 // ACG-correct points (warmup PRE-lockdown, run POST-lockdown). This is the
 // control inversion from today, where the payload owns main().
 int RunWorker() {
-  printf("[sbox-spike] role=worker pid=%lu\n", ::GetCurrentProcessId());
+  printf("[sbox] role=worker pid=%lu\n", ::GetCurrentProcessId());
   sbox_harden::HardenDllSearch();
 
-  SboxTarget* target = sbox_target_begin(nullptr);
+  SboxTarget* target = sbox_target_begin();
   if (!target) {
-    printf("[sbox-spike] worker: sbox_target_begin failed\n");
+    printf("[sbox] worker: sbox_target_begin failed\n");
     return kBeginFailed;
   }
   const bool ping_pre = sbox_target_test_ipc(target) != 0;
-  printf("[sbox-spike] worker: IPC pre-lockdown = %s\n", ping_pre ? "OK" : "FAIL");
+  printf("[sbox] worker: IPC pre-lockdown = %s\n", ping_pre ? "OK" : "FAIL");
 
   // Load the payload by FULL PATH from our own app dir (PRE-lockdown: the
   // lowered token can no longer open it). Resolve the worker entrypoints.
@@ -93,7 +105,7 @@ int RunWorker() {
                                      LOAD_LIBRARY_SEARCH_SYSTEM32 |
                                          LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
   if (!payload) {
-    printf("[sbox-spike] worker: LoadLibrary(v8host.dll) failed: %lu\n",
+    printf("[sbox] worker: LoadLibrary(v8host.dll) failed: %lu\n",
            ::GetLastError());
     return kDllLoadFailed;
   }
@@ -104,7 +116,7 @@ int RunWorker() {
   auto shutdown = reinterpret_cast<v8host_worker_shutdown_fn>(
       ::GetProcAddress(payload, "v8host_worker_shutdown"));
   if (!warmup || !run || !shutdown) {
-    printf("[sbox-spike] worker: payload entrypoints missing\n");
+    printf("[sbox] worker: payload entrypoints missing\n");
     return kDllResolveFailed;
   }
 
@@ -118,21 +130,21 @@ int RunWorker() {
 
   // warmup (PRE-lockdown) -> lower_token -> run (POST-lockdown) -> shutdown.
   const int warmup_rc = warmup(&host);
-  printf("[sbox-spike] worker: v8host_worker_warmup -> %d\n", warmup_rc);
+  printf("[sbox] worker: v8host_worker_warmup -> %d\n", warmup_rc);
   if (warmup_rc != 0) return kWarmupFailed;
 
   const int lowered = sbox_target_lower_token(target);
   if (lowered != 0) {
-    printf("[sbox-spike] worker: sbox_target_lower_token failed (%d)\n", lowered);
+    printf("[sbox] worker: sbox_target_lower_token failed (%d)\n", lowered);
     return kLowerTokenFailed;
   }
-  printf("[sbox-spike] worker: LowerToken survived\n");
+  printf("[sbox] worker: LowerToken survived\n");
 
   const bool ping_post = sbox_target_test_ipc(target) != 0;
-  printf("[sbox-spike] worker: IPC post-lockdown = %s\n", ping_post ? "OK" : "FAIL");
+  printf("[sbox] worker: IPC post-lockdown = %s\n", ping_post ? "OK" : "FAIL");
 
   const int run_rc = run(&host);
-  printf("[sbox-spike] worker: v8host_worker_run -> %d\n", run_rc);
+  printf("[sbox] worker: v8host_worker_run -> %d\n", run_rc);
 
   shutdown();
   sbox_target_end(target);
@@ -149,15 +161,17 @@ struct BrokerMsgCtx {
   HANDLE reply_event = nullptr;
   int replies = 0;
   bool unexpected = false;
-  std::string last_reply;  // H5: worker reply text, forwarded to the pipe client
+  std::string last_reply;  // worker reply text, forwarded to the pipe client
 };
 
 void OnBrokerReply(void* ctx, int kind, const void* data, size_t len) {
   auto* c = static_cast<BrokerMsgCtx*>(ctx);
   if (kind == SBOX_MSG_STRING) {
     const std::string text(static_cast<const char*>(data), len);
-    printf("[sbox-spike] broker: worker reply = \"%s\"\n", text.c_str());
-    if (text.rfind("v8host.dll[pid=", 0) == 0) {
+    printf("[sbox] broker: worker reply = \"%s\"\n", text.c_str());
+    // The worker runs real guest JS under lockdown; the built-in demo guest
+    // echoes each request as "js echo: <request>" via host.postMessage.
+    if (text.rfind("js echo: ", 0) == 0) {
       ++c->replies;
       c->last_reply = text;
     } else {
@@ -169,7 +183,7 @@ void OnBrokerReply(void* ctx, int kind, const void* data, size_t len) {
   if (c->reply_event) ::SetEvent(c->reply_event);
 }
 
-// High-resolution timer for the H4 latency measurement.
+// High-resolution timer for the latency measurement.
 struct Perf {
   LARGE_INTEGER freq;
   Perf() { ::QueryPerformanceFrequency(&freq); }
@@ -198,10 +212,14 @@ double RoundTrip(SboxSession* session, BrokerMsgCtx* mctx, const Perf& perf,
 }
 
 int RunBroker() {
-  printf("[sbox-spike] role=broker pid=%lu\n", ::GetCurrentProcessId());
+  printf("[sbox] role=broker pid=%lu\n", ::GetCurrentProcessId());
   sbox_harden::HardenDllSearch();
 
   const std::wstring self = SelfPath();
+  if (!VerifyPayloadChain()) {
+    printf("[sbox] broker: payload signature verification failed\n");
+    return 3;
+  }
 
   SboxPolicy policy = {};
   policy.struct_size = sizeof(policy);
@@ -214,15 +232,15 @@ int RunBroker() {
   BrokerMsgCtx mctx;
   mctx.reply_event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-  // H4: time the one-time spawn (process creation + sandbox lockdown setup to
-  // resume). Spawns THIS image with --worker (appended inside sbox_core.cc).
+  // Time the one-time spawn (process creation + sandbox lockdown setup to
+  // resume). Spawns THIS image with --worker (appended inside sbox_dll.cc).
   Perf perf;
   const LONGLONG t_spawn0 = perf.now();
   SboxSession* session = sbox_broker_spawn(self.c_str(), &policy, &OnBrokerReply,
                                            &mctx);
   const LONGLONG t_spawn1 = perf.now();
   if (!session) {
-    printf("[sbox-spike] broker: spawn failed\n");
+    printf("[sbox] broker: spawn failed\n");
     ::CloseHandle(mctx.reply_event);
     return 2;
   }
@@ -253,22 +271,22 @@ int RunBroker() {
 
   const double spawn_ms = perf.ms(t_spawn0, t_spawn1);
   const double warm_avg = warm_n ? warm_sum / warm_n : -1.0;
-  printf("[sbox-spike][H4] spawn+lockdown=%.2f ms  first-roundtrip(cold)=%.3f ms"
+  printf("[sbox] spawn+lockdown=%.2f ms  first-roundtrip(cold)=%.3f ms"
          "  warm-roundtrip avg=%.3f min=%.3f ms (n=%d)\n",
          spawn_ms, first_rtt, warm_avg, warm_min, warm_n);
 
   const bool ok = got_reply && warm_ok && !mctx.unexpected && rc_close == 0 &&
                   worker_exit == kOk;
-  printf("[sbox-spike] broker: worker_exit=%d warm_rtts=%d -> %s\n", worker_exit,
+  printf("[sbox] broker: worker_exit=%d warm_rtts=%d -> %s\n", worker_exit,
          warm_n, ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
 
-// H4 §3.4: named-pipe round-trip latency — models the NEW Office->broker hop
-// (the transport that used to be in-proc on x64). Single process: a server
-// thread echoes; the main thread times N round-trips. Isolates the pipe
-// transport cost (cross-process scheduling is already in the warm broker<->
-// worker number). No protocol, no auth — just RTT.
+// Named-pipe round-trip latency — models the new app->broker hop (the transport
+// that used to be in-process on x64). Single process: a server thread echoes;
+// the main thread times N round-trips. Isolates the pipe transport cost
+// (cross-process scheduling is already in the warm broker<->worker number). No
+// protocol, no auth — just RTT.
 DWORD WINAPI PipeServerThread(void* arg) {
   const wchar_t* name = static_cast<const wchar_t*>(arg);
   HANDLE pipe = ::CreateNamedPipeW(
@@ -295,8 +313,8 @@ DWORD WINAPI PipeServerThread(void* arg) {
 }
 
 int RunPipeBench() {
-  printf("[sbox-spike] role=pipe-bench pid=%lu\n", ::GetCurrentProcessId());
-  const wchar_t* name = L"\\\\.\\pipe\\sbox_spike_bench";
+  printf("[sbox] role=pipe-bench pid=%lu\n", ::GetCurrentProcessId());
+  const wchar_t* name = L"\\\\.\\pipe\\sbox_bench";
   HANDLE th = ::CreateThread(nullptr, 0, &PipeServerThread,
                              const_cast<wchar_t*>(name), 0, nullptr);
   if (!th) return 2;
@@ -336,12 +354,12 @@ int RunPipeBench() {
   ::CloseHandle(pipe);
   ::WaitForSingleObject(th, 2000);
   ::CloseHandle(th);
-  printf("[sbox-spike][H4] named-pipe RTT avg=%.4f min=%.4f ms (n=%d)\n",
+  printf("[sbox] named-pipe RTT avg=%.4f min=%.4f ms (n=%d)\n",
          n ? sum / n : -1.0, mn, n);
   return n > 0 ? 0 : 1;
 }
 
-// ===== H5: shared-broker rendezvous, fan-in, per-tenant worker, lifetime =====
+// ===== shared-broker rendezvous, fan-in, per-tenant worker, lifetime =====
 
 // Worker policy (same tier as the single-shot broker above).
 SboxPolicy MakeWorkerPolicy() {
@@ -360,7 +378,7 @@ std::wstring BrokerPipeName() {
   wchar_t user[256] = {};
   DWORD n = 256;
   const std::wstring u = ::GetUserNameW(user, &n) ? user : L"default";
-  return L"\\\\.\\pipe\\sbox_spike_broker_" + u;
+  return L"\\\\.\\pipe\\sbox_broker_" + u;
 }
 
 std::atomic<int> g_active_clients{0};
@@ -416,8 +434,12 @@ DWORD WINAPI HandleClientThread(void* arg) {
 // Long-lived broker: ONE per user. Race-free create-or-lose via
 // FILE_FLAG_FIRST_PIPE_INSTANCE; serves many clients concurrently; idle-exits.
 int RunBrokerService() {
-  printf("[sbox-spike] role=broker-service pid=%lu\n", ::GetCurrentProcessId());
+  printf("[sbox] role=broker-service pid=%lu\n", ::GetCurrentProcessId());
   sbox_harden::HardenDllSearch();
+  if (!VerifyPayloadChain()) {
+    printf("[sbox] broker-service: payload signature verification failed\n");
+    return 2;
+  }
   const std::wstring self = SelfPath();
   const std::wstring name = BrokerPipeName();
 
@@ -438,15 +460,15 @@ int RunBrokerService() {
     if (pipe == INVALID_HANDLE_VALUE) {
       const DWORD e = ::GetLastError();
       if (first && e == ERROR_ACCESS_DENIED) {
-        printf("[sbox-spike] broker-service: pipe already owned -> lost race, "
+        printf("[sbox] broker-service: pipe already owned -> lost race, "
                "exit 0\n");
         return 0;  // another broker won the rendezvous
       }
-      printf("[sbox-spike] broker-service: CreateNamedPipe failed: %lu\n", e);
+      printf("[sbox] broker-service: CreateNamedPipe failed: %lu\n", e);
       return 2;
     }
     if (first) {
-      printf("[sbox-spike] broker-service: WON rendezvous, listening (%ls)\n",
+      printf("[sbox] broker-service: WON rendezvous, listening (%ls)\n",
              name.c_str());
       first = false;
     }
@@ -486,13 +508,13 @@ int RunBrokerService() {
     } else {
       ::CloseHandle(pipe);  // idle instance
       if (g_active_clients.load() == 0) {
-        printf("[sbox-spike] broker-service: idle %lums, no clients -> shutdown "
+        printf("[sbox] broker-service: idle %lums, no clients -> shutdown "
                "(served=%d)\n", kIdleMs, served);
         return 0;
       }
     }
     if (::GetTickCount() - t_start > kMaxLifeMs) {
-      printf("[sbox-spike] broker-service: max lifetime -> exit (served=%d)\n",
+      printf("[sbox] broker-service: max lifetime -> exit (served=%d)\n",
              served);
       return 0;
     }
@@ -502,7 +524,7 @@ int RunBrokerService() {
 // Client: connect to the per-user broker, launching one if absent (the launched
 // broker then wins-or-loses the create race). One request -> one response.
 int RunClient() {
-  printf("[sbox-spike] role=client pid=%lu\n", ::GetCurrentProcessId());
+  printf("[sbox] role=client pid=%lu\n", ::GetCurrentProcessId());
   const std::wstring name = BrokerPipeName();
   const std::wstring self = SelfPath();
 
@@ -530,12 +552,12 @@ int RunClient() {
       }
       ::Sleep(50);
     } else {
-      printf("[sbox-spike] client %lu: connect failed: %lu\n",
+      printf("[sbox] client %lu: connect failed: %lu\n",
              ::GetCurrentProcessId(), e);
       return 2;
     }
     if (::GetTickCount() > deadline) {
-      printf("[sbox-spike] client %lu: broker unavailable\n",
+      printf("[sbox] client %lu: broker unavailable\n",
              ::GetCurrentProcessId());
       return 2;
     }
@@ -552,16 +574,16 @@ int RunClient() {
       ::ReadFile(pipe, resp, sizeof(resp) - 1, &got, nullptr) && got > 0;
   ::CloseHandle(pipe);
   if (!ok) {
-    printf("[sbox-spike] client %lu: no response\n", ::GetCurrentProcessId());
+    printf("[sbox] client %lu: no response\n", ::GetCurrentProcessId());
     return 1;
   }
-  printf("[sbox-spike] client %lu got: %.*s\n", ::GetCurrentProcessId(),
+  printf("[sbox] client %lu got: %.*s\n", ::GetCurrentProcessId(),
          static_cast<int>(got), resp);
   return 0;
 }
 
 // Role dispatch. Kept deliberately dumb and FIRST so neither persona can fall
-// through into the other's init (spike H2).
+// through into the other's init.
 enum class Role {
   kNone,
   kBroker,

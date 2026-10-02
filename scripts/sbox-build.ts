@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Build script for the Chromium-sandbox binaries (sbox.dll / v8host.exe /
-// test_app.exe). Run with Node.js v24+ (TypeScript strip-types).
+// Build script for the Chromium-sandbox binaries (sbox.exe / v8host.dll). Run
+// with Node.js v24+ (TypeScript strip-types).
 // Usage: node scripts/sbox-build.ts [options]
 //
 // These binaries are built by the Chromium gn/ninja toolchain, NOT vcbuild —
@@ -69,8 +69,8 @@ const clangMajorFloor = 22;
 // The VS Installer component id for the C++ Clang compiler.
 const clangComponentId = "Microsoft.VisualStudio.Component.VC.Llvm.Clang";
 
-// BinSkim rules accepted as residuals on the sandbox binaries (sbox.dll,
-// v8host.exe, test_app.exe). These follow from the gn/ninja (clang-cl +
+// BinSkim rules accepted as residuals on the sandbox binaries (sbox.exe,
+// v8host.dll). These follow from the gn/ninja (clang-cl +
 // lld-link) build configuration for these binaries. The mitigations that this
 // toolchain CAN satisfy are enabled at the source (build/config/compiler/BUILD.gn
 // + build/toolchain/win/setup_toolchain.py) and are NO LONGER accepted:
@@ -134,7 +134,7 @@ Boolean flags (all support --no- prefix):
   --gen           Run 'gn gen' (writes args.gn) before building (default: true)
   --build         Run 'ninja' on the target (default: true)
   --check         Enforce export-allowlist + Hybrid-CRT + BinSkim gates on the
-                  produced binaries (sbox.dll, v8host.exe, test_app.exe)
+                  produced binaries (sbox.exe, v8host.dll)
   --clean         Delete the out dir before generating
 
 String arguments:
@@ -571,18 +571,18 @@ interface SandboxBinary {
 }
 
 // The sandbox binaries and their allowed export surfaces.
-//   sbox.dll      — the sandbox C ABI: only sbox_*.
-//   v8host.exe    — exports nothing; the same-image seed retired the exported
-//                   g_sbox_bootstrap struct the broker used to locate and
-//                   populate in the suspended child.
-//   test_app.exe  — exports nothing.
-//   test_app_signed.exe — same, built fail-closed (no SBOX_DEV_ALLOW_UNSIGNED).
+//   sbox.exe    — the single-image container: exports NOTHING. SBOX_STATIC makes
+//                 the statically-linked sbox_* core resolve at link time rather
+//                 than through the EXE's export table.
+//   v8host.dll  — the engine payload: exports only the v8host_worker_* plugin-ABI
+//                 entrypoints the container resolves by name.
 const sandboxBinaries: SandboxBinary[] = [
-  // sbox.dll budget: <= 2 MiB (measured 1.74 MiB; floor at the Hybrid CRT).
-  { file: "sbox.dll", allowedExportPrefixes: ["sbox_"], maxBytes: 2 * 1024 * 1024 },
-  { file: "v8host.exe", allowedExportPrefixes: [] },
-  { file: "test_app.exe", allowedExportPrefixes: [] },
-  { file: "test_app_signed.exe", allowedExportPrefixes: [] },
+  // sbox.exe budget: <= 2 MiB (measured ~1.76 MiB; floor at the Hybrid CRT).
+  { file: "sbox.exe", allowedExportPrefixes: [], maxBytes: 2 * 1024 * 1024 },
+  // v8host.dll budget: <= 512 KiB (measured ~0.36 MiB for the real V8/JSI engine
+  // persona — the engine DLL itself is LoadLibrary'd at runtime, so this is just
+  // the plugin + JSI C++ API glue).
+  { file: "v8host.dll", allowedExportPrefixes: ["v8host_"], maxBytes: 512 * 1024 },
 ];
 
 // Gate 1: export allowlist. Every export of every sandbox binary must match its

@@ -1,15 +1,18 @@
-// sbox_plugin_abi.h — THROWAWAY spike (spike-plan.md §3.3). The one genuinely
-// new ABI surface: the in-process contract between the V8-agnostic sbox.exe
-// container and the v8host.dll payload it drives. Kept tiny and C-shaped so the
-// payload DLL depends ONLY on this header — never on the sandbox core.
+// sbox_plugin_abi.h — the in-process contract between the V8-agnostic sbox.exe
+// container and the v8host.dll engine payload it drives. Kept tiny and C-shaped
+// so the payload DLL depends ONLY on this header — never on the sandbox core.
+//
+// EXPERIMENTAL / not yet ABI-frozen: this surface may still be reshaped. The
+// shape below is the validated worker-direction lifecycle; the broker direction
+// and a versioned error/config surface arrive with later work.
 //
 // Lifecycle (worker persona), driven by sbox.exe's worker main():
-//   begin -> v8host_worker_warmup  (PRE-lockdown: load engine, codegen allowed)
-//         -> sbox_target_lower_token()
-//         -> v8host_worker_run      (POST-lockdown: ACG armed; message loop)
-//         -> v8host_worker_shutdown -> end
-#ifndef SBOX_SPIKE_PLUGIN_ABI_H_
-#define SBOX_SPIKE_PLUGIN_ABI_H_
+//   sbox_target_begin -> v8host_worker_warmup  (PRE-lockdown: load engine, codegen allowed)
+//                     -> sbox_target_lower_token()
+//                     -> v8host_worker_run      (POST-lockdown: ACG armed; message loop)
+//                     -> v8host_worker_shutdown -> sbox_target_end
+#ifndef SANDBOX_DLL_SBOX_PLUGIN_ABI_H_
+#define SANDBOX_DLL_SBOX_PLUGIN_ABI_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -46,4 +49,4 @@ extern "C" __declspec(dllexport) int v8host_worker_run(const SboxHostServices*);
 extern "C" __declspec(dllexport) void v8host_worker_shutdown(void);
 #endif
 
-#endif  // SBOX_SPIKE_PLUGIN_ABI_H_
+#endif  // SANDBOX_DLL_SBOX_PLUGIN_ABI_H_

@@ -1,29 +1,33 @@
-# The generic, V8-agnostic sandbox DLL (sbox.dll) + its broker/target C ABI.
-# Built with the Chromium toolchain; loaded by the app's host + target EXEs.
+# The product single-image sbox.exe (broker + worker, persona by argv) + the
+# broker/target C ABI it links statically. Built with the Chromium toolchain;
+# the EXE loads v8host.dll (the engine payload) at runtime.
 # Build everything: `ninja -C out/sandbox-x64 generic`.
 
-shared_library("sbox") {
-  sources = [ "sbox_dll.cc" ]
-  include_dirs = [ "." ]  # sbox.h
+# sbox.exe — the V8-agnostic sandbox container. Statically links the broker/
+# target core (sbox_dll.cc) and the role-dispatch + fail-closed lifecycle driver
+# (sbox_main.cc). SBOX_STATIC makes SBOX_API plain extern "C" so the core's
+# sbox_* symbols stay out of the EXE's export table (it must export nothing).
+executable("sbox") {
+  sources = [
+    "sbox_dll.cc",
+    "sbox_main.cc",
+  ]
+  include_dirs = [ "." ]  # sbox.h, msg_channel.h, sbox_harden.h, sbox_plugin_abi.h
+  defines = [ "SBOX_STATIC", "SBOX_DEV_ALLOW_UNSIGNED" ]
   deps = [
     "//base",
     "//sandbox/win:sandbox",
   ]
-
-  # Microsoft.JavaScript.V8 VERSIONINFO. The pruned sandbox tree lacks the
-  # hermetic rc binary GN's rc tool needs, so scripts/sbox-build.ts compiles
-  # src/version_info.rc -> version_info_sbox.res (VER_BINARY=4 selects sbox.dll's
-  # strings) with the Windows SDK rc.exe before ninja runs; link the prebuilt
-  # .res (lld-link embeds its resources). Path is relative to the out dir.
-  # source_link_gen_gyp.json: the SourceLink map (also written to the out dir by
-  # scripts/sbox-build.ts before ninja) — injected as the PDB "sourcelink" named
-  # stream via /pdbstream (lld-link does not support MSVC's /SOURCELINK). Embeds
-  # GitHub source indexing in sbox.dll's PDB (clears BinSkim BA2027). Relative to
-  # the out dir.
-  ldflags = [
-    "version_info_sbox.res",
-    "/pdbstream:sourcelink=source_link_gen_gyp.json",
+  libs = [
+    "advapi32.lib",  # token / SID plumbing pulled in by the sandbox core
+    "wintrust.lib",  # WinVerifyTrust (sbox_harden.h)
   ]
+
+  # Resolve statically-imported DLLs only from System32 + the app dir.
+  ldflags = [ "/DEPENDENTLOADFLAG:0xA00" ]
+
+  # Stage the engine payload (v8host.dll) beside sbox.exe so the worker loads it.
+  data_deps = [ "//v8host" ]
 }
 
 # The instrumented single-image trust-transition test (S1). ONE testonly exe that
@@ -45,7 +49,12 @@ if (current_cpu == "x64") {
       ".",           # sbox.h, msg_channel.h
       "//test_app",  # sbox_trust_transition_test_private.h
     ]
-    defines = [ "SBOX_TRUST_TRANSITION_TESTING" ]
+    # SBOX_STATIC: SBOX_API -> plain extern "C" so this exe (which also compiles
+    # sbox_dll.cc) exports nothing, like the product sbox.exe.
+    defines = [
+      "SBOX_TRUST_TRANSITION_TESTING",
+      "SBOX_STATIC",
+    ]
     deps = [
       "//base",
       "//sandbox/win:sandbox_trust_transition_test",

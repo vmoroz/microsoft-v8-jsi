@@ -23,7 +23,14 @@
 #include <cstddef>
 #include <cstdint>
 
-#ifdef SBOX_DLL_IMPL
+#if defined(SBOX_STATIC)
+// The broker/target core is linked directly into an executable (the product
+// sbox.exe and the trust-transition test both compile sbox_dll.cc), so the
+// sbox_* ABI is resolved at link time, not across a DLL boundary. Plain
+// extern "C" keeps the symbols out of the export table (the EXE must export
+// nothing). Checked BEFORE SBOX_DLL_IMPL because sbox_dll.cc self-defines that.
+#define SBOX_API extern "C"
+#elif defined(SBOX_DLL_IMPL)
 #define SBOX_API extern "C" __declspec(dllexport)
 #else
 #define SBOX_API extern "C" __declspec(dllimport)
