@@ -2,47 +2,57 @@
 # Built with the Chromium toolchain; loaded by the app's host + target EXEs.
 # Build everything: `ninja -C out/sandbox-x64 generic`.
 
-template("sbox_library") {
-  _trust_transition_testing = invoker.trust_transition_testing
-  shared_library(target_name) {
-    sources = [ "sbox_dll.cc" ]
-    include_dirs = [ "." ]  # sbox.h
+shared_library("sbox") {
+  sources = [ "sbox_dll.cc" ]
+  include_dirs = [ "." ]  # sbox.h
+  deps = [
+    "//base",
+    "//sandbox/win:sandbox",
+  ]
+
+  # Microsoft.JavaScript.V8 VERSIONINFO. The pruned sandbox tree lacks the
+  # hermetic rc binary GN's rc tool needs, so scripts/sbox-build.ts compiles
+  # src/version_info.rc -> version_info_sbox.res (VER_BINARY=4 selects sbox.dll's
+  # strings) with the Windows SDK rc.exe before ninja runs; link the prebuilt
+  # .res (lld-link embeds its resources). Path is relative to the out dir.
+  # source_link_gen_gyp.json: the SourceLink map (also written to the out dir by
+  # scripts/sbox-build.ts before ninja) — injected as the PDB "sourcelink" named
+  # stream via /pdbstream (lld-link does not support MSVC's /SOURCELINK). Embeds
+  # GitHub source indexing in sbox.dll's PDB (clears BinSkim BA2027). Relative to
+  # the out dir.
+  ldflags = [
+    "version_info_sbox.res",
+    "/pdbstream:sourcelink=source_link_gen_gyp.json",
+  ]
+}
+
+# The instrumented single-image trust-transition test (S1). ONE testonly exe that
+# is BOTH the sandbox broker/case-runner and the sandbox worker/fault-harness,
+# selected by argv, statically linking sbox_dll.cc + the sandbox trust-transition
+# core (which also carries sbox_trust_transition_test_private.cc). It proves the
+# same-image seed: the broker role spawns itself --worker and seeds the worker's
+# sandbox globals + control struct by RVA. This folded suite replaces the retired
+# two-image topology (a separate case-runner EXE + fault-injection target EXE
+# joined by the export-table relay).
+if (current_cpu == "x64") {
+  executable("sbox_trust_transition_test") {
+    testonly = true
+    sources = [
+      "sbox_dll.cc",
+      "sbox_trust_transition_main.cc",
+    ]
+    include_dirs = [
+      ".",           # sbox.h, msg_channel.h
+      "//test_app",  # sbox_trust_transition_test_private.h
+    ]
+    defines = [ "SBOX_TRUST_TRANSITION_TESTING" ]
     deps = [
       "//base",
-      "//sandbox/win:sandbox",
+      "//sandbox/win:sandbox_trust_transition_test",
     ]
+    libs = [ "userenv.lib" ]  # AppContainer profile APIs (broker/case role)
 
-    # Microsoft.JavaScript.V8 VERSIONINFO. The pruned sandbox tree lacks the
-    # hermetic rc binary GN's rc tool needs, so scripts/sbox-build.ts compiles
-    # src/version_info.rc -> version_info_sbox.res (VER_BINARY=4 selects sbox.dll's
-    # strings) with the Windows SDK rc.exe before ninja runs; link the prebuilt
-    # .res (lld-link embeds its resources). Path is relative to the out dir.
-    # source_link_gen_gyp.json: the SourceLink map (also written to the out dir by
-    # scripts/sbox-build.ts before ninja) — injected as the PDB "sourcelink" named
-    # stream via /pdbstream (lld-link does not support MSVC's /SOURCELINK). Embeds
-    # GitHub source indexing in sbox.dll's PDB (clears BinSkim BA2027). Relative to
-    # the out dir.
-    ldflags = [
-      "version_info_sbox.res",
-      "/pdbstream:sourcelink=source_link_gen_gyp.json",
-    ]
-    if (_trust_transition_testing) {
-      testonly = true
-      output_name = "sbox_trust_transition_test"
-      defines = [ "SBOX_TRUST_TRANSITION_TESTING" ]
-      deps -= [ "//sandbox/win:sandbox" ]
-      deps += [ "//sandbox/win:sandbox_trust_transition_test" ]
-      include_dirs += [ "//test_app" ]
-    }
-  }
-}
-
-sbox_library("sbox") {
-  trust_transition_testing = false
-}
-
-if (current_cpu == "x64") {
-  sbox_library("sbox_trust_transition_test") {
-    trust_transition_testing = true
+    # Resolve statically-imported DLLs only from System32 + the app dir.
+    ldflags = [ "/DEPENDENTLOADFLAG:0xA00" ]
   }
 }

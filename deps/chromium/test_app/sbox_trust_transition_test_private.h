@@ -76,11 +76,17 @@ constexpr uint64_t kSboxTrustTransitionControlMagic = 0x5342503154455354ull;
 constexpr uint32_t kSboxTrustTransitionControlVersion = 2;
 constexpr wchar_t kSboxTrustTransitionCapability[] = L"S-1-15-3-4021848294-1651122667-3873966303-2985905677";
 
-#if defined(SBOX_TRUST_TRANSITION_TEST_DLL_IMPL)
-#define SBOX_TRUST_TRANSITION_API extern "C" __declspec(dllexport)
-#else
-#define SBOX_TRUST_TRANSITION_API extern "C" __declspec(dllimport)
-#endif
+// The instrumented single-image trust-transition test links the control plane
+// (sbox_dll.cc) and the role-by-argv main into ONE image, so these symbols
+// resolve within the image at link time and are never exported. The broker role
+// seeds g_sbox_trust_transition_test_control into the suspended worker by RVA
+// (same image, same RVA) — the inversion of the retired export-table relay.
+#define SBOX_TRUST_TRANSITION_API extern "C"
+
+// The same-image control struct: the broker role seeds it by RVA, the worker
+// role reads it. Defined once in the instrumented image's main TU; declared here
+// so both the control plane and the worker reference the one symbol.
+extern "C" SboxTrustTransitionTestControl g_sbox_trust_transition_test_control;
 
 SBOX_TRUST_TRANSITION_API int sbox_trust_transition_test_set_next_case(uint32_t case_id, uint64_t serial);
 SBOX_TRUST_TRANSITION_API int sbox_trust_transition_test_initialize(const SboxTrustTransitionTestControl *control);

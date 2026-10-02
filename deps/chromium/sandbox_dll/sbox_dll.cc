@@ -44,7 +44,6 @@
 #include "sandbox/win/src/security_level.h"
 #include "sandbox/win/src/target_services.h"  // TargetServicesBase::TestIPCPing
 #if defined(SBOX_TRUST_TRANSITION_TESTING)
-#define SBOX_TRUST_TRANSITION_TEST_DLL_IMPL
 #include "sbox_trust_transition_test_private.h"
 #endif
 
@@ -407,10 +406,20 @@ DWORD MyDllSizeOfImage() {
   return nt->OptionalHeader.SizeOfImage;
 }
 
-// Finds the address of an exported symbol in a (suspended) child process by
-// reading its PEB -> EXE base and parsing the EXE export table. We deliver the
-// bootstrap into the child's EXE image (mapped at creation, unlike sbox.dll).
-uint64_t FindRemoteExport(HANDLE proc, const char* name) {
+// Same-image handoff — replaces the retired FindRemoteExport export-table walk.
+//
+// The old relay PE-parsed the suspended child's EXE export table to locate an
+// exported g_sbox_bootstrap, then WriteProcessMemory'd a bootstrap struct the
+// child copied into the sandbox globals. That existed ONLY because the broker
+// and target were DIFFERENT images (the target's sbox.dll was not yet mapped),
+// so the broker could not name the target's sandbox globals.
+//
+// In the single-image topology the broker and worker are the SAME image with
+// the sandbox core statically linked, so every sandbox global sits at the SAME
+// RVA in both. The broker writes the worker's globals directly — no export-table
+// walk, no bootstrap struct. The ONLY per-process unknown is the worker's ASLR
+// base, read from one documented PEB field (not the export table).
+uint64_t WorkerImageBase(HANDLE proc) {
   struct PBI {
     PVOID r1;
     PVOID PebBaseAddress;
@@ -426,64 +435,47 @@ uint64_t FindRemoteExport(HANDLE proc, const char* name) {
   PBI pbi = {};
   if (nt_qip(proc, 0 /*ProcessBasicInformation*/, &pbi, sizeof(pbi), nullptr) < 0)
     return 0;
-
-  auto rpm = [&](uint64_t addr, void* out, size_t n) -> bool {
-    SIZE_T got = 0;
-    return ::ReadProcessMemory(proc, reinterpret_cast<void*>(addr), out, n,
-                               &got) &&
-           got == n;
-  };
-
-  // v8-jsi: PEB->ImageBaseAddress offset + the pointer width are arch-
-  // specific. The broker and target are always the SAME arch (the Chromium
-  // sandbox requires a uniform-ABI broker/target pair), so we read the native
-  // pointer width: x64 PEB has ImageBaseAddress at 0x10, x86 PEB at 0x08.
-  // (Was hardcoded to the x64 layout, which read the wrong field for a 32-bit
-  // target and made FindRemoteExport return 0.)
+  // PEB->ImageBaseAddress is at 0x10 on 64-bit (x64/arm64) and 0x08 on x86. The
+  // broker and target are the same arch by construction (the Chromium sandbox
+  // requires a uniform-ABI broker/target pair), so the native pointer width
+  // selects the correct offset.
+  static_assert(sizeof(void*) == 8 || sizeof(void*) == 4,
+                "unexpected pointer width for the PEB ImageBaseAddress offset");
   const uint64_t kImageBaseOff = sizeof(void*) == 8 ? 0x10 : 0x08;
-  uintptr_t image_base_native = 0;
-  if (!rpm(reinterpret_cast<uint64_t>(pbi.PebBaseAddress) + kImageBaseOff,
-           &image_base_native, sizeof(image_base_native)))
+  uintptr_t base = 0;  // pointer-width read: exactly ImageBaseAddress (x86-safe)
+  SIZE_T got = 0;
+  if (!::ReadProcessMemory(
+          proc, reinterpret_cast<BYTE*>(pbi.PebBaseAddress) + kImageBaseOff,
+          &base, sizeof(base), &got) ||
+      got != sizeof(base))
     return 0;
-  uint64_t image_base = image_base_native;
+  return base;
+}
 
-  IMAGE_DOS_HEADER dos = {};
-  if (!rpm(image_base, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE)
-    return 0;
-  IMAGE_NT_HEADERS nt = {};
-  if (!rpm(image_base + dos.e_lfanew, &nt, sizeof(nt)) ||
-      nt.Signature != IMAGE_NT_SIGNATURE)
-    return 0;
-  DWORD exp_rva =
-      nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
-          .VirtualAddress;
-  if (!exp_rva)
-    return 0;
-  IMAGE_EXPORT_DIRECTORY exp = {};
-  if (!rpm(image_base + exp_rva, &exp, sizeof(exp)))
-    return 0;
+// The duplex message channel has no sandbox global, so the broker seeds this
+// file-scope struct (by RVA) with the 4 child-side channel handles + a magic;
+// the worker reads its own copy. Not exported — addressed by same-image RVA,
+// never by an export lookup.
+struct SboxWorkerSeed {
+  uint64_t magic;
+  uint64_t msg_section;
+  uint64_t msg_evt_t2b;
+  uint64_t msg_evt_b2t;
+  uint64_t msg_evt_close;
+};
+SboxWorkerSeed g_sbox_worker_seed = {};
+constexpr uint64_t kSboxWorkerSeedMagic = 0x5342584F53454544ull;  // 'SBXOSEED'
 
-  for (DWORD i = 0; i < exp.NumberOfNames; ++i) {
-    DWORD name_rva = 0;
-    if (!rpm(image_base + exp.AddressOfNames + i * sizeof(DWORD), &name_rva,
-             sizeof(DWORD)))
-      return 0;
-    char buf[64] = {};
-    if (!rpm(image_base + name_rva, buf, sizeof(buf) - 1))
-      continue;
-    if (std::strcmp(buf, name) != 0)
-      continue;
-    WORD ord = 0;
-    if (!rpm(image_base + exp.AddressOfNameOrdinals + i * sizeof(WORD), &ord,
-             sizeof(WORD)))
-      return 0;
-    DWORD func_rva = 0;
-    if (!rpm(image_base + exp.AddressOfFunctions + ord * sizeof(DWORD),
-             &func_rva, sizeof(DWORD)))
-      return 0;
-    return image_base + func_rva;
-  }
-  return 0;
+// Write `n` bytes of `value` into the SAME variable in the same-image worker:
+// worker_addr = &local - my_base + worker_base.
+bool SeedWorkerVar(HANDLE proc, uint64_t worker_base, uintptr_t my_base,
+                   const void* local, const void* value, size_t n) {
+  const uint64_t remote =
+      worker_base + (reinterpret_cast<uintptr_t>(local) - my_base);
+  SIZE_T wrote = 0;
+  return ::WriteProcessMemory(proc, reinterpret_cast<void*>(remote), value, n,
+                              &wrote) &&
+         wrote == n;
 }
 
 // --- message channel (broker side) ---
@@ -689,7 +681,7 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
   // Hosted mode: the broker can't push into the suspended child's unmapped
   // sbox.dll. Create the shared IPC section here (target->Init adopts it); after
   // the spawn we duplicate it + the message-channel handles into the child and
-  // relay the values via the child's EXE bootstrap struct.
+  // seed the values directly at their shared RVAs (same-image handoff).
   sandbox::g_sbox_hosted_mode = true;
 #if defined(SBOX_TRUST_TRANSITION_TESTING)
   if (sandbox::trust_transition_test::ConsumeBrokerFault(
@@ -708,7 +700,12 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
   sandbox::g_sbox_hosted_section = s->ipc_section;
 
   base::CommandLine target_cmd((base::FilePath(target_exe)));
-  BrokerLog("[broker] spawning target binary: %ls\n", target_exe);
+  // Single-image topology — the broker spawns THIS SAME image in the worker
+  // role. The role is carried by argv so main() can branch before any role-only
+  // init; the sandbox state is delivered by the same-image seed below. This
+  // switch only selects the persona.
+  target_cmd.AppendSwitch("worker");
+  BrokerLog("[broker] spawning target binary: %ls --worker\n", target_exe);
 
   // Capture the sandboxed target's stdout (it can't reach the console).
   wchar_t dir[MAX_PATH] = {};
@@ -763,56 +760,83 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
   BrokerLog("[broker] target created: pid=%lu output=%ls\n", target_pid,
             s->log_path.empty() ? L"(unavailable)" : s->log_path.c_str());
 
-  // Relay the bootstrap to the child's EXE struct while it is still suspended
-  // (its EXE image is mapped; its sbox.dll is not). Duplicate the IPC section +
-  // the message-channel section/events into the child, then PE-find
-  // g_sbox_bootstrap and write the values.
+  // Same-image seed. Duplicate the IPC + message-channel handles into the child
+  // (unchanged), then write the worker's sandbox globals + the channel seed
+  // DIRECTLY at their shared RVAs while it is still suspended — no export-table
+  // walk, no bootstrap struct.
   HANDLE proc = s->proc;
-  SboxBootstrap bootstrap = {};
-  bootstrap.magic = SBOX_BOOTSTRAP_MAGIC;
-  if (!::DuplicateHandle(
-          ::GetCurrentProcess(), s->ipc_section, proc,
-          reinterpret_cast<HANDLE*>(&bootstrap.section_handle),
-          FILE_MAP_READ | FILE_MAP_WRITE | SECTION_QUERY, FALSE, 0) ||
-      !::DuplicateHandle(::GetCurrentProcess(), s->msg_section, proc,
-                         reinterpret_cast<HANDLE*>(&bootstrap.msg_section),
+  HANDLE child_ipc = nullptr, child_msg = nullptr;
+  HANDLE child_t2b = nullptr, child_b2t = nullptr, child_close = nullptr;
+  if (!::DuplicateHandle(::GetCurrentProcess(), s->ipc_section, proc, &child_ipc,
                          FILE_MAP_READ | FILE_MAP_WRITE | SECTION_QUERY, FALSE,
                          0) ||
-      !::DuplicateHandle(::GetCurrentProcess(), s->evt_t2b, proc,
-                         reinterpret_cast<HANDLE*>(&bootstrap.msg_evt_t2b),
+      !::DuplicateHandle(::GetCurrentProcess(), s->msg_section, proc, &child_msg,
+                         FILE_MAP_READ | FILE_MAP_WRITE | SECTION_QUERY, FALSE,
+                         0) ||
+      !::DuplicateHandle(::GetCurrentProcess(), s->evt_t2b, proc, &child_t2b,
                          EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, 0) ||
-      !::DuplicateHandle(::GetCurrentProcess(), s->evt_b2t, proc,
-                         reinterpret_cast<HANDLE*>(&bootstrap.msg_evt_b2t),
+      !::DuplicateHandle(::GetCurrentProcess(), s->evt_b2t, proc, &child_b2t,
                          EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, 0) ||
-      !::DuplicateHandle(::GetCurrentProcess(), s->evt_close, proc,
-                         reinterpret_cast<HANDLE*>(&bootstrap.msg_evt_close),
+      !::DuplicateHandle(::GetCurrentProcess(), s->evt_close, proc, &child_close,
                          EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, 0)) {
     BrokerLog("[broker] DuplicateHandle(->child) failed: %lu\n", ::GetLastError());
     return nullptr;
   }
-  bootstrap.ipc_size = sandbox::g_sbox_hosted_child_ipc_size;
-  bootstrap.policy_size = sandbox::g_sbox_hosted_child_policy_size;
-  bootstrap.integrity = MapIntegrity(policy->delayed_integrity);
-  bootstrap.mitigations =
-      policy->prohibit_dynamic_code ? sandbox::MITIGATION_DYNAMIC_CODE_DISABLE : 0;
-  // Relay the handle-closer config (parity with SetupHandleCloser).
-  static_assert(sizeof(sandbox::HandleCloserConfig) <=
-                    sizeof(bootstrap.handle_closer),
-                "HandleCloserConfig does not fit the bootstrap relay field");
-  std::memcpy(bootstrap.handle_closer, &sandbox::g_sbox_hosted_handle_closer,
-              sizeof(sandbox::HandleCloserConfig));
-  uint64_t addr = FindRemoteExport(proc, "g_sbox_bootstrap");
-  SIZE_T wrote = 0;
-  if (!addr ||
-      !::WriteProcessMemory(proc, reinterpret_cast<void*>(addr), &bootstrap,
-                            sizeof(bootstrap), &wrote) ||
-      wrote != sizeof(bootstrap)) {
-    BrokerLog("[broker] relay bootstrap failed (addr=0x%llx err=%lu)\n",
-           (unsigned long long)addr, ::GetLastError());
+
+  const uint64_t worker_base = WorkerImageBase(proc);
+  // my_base is the base of THIS image (the one holding the sandbox globals we
+  // address below). sbox_dll.cc links into the DLL and into the single-image
+  // test exe, so CURRENT_MODULE() (not the process EXE) is the correct anchor.
+  const uintptr_t my_base = MyDllBase();
+  if (!worker_base || !my_base) {
+    BrokerLog("[broker] same-image base read failed (worker=0x%llx my=0x%llx)\n",
+              (unsigned long long)worker_base, (unsigned long long)my_base);
     return nullptr;
   }
-  BrokerLog("[broker] relayed bootstrap @0x%llx: ipc=%u policy=%u + message channel\n",
-         (unsigned long long)addr, bootstrap.ipc_size, bootstrap.policy_size);
+  BrokerLog("[broker] same-image seed: my_base=0x%llx worker_base=0x%llx%s\n",
+            (unsigned long long)my_base, (unsigned long long)worker_base,
+            worker_base == my_base ? " (identical)" : " (relocated)");
+
+  // Values for the worker's copies of the sandbox globals (the same values the
+  // retired bootstrap carried, written directly instead of through a struct).
+  const HANDLE v_section = child_ipc;
+  const size_t v_ipc = sandbox::g_sbox_hosted_child_ipc_size;
+  const size_t v_policy = sandbox::g_sbox_hosted_child_policy_size;
+  const sandbox::IntegrityLevel v_integ = MapIntegrity(policy->delayed_integrity);
+  const sandbox::MitigationFlags v_mit =
+      policy->prohibit_dynamic_code ? sandbox::MITIGATION_DYNAMIC_CODE_DISABLE : 0;
+  SboxWorkerSeed seed = {};
+  seed.magic = kSboxWorkerSeedMagic;
+  seed.msg_section = reinterpret_cast<uint64_t>(child_msg);
+  seed.msg_evt_t2b = reinterpret_cast<uint64_t>(child_t2b);
+  seed.msg_evt_b2t = reinterpret_cast<uint64_t>(child_b2t);
+  seed.msg_evt_close = reinterpret_cast<uint64_t>(child_close);
+
+  // All seed writes land while the worker is suspended, before ResumeThread.
+  const bool seeded =
+      SeedWorkerVar(proc, worker_base, my_base, &sandbox::g_shared_section,
+                    &v_section, sizeof(HANDLE)) &&
+      SeedWorkerVar(proc, worker_base, my_base, &sandbox::g_shared_IPC_size,
+                    &v_ipc, sizeof(size_t)) &&
+      SeedWorkerVar(proc, worker_base, my_base, &sandbox::g_shared_policy_size,
+                    &v_policy, sizeof(size_t)) &&
+      SeedWorkerVar(proc, worker_base, my_base,
+                    &sandbox::g_shared_delayed_integrity_level, &v_integ,
+                    sizeof(v_integ)) &&
+      SeedWorkerVar(proc, worker_base, my_base,
+                    &sandbox::g_shared_delayed_mitigations, &v_mit,
+                    sizeof(v_mit)) &&
+      SeedWorkerVar(proc, worker_base, my_base, &sandbox::g_handle_closer_info,
+                    &sandbox::g_sbox_hosted_handle_closer,
+                    sizeof(sandbox::HandleCloserConfig)) &&
+      SeedWorkerVar(proc, worker_base, my_base, &g_sbox_worker_seed, &seed,
+                    sizeof(seed));
+  if (!seeded) {
+    BrokerLog("[broker] same-image seed write failed: %lu\n", ::GetLastError());
+    return nullptr;
+  }
+  BrokerLog("[broker] same-image seed OK: ipc=%zu policy=%zu + message channel\n",
+            v_ipc, v_policy);
 
 #if defined(SBOX_TRUST_TRANSITION_TESTING)
   SboxTrustTransitionTestControl control = {};
@@ -823,16 +847,12 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
   }
   if (control.magic == kSboxTrustTransitionControlMagic) {
     control.broker_dll_base = MyDllBase();
-    const uint64_t control_addr =
-        FindRemoteExport(proc, "g_sbox_trust_transition_test_control");
-    wrote = 0;
-    if (!control_addr ||
-        !::WriteProcessMemory(proc, reinterpret_cast<void*>(control_addr),
-                              &control, sizeof(control), &wrote) ||
-        wrote != sizeof(control)) {
-      BrokerLog("[broker] trust-transition control relay failed "
-                "(addr=0x%llx err=%lu)\n",
-                static_cast<unsigned long long>(control_addr),
+    // Same-image seed: write the control struct directly at its shared RVA in
+    // the suspended worker (was a FindRemoteExport of an exported symbol).
+    if (!SeedWorkerVar(proc, worker_base, my_base,
+                       &g_sbox_trust_transition_test_control, &control,
+                       sizeof(control))) {
+      BrokerLog("[broker] trust-transition control seed failed (err=%lu)\n",
                 ::GetLastError());
       return nullptr;
     }
@@ -1114,33 +1134,25 @@ SBOX_TRUST_TRANSITION_API int sbox_trust_transition_test_get_exit_observation(
 }
 #endif
 
-SBOX_API SboxTarget* sbox_target_begin(const SboxBootstrap* boot) {
+SBOX_API SboxTarget* sbox_target_begin(void) {
   EnsureBase();
   setvbuf(stdout, nullptr, _IONBF, 0);
 
-  if (!boot || boot->magic != SBOX_BOOTSTRAP_MAGIC) {
-    printf("[sbox] missing/invalid bootstrap (magic=0x%llx)\n",
-           boot ? static_cast<unsigned long long>(boot->magic) : 0ull);
+  // The broker already wrote this worker's sandbox globals (g_shared_section is
+  // the is-target gate) and the message-channel seed directly at their shared
+  // RVAs while we were suspended — there is no bootstrap struct to copy. The
+  // seed magic confirms the broker ran; its absence fails closed.
+  if (g_sbox_worker_seed.magic != kSboxWorkerSeedMagic) {
+    printf("[sbox] missing same-image seed (magic=0x%llx)\n",
+           static_cast<unsigned long long>(g_sbox_worker_seed.magic));
     return nullptr;
   }
-  // Populate the sandbox globals BEFORE GetTargetServices (g_shared_section is
-  // the is-target gate). The broker relayed these into this EXE's exported
-  // g_sbox_bootstrap while the process was suspended.
-  sandbox::g_shared_section = reinterpret_cast<HANDLE>(boot->section_handle);
-  sandbox::g_shared_IPC_size = boot->ipc_size;
-  sandbox::g_shared_policy_size = boot->policy_size;
-  sandbox::g_shared_delayed_integrity_level =
-      static_cast<sandbox::IntegrityLevel>(boot->integrity);
-  sandbox::g_shared_delayed_mitigations =
-      static_cast<sandbox::MitigationFlags>(boot->mitigations);
-  // Apply the relayed handle-closer config before LowerToken runs its
-  // CloseOpenHandles step (parity with the broker's skipped SetupHandleCloser).
-  std::memcpy(&sandbox::g_handle_closer_info, boot->handle_closer,
-              sizeof(sandbox::HandleCloserConfig));
-  printf("[sbox] target bootstrap: section=%p ipc=%u policy=%u handle_closer=%d\n",
-         reinterpret_cast<void*>(sandbox::g_shared_section), boot->ipc_size,
-         boot->policy_size, sandbox::g_handle_closer_info.handle_closer_enabled);
-  printf("[sbox] sbox.dll base = 0x%llx (size 0x%lx)\n",
+  printf("[sbox] same-image seed: section=%p ipc=%zu policy=%zu handle_closer=%d\n",
+         reinterpret_cast<void*>(sandbox::g_shared_section),
+         static_cast<size_t>(sandbox::g_shared_IPC_size),
+         static_cast<size_t>(sandbox::g_shared_policy_size),
+         sandbox::g_handle_closer_info.handle_closer_enabled);
+  printf("[sbox] image base = 0x%llx (size 0x%lx)\n",
          (unsigned long long)MyDllBase(), MyDllSizeOfImage());
 
   sandbox::TargetServices* services =
@@ -1158,15 +1170,17 @@ SBOX_API SboxTarget* sbox_target_begin(const SboxBootstrap* boot) {
   SboxTarget* target = new SboxTarget();
   target->services = services;
 
-  // Map the duplex message channel relayed by the broker.
-  if (boot->msg_section) {
-    void* map = ::MapViewOfFile(reinterpret_cast<HANDLE>(boot->msg_section),
-                                FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
+  // Map the duplex message channel from the same-image seed.
+  if (g_sbox_worker_seed.msg_section) {
+    void* map = ::MapViewOfFile(
+        reinterpret_cast<HANDLE>(g_sbox_worker_seed.msg_section),
+        FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
     if (map && sbox_msg::Header(map)->magic == sbox_msg::kMagic) {
       target->msg_map = map;
-      target->evt_t2b = reinterpret_cast<HANDLE>(boot->msg_evt_t2b);
-      target->evt_b2t = reinterpret_cast<HANDLE>(boot->msg_evt_b2t);
-      target->evt_close = reinterpret_cast<HANDLE>(boot->msg_evt_close);
+      target->evt_t2b = reinterpret_cast<HANDLE>(g_sbox_worker_seed.msg_evt_t2b);
+      target->evt_b2t = reinterpret_cast<HANDLE>(g_sbox_worker_seed.msg_evt_b2t);
+      target->evt_close =
+          reinterpret_cast<HANDLE>(g_sbox_worker_seed.msg_evt_close);
       printf("[sbox] message channel mapped\n");
     } else {
       printf("[sbox] message channel map FAILED (err=%lu)\n", ::GetLastError());

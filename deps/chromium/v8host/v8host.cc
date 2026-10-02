@@ -5,9 +5,14 @@
 // for Trusted (overridable via V8HOST_ENGINE_DLL). All V8
 // knowledge lives HERE, not in the sandbox DLL.
 //
-// g_sbox_bootstrap is EXPORTED so the broker can find it (by parsing this EXE's
-// export table) and write the bootstrap values into it while this process is
-// still suspended — the EXE image is mapped at creation, unlike sbox.dll.
+// NOTE: v8host.exe is the legacy two-image sandbox TARGET (broker test_app.exe
+// spawning a SEPARATE v8host.exe, formerly joined by the export-table bootstrap
+// relay). The sandbox core now uses a same-image seed (broker and worker are one
+// statically-linked image), which retires that relay. This two-image target flow
+// is therefore intentionally idled: a foreign EXE never receives the same-image
+// seed, so sbox_target_begin() here fails closed (returns NULL). v8host is
+// re-pointed onto the single-image sbox.exe in a later stage; it is kept building
+// in the meantime.
 //
 // Stage 2 of the WebView2-style message channel lives here: a `host` JS object
 // (host.postMessage / host.postMessageBinary / host.onmessage) bridged to the
@@ -50,8 +55,6 @@
 
 #include "jsi_abi/JsiAbiRuntime.h"
 #include "jsi_abi/v8_jsi_config.h"
-
-extern "C" __declspec(dllexport) SboxBootstrap g_sbox_bootstrap = {};
 
 namespace {
 
@@ -542,7 +545,7 @@ int main() {
   // it before spawning us — see test_app.cc).
   sbox_harden::HardenDllSearch();
 
-  SboxTarget* target = sbox_target_begin(&g_sbox_bootstrap);
+  SboxTarget* target = sbox_target_begin();
   if (!target) {
     printf("[v8host] sbox_target_begin failed\n");
     return 10;

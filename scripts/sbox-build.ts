@@ -572,14 +572,15 @@ interface SandboxBinary {
 
 // The sandbox binaries and their allowed export surfaces.
 //   sbox.dll      — the sandbox C ABI: only sbox_*.
-//   v8host.exe    — exports only g_sbox_bootstrap, the struct the broker locates
-//                   and populates in the suspended child.
+//   v8host.exe    — exports nothing; the same-image seed retired the exported
+//                   g_sbox_bootstrap struct the broker used to locate and
+//                   populate in the suspended child.
 //   test_app.exe  — exports nothing.
 //   test_app_signed.exe — same, built fail-closed (no SBOX_DEV_ALLOW_UNSIGNED).
 const sandboxBinaries: SandboxBinary[] = [
   // sbox.dll budget: <= 2 MiB (measured 1.74 MiB; floor at the Hybrid CRT).
   { file: "sbox.dll", allowedExportPrefixes: ["sbox_"], maxBytes: 2 * 1024 * 1024 },
-  { file: "v8host.exe", allowedExportPrefixes: ["g_sbox_bootstrap"] },
+  { file: "v8host.exe", allowedExportPrefixes: [] },
   { file: "test_app.exe", allowedExportPrefixes: [] },
   { file: "test_app_signed.exe", allowedExportPrefixes: [] },
 ];

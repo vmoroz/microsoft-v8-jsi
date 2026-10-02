@@ -85,27 +85,13 @@ typedef struct SboxPolicy {
 // The current complete structure is required. Smaller structures are rejected;
 // larger structures may append fields, but this version reads only this prefix.
 
-// Bootstrap struct: the target EXE exports an instance named `g_sbox_bootstrap`;
-// the broker fills it (by parsing the target EXE's export table) while the
-// target is still suspended — the EXE image is mapped at creation, unlike the
-// target's not-yet-loaded sbox.dll. The fields carry only values (a handle, two
-// sizes, the delayed integrity + mitigations), never DLL addresses, so the
-// scheme is independent of where sbox.dll loads in either process.
-typedef struct SboxBootstrap {
-  uint64_t magic;           // SBOX_BOOTSTRAP_MAGIC once the broker has written it
-  uint64_t section_handle;  // child-side shared-section HANDLE value
-  uint32_t ipc_size;        // shared IPC region size
-  uint32_t policy_size;     // policy blob size (in the section)
-  int32_t  integrity;       // delayed integrity (raw sandbox value)
-  uint64_t mitigations;     // delayed mitigations (raw sandbox value)
-  uint8_t  handle_closer[8];  // opaque: the sandbox HandleCloserConfig (relayed)
-  uint64_t msg_section;     // child-side message-channel section handle
-  uint64_t msg_evt_t2b;     // child-side event the target SIGNALS (target->broker)
-  uint64_t msg_evt_b2t;     // child-side event the target WAITS on (broker->target)
-  uint64_t msg_evt_close;   // child-side event the broker SIGNALS to close the channel
-} SboxBootstrap;
-
-#define SBOX_BOOTSTRAP_MAGIC 0x5342584F4F540003ull  // 'SBXOOT' + v3
+// Same-image handoff: the broker and target are the SAME statically-linked
+// image, so every sandbox global sits at the same RVA in both. While the target
+// is suspended the broker writes its sandbox globals (and a small channel seed)
+// directly at those shared RVAs — there is no exported bootstrap struct and no
+// export-table walk. The only per-process unknown is the target's ASLR base,
+// read from one documented PEB field, which keeps the scheme independent of
+// where the image loads in either process.
 
 // --- broker role (used by the host, e.g. test_app.exe) ---
 // Spawn `target_exe` as a locked-down sandbox target per `policy`, wire the
@@ -174,10 +160,12 @@ SBOX_API void* sbox_target_close_event(SboxTarget* target);
 
 // --- target role (used by the app-defined target EXE, e.g. v8host.exe) ---
 
-// Adopt the broker-relayed bootstrap, init the sandbox target services, and
-// stand up the IPC client. Returns NULL on failure. Call BEFORE doing any guest
-// warmup; the returned handle is used for the calls below.
-SBOX_API SboxTarget* sbox_target_begin(const SboxBootstrap* boot);
+// Adopt the broker's same-image seed (written into this image's sandbox globals
+// while the process was suspended), init the sandbox target services, and stand
+// up the IPC client. Returns NULL on failure, including a missing seed (fail
+// closed). Call BEFORE doing any guest warmup; the returned handle is used for
+// the calls below.
+SBOX_API SboxTarget* sbox_target_begin(void);
 
 // Prove the broker<->target IPC channel (a cross-call ping). Returns 1 on OK.
 SBOX_API int sbox_target_test_ipc(SboxTarget* target);
