@@ -574,15 +574,19 @@ interface SandboxBinary {
 //   sbox.exe    — the single-image container: exports NOTHING. SBOX_STATIC makes
 //                 the statically-linked sbox_* core resolve at link time rather
 //                 than through the EXE's export table.
-//   v8host.dll  — the engine payload: exports only the v8host_worker_* plugin-ABI
-//                 entrypoints the container resolves by name.
+//   v8host.dll  — the engine payload: exports only the single sbox_plugin_main
+//                 plugin-ABI entry the container resolves by name.
 const sandboxBinaries: SandboxBinary[] = [
   // sbox.exe budget: <= 2 MiB (measured ~1.76 MiB; floor at the Hybrid CRT).
   { file: "sbox.exe", allowedExportPrefixes: [], maxBytes: 2 * 1024 * 1024 },
   // v8host.dll budget: <= 512 KiB (measured ~0.36 MiB for the real V8/JSI engine
   // persona — the engine DLL itself is LoadLibrary'd at runtime, so this is just
   // the plugin + JSI C++ API glue).
-  { file: "v8host.dll", allowedExportPrefixes: ["v8host_"], maxBytes: 512 * 1024 },
+  {
+    file: "v8host.dll",
+    allowedExportPrefixes: ["sbox_plugin_main"],
+    maxBytes: 512 * 1024,
+  },
 ];
 
 // Gate 1: export allowlist. Every export of every sandbox binary must match its

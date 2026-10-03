@@ -6,7 +6,7 @@
 
 #define SBOX_DLL_IMPL
 #include "msg_channel.h"
-#include "sbox.h"
+#include "sbox_core_internal.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -455,13 +455,18 @@ uint64_t WorkerImageBase(HANDLE proc) {
 // The duplex message channel has no sandbox global, so the broker seeds this
 // file-scope struct (by RVA) with the 4 child-side channel handles + a magic;
 // the worker reads its own copy. Not exported — addressed by same-image RVA,
-// never by an export lookup.
+// never by an export lookup. plugin_data is an opaque app blob the broker copies
+// in and the worker reads back (sbox_target_plugin_data); the core never looks
+// inside it.
+constexpr size_t kSboxPluginDataMax = 4096;  // fixed cap; a larger blob fails spawn
 struct SboxWorkerSeed {
   uint64_t magic;
   uint64_t msg_section;
   uint64_t msg_evt_t2b;
   uint64_t msg_evt_b2t;
   uint64_t msg_evt_close;
+  uint32_t plugin_data_len;                 // bytes actually set in plugin_data
+  uint8_t plugin_data[kSboxPluginDataMax];  // opaque app knowledge; never read here
 };
 SboxWorkerSeed g_sbox_worker_seed = {};
 constexpr uint64_t kSboxWorkerSeedMagic = 0x5342584F53454544ull;  // 'SBXOSEED'
@@ -707,6 +712,13 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
   target_cmd.AppendSwitch("worker");
   BrokerLog("[broker] spawning target binary: %ls --worker\n", target_exe);
 
+  // Propagate the plugin identity to the worker persona (opaque to the core — a
+  // renameable host stays in sync with its plugin). Rendered as --plugin=<name>.
+  if (policy->worker_plugin_name && policy->worker_plugin_name[0]) {
+    target_cmd.AppendSwitchNative("plugin", policy->worker_plugin_name);
+    BrokerLog("[broker] worker plugin = %ls\n", policy->worker_plugin_name);
+  }
+
   // Capture the sandboxed target's stdout (it can't reach the console).
   wchar_t dir[MAX_PATH] = {};
   DWORD tn = ::GetTempPathW(MAX_PATH, dir);
@@ -811,6 +823,20 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
   seed.msg_evt_t2b = reinterpret_cast<uint64_t>(child_t2b);
   seed.msg_evt_b2t = reinterpret_cast<uint64_t>(child_b2t);
   seed.msg_evt_close = reinterpret_cast<uint64_t>(child_close);
+
+  // Carry the opaque app blob broker->worker inline in the seed (design: "lean
+  // seed"). Bounded; a blob that doesn't fit fails closed.
+  const size_t plugin_data_len =
+      (policy->plugin_data && policy->plugin_data_len) ? policy->plugin_data_len
+                                                       : 0;
+  if (plugin_data_len > kSboxPluginDataMax) {
+    BrokerLog("[broker] plugin_data too large: %zu > %zu\n", plugin_data_len,
+              kSboxPluginDataMax);
+    return nullptr;
+  }
+  if (plugin_data_len)
+    ::memcpy(seed.plugin_data, policy->plugin_data, plugin_data_len);
+  seed.plugin_data_len = static_cast<uint32_t>(plugin_data_len);
 
   // All seed writes land while the worker is suspended, before ResumeThread.
   const bool seeded =
@@ -1262,6 +1288,25 @@ SBOX_API void sbox_target_end(SboxTarget* target) {
   if (target && target->msg_map)
     ::UnmapViewOfFile(target->msg_map);
   delete target;  // does not terminate the process
+}
+
+SBOX_API int sbox_target_plugin_data(SboxTarget* target, const void** data,
+                                     size_t* len) {
+  if (!target || !data || !len)
+    return 0;
+  *data = g_sbox_worker_seed.plugin_data_len ? g_sbox_worker_seed.plugin_data
+                                             : nullptr;
+  *len = g_sbox_worker_seed.plugin_data_len;
+  return 1;
+}
+
+SBOX_API int sbox_target_acg_enabled(SboxTarget* target) {
+  if (!target)
+    return 0;
+  return (sandbox::g_shared_delayed_mitigations &
+          sandbox::MITIGATION_DYNAMIC_CODE_DISABLE) != 0
+             ? 1
+             : 0;
 }
 
 SBOX_API int sbox_target_post_message(SboxTarget* target, int kind,

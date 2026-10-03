@@ -1,8 +1,9 @@
 # v8host.dll — the engine payload driven by the product sbox.exe worker. It
-# exports only the v8host_worker_* plugin-ABI entrypoints (sbox.exe resolves them
+# exports only the single sbox_plugin_main plugin-ABI entry (sbox.exe resolves it
 # by name) and links the JSI C++ API (jsi_cpp) but NOT the sandbox core. This is
 # the control inversion from the retired two-image v8host.exe: the container owns
-# main() and drives warmup (pre-lockdown) -> lower_token -> run (post-lockdown).
+# main() and drives configure (broker) + warmup (pre-lockdown) -> lower_token ->
+# run (post-lockdown) -> shutdown.
 #
 # REAL V8/JSI engine persona: v8host_engine.cc loads the engine DLL (v8jsisb.dll
 # jitless for Untrusted / v8jsi.dll for Trusted), creates a JSI runtime, installs
@@ -11,10 +12,11 @@
 shared_library("v8host") {
   sources = [ "v8host_engine.cc" ]
 
-  # //sandbox_dll for sbox_plugin_abi.h + sbox_harden.h (header-only ExeDir);
-  # //../../src for the JSI C++ API headers (jsi/jsi.h, jsi_abi/JsiAbiRuntime.h)
-  # + the v8jsi config header (jsi_abi/v8_jsi_config.h). The engine DLL itself is
-  # LoadLibrary'd at runtime (resolved by name, no link-time bind).
+  # //sandbox_dll for sbox.h (the plugin ABI) + sbox_harden.h (header-only
+  # ExeDir); //../../src for the JSI C++ API headers (jsi/jsi.h,
+  # jsi_abi/JsiAbiRuntime.h) + the v8jsi config header (jsi_abi/v8_jsi_config.h).
+  # The engine DLL itself is LoadLibrary'd at runtime (resolved by name, no
+  # link-time bind).
   include_dirs = [
     "//sandbox_dll",
     "//../../src",
@@ -24,9 +26,9 @@ shared_library("v8host") {
   # not the raw ABI — so it pulls in jsi_cpp and must compile with exceptions
   # (jsi.h throws jsi::JSError). It deliberately does NOT dep on the sandbox core:
   # the container drives the lifecycle and the payload reaches the message channel
-  # only through sbox_plugin_abi.h's SboxHostServices.
+  # only through sbox.h's sbox_worker_api.
   deps = [ "//jsi_cpp" ]
-  defines = [ "V8HOST_PLUGIN_IMPL" ]
+  defines = [ "SBOX_PLUGIN_IMPL" ]
 
   configs -= [ "//build/config/compiler:no_exceptions" ]
   configs += [ "//build/config/compiler:exceptions" ]

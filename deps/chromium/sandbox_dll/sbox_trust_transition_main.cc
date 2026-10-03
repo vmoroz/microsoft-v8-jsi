@@ -38,7 +38,7 @@
 #include <string>
 #include <vector>
 
-#include "sbox.h"
+#include "sbox_core_internal.h"
 #include "sbox_trust_transition_test_private.h"
 
 // The same-image control struct: the broker role seeds it by RVA into the

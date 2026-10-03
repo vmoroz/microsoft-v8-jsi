@@ -12,7 +12,7 @@ executable("sbox") {
     "sbox_dll.cc",
     "sbox_main.cc",
   ]
-  include_dirs = [ "." ]  # sbox.h, msg_channel.h, sbox_harden.h, sbox_plugin_abi.h
+  include_dirs = [ "." ]  # sbox_core_internal.h, sbox.h, msg_channel.h, sbox_harden.h
   defines = [ "SBOX_STATIC", "SBOX_DEV_ALLOW_UNSIGNED" ]
   deps = [
     "//base",
