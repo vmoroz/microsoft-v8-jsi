@@ -5,10 +5,7 @@
 // (sbox_core_internal.h). Host services are passed IN as function-pointer
 // structs; the plugin exposes exactly one resolved-by-name export.
 //
-// EXPERIMENTAL / not yet ABI-frozen. First iteration — deliberately minimal.
-// Formal ABI versioning/negotiation and the Node-API-grade safety pass are
-// deferred; calling conventions and opaque-handle discipline go in NOW because
-// they are correctness, not polish.
+// EXPERIMENTAL / not yet ABI-frozen.
 //
 // Lifecycle, driven by sbox.exe (the ACG-correct ordering IS the contract):
 //   broker:  resolve+verify plugin -> configure(cfg, config_api)
@@ -44,11 +41,13 @@ extern "C" {
 #define SBOX_EXPORT
 #endif
 
-#define SBOX_ABI_VERSION 1u
+#define SBOX_ABI_VERSION 2u
 
 // Opaque, typed handles (Node-API style — never void*).
 typedef struct sbox_config_s* sbox_config;  // broker: the policy builder
 typedef struct sbox_worker_s* sbox_worker;  // worker: the run context
+typedef struct sbox_broker_s* sbox_broker;
+typedef struct sbox_broker_worker_s* sbox_broker_worker;
 
 typedef enum {
   sbox_ok = 0,
@@ -59,6 +58,11 @@ typedef enum {
 
 typedef enum { sbox_msg_string = 0, sbox_msg_binary = 1 } sbox_msg_kind;
 
+typedef enum {
+  sbox_broker_mode_dedicated = 0,
+  sbox_broker_mode_shared = 1,
+} sbox_broker_mode;
+
 // Mandatory integrity levels for set_integrity(initial, delayed). Mirrors the OS
 // integrity the container applies; the host maps these 1:1 to its internal enum.
 typedef enum {
@@ -68,6 +72,47 @@ typedef enum {
 
 typedef void(SBOX_CALL* sbox_message_cb)(void* ctx, sbox_msg_kind kind,
                                          const void* data, size_t len);
+
+// Host-owned identity storage borrowed only for broker_run. The opaque tokens
+// are never serialized and must not be closed by the plugin.
+typedef struct sbox_broker_start {
+  uint32_t struct_size;
+  uint32_t mode;
+  const wchar_t* endpoint_name;
+  uint16_t native_machine;
+  uint16_t reserved;
+  const uint8_t* container_sha256;
+  const uint8_t* plugin_sha256;
+  const wchar_t* container_final_path;
+  const wchar_t* plugin_final_path;
+  const void* container_file_token;
+  const void* plugin_file_token;
+  const uint8_t* dedicated_nonce;
+  size_t dedicated_nonce_size;
+} sbox_broker_start;
+
+// configure_and_spawn copies configure_data before the call returns. Message
+// buffers are borrowed only for callback duration. After a successful spawn,
+// the plugin owns the worker: close is called at most once and wait exactly
+// once. wait is destructive and invalidates the handle; callbacks have stopped
+// when it returns. The host owns this table and every opaque host token.
+typedef struct sbox_broker_api {
+  uint32_t struct_size;
+  sbox_status(SBOX_CALL* configure_and_spawn)(
+      sbox_broker broker,
+      const void* configure_data,
+      size_t configure_data_size,
+      sbox_message_cb on_message,
+      void* callback_context,
+      sbox_broker_worker* out_worker);
+  sbox_status(SBOX_CALL* post_message)(sbox_broker_worker worker,
+                                       sbox_msg_kind kind,
+                                       const void* data,
+                                       size_t size);
+  sbox_status(SBOX_CALL* close)(sbox_broker_worker worker);
+  sbox_status(SBOX_CALL* wait)(sbox_broker_worker worker,
+                               int32_t* out_exit_code);
+} sbox_broker_api;
 
 // --- sbox.exe -> plugin, BROKER role: services configure() uses to describe
 // the sandbox. sbox speaks ACG (a mitigation), never JIT. ---
@@ -111,7 +156,16 @@ typedef struct sbox_plugin {
   uint32_t struct_size;  // sizeof(sbox_plugin)
   uint32_t abi_version;  // == SBOX_ABI_VERSION the plugin was built against
   // BROKER: describe the sandbox the worker will run in.
-  sbox_status (SBOX_CALL* configure)(sbox_config cfg, const sbox_config_api* api);
+  // configure_data is copied host storage valid only for this call.
+  sbox_status (SBOX_CALL* configure)(sbox_config cfg,
+                                     const sbox_config_api* api,
+                                     const void* configure_data,
+                                     size_t configure_data_size);
+  // Blocking coordinator entry. It must stop accepts and join every task and
+  // broker worker before returning.
+  sbox_status (SBOX_CALL* broker_run)(sbox_broker broker,
+                                      const sbox_broker_api* api,
+                                      const sbox_broker_start* start);
   // WORKER (driven in order by sbox.exe):
   sbox_status (SBOX_CALL* warmup)(sbox_worker w,
                                   const sbox_worker_api* api);  // PRE-lockdown

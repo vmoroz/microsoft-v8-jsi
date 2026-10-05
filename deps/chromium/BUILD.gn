@@ -15,6 +15,11 @@ group("generic") {
   ]
 }
 
+group("v8host_broker_tests") {
+  testonly = true
+  deps = [ "//v8host:v8host_broker_tests" ]
+}
+
 if (current_cpu == "x64") {
   group("sbox_trust_transition_tests") {
     testonly = true

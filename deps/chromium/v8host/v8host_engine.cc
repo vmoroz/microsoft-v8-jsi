@@ -31,6 +31,7 @@
 // SBOX_PLUGIN_IMPL (set by the BUILD.gn target) makes sbox.h export this DLL's
 // single sbox_plugin_main entry.
 #include "sbox.h"
+#include "v8host_broker.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -801,8 +802,13 @@ static void SBOX_CALL Shutdown(sbox_worker /*w*/) {
 // plugin_data the worker reads back in warmup.
 //==========================================================================
 static sbox_status SBOX_CALL Configure(sbox_config cfg,
-                                       const sbox_config_api* api) {
+                                       const sbox_config_api* api,
+                                       const void* configure_data,
+                                       size_t configure_data_size) {
   if (!cfg || !api || api->struct_size < sizeof(sbox_config_api))
+    return sbox_error_args;
+  if ((configure_data_size && !configure_data) ||
+      configure_data_size > 64 * 1024)
     return sbox_error_args;
   const bool trusted = EnvW(L"SBOX_TIER") == L"trusted";
   std::wstring engine = EnvW(L"V8HOST_ENGINE_DLL");
@@ -827,11 +833,18 @@ static sbox_status SBOX_CALL Configure(sbox_config cfg,
   return sbox_ok;
 }
 
+static sbox_status SBOX_CALL BrokerRun(sbox_broker broker,
+                                       const sbox_broker_api* api,
+                                       const sbox_broker_start* start) {
+  return V8HostBrokerRun(broker, api, start);
+}
+
 // The plugin vtable + its single resolved-by-name export. sbox.exe calls
 // sbox_plugin_main(host_abi_version), version-checks, then drives the vtable.
 static const sbox_plugin g_plugin = {sizeof(sbox_plugin), SBOX_ABI_VERSION,
-                                     &Configure,          &Warmup,
-                                     &Run,                &Shutdown};
+                                     &Configure,          &BrokerRun,
+                                     &Warmup,             &Run,
+                                     &Shutdown};
 
 extern "C" __declspec(dllexport) sbox_status SBOX_CALL sbox_plugin_main(
     uint32_t host_abi_version, const sbox_plugin** out) {

@@ -9,7 +9,79 @@
 # jitless for Untrusted / v8jsi.dll for Trusted), creates a JSI runtime, installs
 # the `host` object, evaluates a guest, and runs the message loop — all under the
 # container-driven ACG lifecycle. Carved from the retired v8host.exe main.
-shared_library("v8host") {
+config("v8host_common_config") {
+  include_dirs = [
+    "common",
+    "client",
+    "coordinator",
+    "//sandbox_dll",
+  ]
+
+  # Development posture for the whole identity/persona layer: unsigned payloads
+  # are tolerated only at compile time (see TrustAllowed / dev install-root /
+  # the dev-only sbox_broker_api self-test). Release builds omit this define,
+  # which fail-closes every one of those paths. Centralized here so a persona
+  # that adds a compile-gated dev path cannot silently miss the flag.
+  defines = [ "SBOX_DEV_ALLOW_UNSIGNED" ]
+}
+
+static_library("file_identity") {
+  sources = [
+    "common/v8host_file_identity.cc",
+    "common/v8host_file_identity.h",
+  ]
+  public_configs = [ ":v8host_common_config" ]
+  libs = [
+    "bcrypt.lib",
+    "wintrust.lib",
+  ]
+}
+
+static_library("payload_identity") {
+  sources = [
+    "common/v8host_payload_identity.cc",
+    "common/v8host_payload_identity.h",
+  ]
+  public_deps = [ ":file_identity" ]
+  public_configs = [ ":v8host_common_config" ]
+  libs = [ "bcrypt.lib" ]
+}
+
+source_set("client_persona") {
+  sources = [
+    "client/v8host_broker_rendezvous.cc",
+    "client/v8host_broker_rendezvous.h",
+  ]
+  public_deps = [
+    ":payload_identity",
+    ":peer_auth",
+  ]
+  public_configs = [ ":v8host_common_config" ]
+}
+
+source_set("peer_auth") {
+  sources = [
+    "coordinator/v8host_peer_auth.cc",
+    "coordinator/v8host_peer_auth.h",
+  ]
+  public_deps = [ ":payload_identity" ]
+  public_configs = [ ":v8host_common_config" ]
+}
+
+source_set("coordinator_persona") {
+  sources = [
+    "coordinator/v8host_broker.cc",
+    "coordinator/v8host_broker.h",
+  ]
+  public_deps = [
+    ":payload_identity",
+    ":peer_auth",
+  ]
+  public_configs = [ ":v8host_common_config" ]
+  libs = [ "advapi32.lib" ]
+}
+
+source_set("engine_persona") {
   sources = [ "v8host_engine.cc" ]
 
   # //sandbox_dll for sbox.h (the plugin ABI) + sbox_harden.h (header-only
@@ -27,7 +99,10 @@ shared_library("v8host") {
   # (jsi.h throws jsi::JSError). It deliberately does NOT dep on the sandbox core:
   # the container drives the lifecycle and the payload reaches the message channel
   # only through sbox.h's sbox_worker_api.
-  deps = [ "//jsi_cpp" ]
+  deps = [
+    "//jsi_cpp",
+    ":coordinator_persona",
+  ]
   defines = [ "SBOX_PLUGIN_IMPL" ]
 
   configs -= [ "//build/config/compiler:no_exceptions" ]
@@ -35,4 +110,46 @@ shared_library("v8host") {
 
   # Resolve statically-imported DLLs only from System32 + the app dir.
   ldflags = [ "/DEPENDENTLOADFLAG:0xA00" ]
+}
+
+shared_library("v8host") {
+  deps = [
+    ":client_persona",
+    ":coordinator_persona",
+    ":engine_persona",
+  ]
+  defines = [
+    "SBOX_PLUGIN_IMPL",
+    "SBOX_DEV_ALLOW_UNSIGNED",
+  ]
+  configs -= [ "//build/config/compiler:no_exceptions" ]
+  configs += [ "//build/config/compiler:exceptions" ]
+  ldflags = [ "/DEPENDENTLOADFLAG:0xA00" ]
+}
+
+executable("v8host_broker_tests") {
+  testonly = true
+  sources = [
+    "tests/v8host_broker_tests.cc",
+    "tests/v8host_test_support.cc",
+    "tests/v8host_test_support.h",
+  ]
+  deps = [
+    ":client_persona",
+    ":payload_identity",
+    ":peer_auth",
+  ]
+  public_configs = [ ":v8host_common_config" ]
+  data_deps = [
+    ":v8host",
+    ":v8host_fake_plugin",
+    "//sandbox_dll:sbox",
+  ]
+}
+
+# Deliberately invalid plugin used by the host-rejects-bad-plugin-abi case.
+shared_library("v8host_fake_plugin") {
+  testonly = true
+  sources = [ "tests/v8host_fake_plugin.cc" ]
+  public_configs = [ ":v8host_common_config" ]
 }

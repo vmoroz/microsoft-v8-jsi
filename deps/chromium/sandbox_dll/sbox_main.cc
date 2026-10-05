@@ -11,15 +11,16 @@
 //                         round-trip. Drives sbox_broker_* + the plugin's configure.
 //   sbox.exe --worker --plugin <dll>  : sbox_target_begin -> plugin.warmup ->
 //                         lower_token -> plugin.run -> plugin.shutdown.
-//   sbox.exe --broker-service / --client / --pipe-bench : the shared-broker
-//                         rendezvous + a transport-latency probe (used by later
-//                         stages).
+//   sbox.exe --broker --mode=<mode> --pipe=<name> --plugin <dll>
+//                       : invoke the plugin-owned coordinator service.
+//   sbox.exe --pipe-bench : developer transport-latency probe.
 //
 // SBOX_API is plain extern "C" here (the target defines SBOX_STATIC), so the
 // sbox_* core compiled into this EXE stays out of its export table.
 #include "sbox_core_internal.h"
 #include "sbox_harden.h"
 #include "sbox.h"
+#include "v8host_file_identity.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -28,9 +29,12 @@
 
 #include <cstdio>
 #include <cstring>
-#include <atomic>
+#include <array>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Same-image seed: the broker writes this worker's sandbox globals + message
@@ -64,6 +68,26 @@ struct sbox_worker_s {
   SboxTarget* target = nullptr;
 };
 
+struct sbox_broker_s;
+struct sbox_broker_worker_s {
+  sbox_broker_s* broker = nullptr;
+  SboxSession* session = nullptr;
+  sbox_message_cb callback = nullptr;
+  void* callback_context = nullptr;
+  bool close_called = false;
+  bool wait_called = false;
+};
+
+struct sbox_broker_s {
+  std::wstring self_path;
+  std::wstring plugin_name;
+  const sbox_plugin* plugin = nullptr;
+  HMODULE plugin_module = nullptr;
+  std::mutex mutex;
+  std::set<sbox_broker_worker_s*> workers;
+  bool stopping = false;
+};
+
 namespace {
 
 // Worker exit codes (the broker asserts 0). Distinct values make a failed run
@@ -84,6 +108,68 @@ std::wstring SelfPath() {
   wchar_t buf[MAX_PATH] = {};
   const DWORD n = ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
   return std::wstring(buf, n);
+}
+
+std::wstring Widen(const char* s);
+
+std::wstring ParseValue(int argc, char** argv, const char* name) {
+  const size_t name_length = std::strlen(name);
+  for (int i = 1; i < argc; ++i) {
+    if (std::strncmp(argv[i], name, name_length) == 0 &&
+        argv[i][name_length] == '=')
+      return Widen(argv[i] + name_length + 1);
+  }
+  return std::wstring();
+}
+
+bool ParseBrokerMode(int argc, char** argv, sbox_broker_mode* mode) {
+  const std::wstring value = ParseValue(argc, argv, "--mode");
+  if (value == L"shared") {
+    *mode = sbox_broker_mode_shared;
+    return true;
+  }
+  if (value == L"dedicated") {
+    *mode = sbox_broker_mode_dedicated;
+    return true;
+  }
+  return false;
+}
+
+bool ParsePipeName(int argc, char** argv, std::wstring* pipe) {
+  const std::wstring value = ParseValue(argc, argv, "--pipe");
+  constexpr wchar_t kPrefix[] = L"\\\\.\\pipe\\v8host-rv1-";
+  if (value.size() != (sizeof(kPrefix) / sizeof(kPrefix[0]) - 1) + 64 ||
+      value.compare(0, sizeof(kPrefix) / sizeof(kPrefix[0]) - 1, kPrefix) != 0)
+    return false;
+  for (size_t i = sizeof(kPrefix) / sizeof(kPrefix[0]) - 1; i < value.size();
+       ++i) {
+    if (!((value[i] >= L'0' && value[i] <= L'9') ||
+          (value[i] >= L'a' && value[i] <= L'f')))
+      return false;
+  }
+  *pipe = value;
+  return true;
+}
+
+bool ParseNonce(int argc, char** argv, std::array<uint8_t, 16>* nonce) {
+  const std::wstring value = ParseValue(argc, argv, "--nonce");
+  if (value.size() != nonce->size() * 2)
+    return false;
+  for (size_t i = 0; i < nonce->size(); ++i) {
+    auto hex = [](wchar_t c) -> int {
+      if (c >= L'0' && c <= L'9')
+        return c - L'0';
+      if (c >= L'a' && c <= L'f')
+        return c - L'a' + 10;
+      return -1;
+    };
+    const int high = hex(value[i * 2]);
+    const int low = hex(value[i * 2 + 1]);
+    if (high < 0 || low < 0)
+      return false;
+    (*nonce)[i] = static_cast<uint8_t>((high << 4) | low);
+  }
+  return true;
 }
 
 // A plugin name must be a BARE app-dir filename (e.g. "v8host.dll") — never a
@@ -257,16 +343,22 @@ sbox_worker_api MakeWorkerApi() {
 // Dev builds tolerate UNSIGNED only via SBOX_DEV_ALLOW_UNSIGNED (no runtime
 // bypass).
 bool LoadPlugin(const std::wstring& plugin_name, bool verify, const char* tag,
-                HMODULE* out_mod, const sbox_plugin** out_vtable) {
+                HMODULE* out_mod, const sbox_plugin** out_vtable,
+                v8host::HeldFile* out_file) {
   if (!IsBareFilename(plugin_name)) {
     printf("[sbox] %s: invalid --plugin name (bare app-dir filename only)\n",
            tag);
     return false;
   }
   const std::wstring full = sbox_harden::ExeDir() + plugin_name;
-  if (verify && !sbox_harden::CheckTrust(full, tag)) {
-    printf("[sbox] %s: signature verification failed: %ls\n", tag,
-           plugin_name.c_str());
+  v8host::HeldFile held;
+  DWORD error = ERROR_SUCCESS;
+  if (!v8host::OpenImmutableFile(full, &held, &error)) {
+    printf("[sbox] %s: immutable open failed: %lu\n", tag, error);
+    return false;
+  }
+  if (verify && !v8host::TrustAllowed(v8host::VerifyTrust(held))) {
+    printf("[sbox] %s: signature verification failed\n", tag);
     return false;
   }
   HMODULE mod = ::LoadLibraryExW(full.c_str(), nullptr,
@@ -287,7 +379,8 @@ bool LoadPlugin(const std::wstring& plugin_name, bool verify, const char* tag,
   }
   if (vtable->abi_version != SBOX_ABI_VERSION ||
       vtable->struct_size < sizeof(sbox_plugin) || !vtable->configure ||
-      !vtable->warmup || !vtable->run || !vtable->shutdown) {
+      !vtable->broker_run || !vtable->warmup || !vtable->run ||
+      !vtable->shutdown) {
     printf("[sbox] %s: plugin ABI mismatch (abi=%u host=%u) or incomplete "
            "vtable\n",
            tag, vtable->abi_version, SBOX_ABI_VERSION);
@@ -296,6 +389,8 @@ bool LoadPlugin(const std::wstring& plugin_name, bool verify, const char* tag,
   }
   *out_mod = mod;
   *out_vtable = vtable;
+  if (out_file)
+    *out_file = std::move(held);
   return true;
 }
 
@@ -307,6 +402,7 @@ struct PreparedSandbox {
   HMODULE plugin_mod = nullptr;
   const sbox_plugin* plugin = nullptr;
   std::wstring plugin_name;
+  v8host::HeldFile plugin_file;
   sbox_config_s cfg;                     // collected by configure()
   std::vector<SboxFileRule> file_rules;  // pattern ptrs into cfg.file_patterns
   std::vector<const wchar_t*> cap_ptrs;  // into cfg.capabilities
@@ -316,20 +412,28 @@ struct PreparedSandbox {
   // policy aliases the members above, so a copy/move would leave it dangling.
   PreparedSandbox(const PreparedSandbox&) = delete;
   PreparedSandbox& operator=(const PreparedSandbox&) = delete;
+  ~PreparedSandbox() {
+    if (plugin_mod)
+      ::FreeLibrary(plugin_mod);
+  }
 };
 
 // Resolve+verify the plugin, run configure() to collect the policy, verify every
 // declared engine DLL, and build the SboxPolicy. Returns false (fail closed) on
 // any error.
-bool PrepareSandbox(const std::wstring& plugin_name, PreparedSandbox& out) {
+bool PrepareSandbox(const std::wstring& plugin_name,
+                    const void* configure_data,
+                    size_t configure_data_size,
+                    PreparedSandbox& out) {
   if (!LoadPlugin(plugin_name, /*verify=*/true, "plugin", &out.plugin_mod,
-                  &out.plugin))
+                  &out.plugin, &out.plugin_file))
     return false;
   out.plugin_name = plugin_name;
 
   // BROKER role: the plugin describes the sandbox it needs.
   sbox_config_api api = MakeConfigApi();
-  const sbox_status cs = out.plugin->configure(&out.cfg, &api);
+  const sbox_status cs = out.plugin->configure(
+      &out.cfg, &api, configure_data, configure_data_size);
   if (cs != sbox_ok) {
     printf("[sbox] plugin.configure failed: status=%d\n", cs);
     return false;
@@ -399,7 +503,7 @@ int RunWorker(const std::wstring& plugin_name) {
   HMODULE plugin_mod = nullptr;
   const sbox_plugin* plugin = nullptr;
   if (!LoadPlugin(plugin_name, /*verify=*/false, "worker-plugin", &plugin_mod,
-                  &plugin))
+                  &plugin, nullptr))
     return kDllResolveFailed;
 
   sbox_worker_s wk;
@@ -501,7 +605,7 @@ int RunBroker(const std::wstring& plugin_name) {
   // The plugin (not sbox.exe) supplies the sandbox policy: load+verify it, run
   // configure(), and apply what it set. This keeps the container app-agnostic.
   PreparedSandbox sb;
-  if (!PrepareSandbox(plugin_name, sb)) {
+  if (!PrepareSandbox(plugin_name, nullptr, 0, sb)) {
     printf("[sbox] broker: sandbox preparation failed\n");
     return 3;
   }
@@ -637,221 +741,172 @@ int RunPipeBench() {
   return n > 0 ? 0 : 1;
 }
 
-// ===== shared-broker rendezvous, fan-in, per-tenant worker, lifetime =====
+// ===== generic plugin coordinator adapter =====
 
-// Per-user rendezvous point: a well-known, user-scoped pipe name.
-std::wstring BrokerPipeName() {
-  wchar_t user[256] = {};
-  DWORD n = 256;
-  const std::wstring u = ::GetUserNameW(user, &n) ? user : L"default";
-  return L"\\\\.\\pipe\\sbox_broker_" + u;
+void OnBrokerWorkerMessage(void* context, int kind, const void* data, size_t len) {
+  auto* worker = static_cast<sbox_broker_worker_s*>(context);
+  if (worker && worker->callback)
+    worker->callback(worker->callback_context,
+                     static_cast<sbox_msg_kind>(kind), data, len);
 }
 
-std::atomic<int> g_active_clients{0};
-
-// One connected client: read its request, spawn a DEDICATED sandbox worker, relay
-// one round-trip, and reply with the broker + worker PIDs so the client can prove
-// rendezvous fan-in (same broker) and per-tenant isolation (distinct workers).
-struct ClientJob {
-  HANDLE pipe;
-  std::wstring self;
-  const SboxPolicy* policy;  // the broker-service's plugin-prepared policy
-};
-
-DWORD WINAPI HandleClientThread(void* arg) {
-  std::unique_ptr<ClientJob> job(static_cast<ClientJob*>(arg));
-  HANDLE pipe = job->pipe;
-
-  char req[256] = {};
-  DWORD got = 0;
-  std::string reply;
-  if (::ReadFile(pipe, req, sizeof(req) - 1, &got, nullptr) && got > 0) {
-    const SboxPolicy& policy = *job->policy;
-    BrokerMsgCtx mctx;
-    mctx.reply_event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    SboxSession* session = sbox_broker_spawn(job->self.c_str(), &policy,
-                                             &OnBrokerReply, &mctx);
-    if (session) {
-      sbox_broker_post_message(session, SBOX_MSG_STRING, req, got);
-      ::WaitForSingleObject(mctx.reply_event, 15000);
-      sbox_broker_close(session);
-      sbox_broker_wait(session);
-      reply = "broker[pid=" + std::to_string(::GetCurrentProcessId()) + "] -> " +
-              (mctx.last_reply.empty() ? std::string("(no worker reply)")
-                                       : mctx.last_reply);
-    } else {
-      reply = "broker[pid=" + std::to_string(::GetCurrentProcessId()) +
-              "] -> spawn FAILED";
-    }
-    ::CloseHandle(mctx.reply_event);
-  } else {
-    reply = "broker: empty request";
+sbox_status SBOX_CALL BrokerConfigureAndSpawn(
+    sbox_broker broker,
+    const void* configure_data,
+    size_t configure_data_size,
+    sbox_message_cb on_message,
+    void* callback_context,
+    sbox_broker_worker* out_worker) {
+  if (!broker || !out_worker || (configure_data_size && !configure_data) ||
+      configure_data_size > 64 * 1024) {
+    return sbox_error_args;
   }
-
-  DWORD wrote = 0;
-  ::WriteFile(pipe, reply.data(), static_cast<DWORD>(reply.size()), &wrote,
-              nullptr);
-  ::FlushFileBuffers(pipe);
-  ::DisconnectNamedPipe(pipe);
-  ::CloseHandle(pipe);
-  g_active_clients.fetch_sub(1);
-  return 0;
+  *out_worker = nullptr;
+  std::vector<uint8_t> copied;
+  if (configure_data_size) {
+    const auto* begin = static_cast<const uint8_t*>(configure_data);
+    copied.assign(begin, begin + configure_data_size);
+  }
+  {
+    std::lock_guard<std::mutex> lock(broker->mutex);
+    if (broker->stopping)
+      return sbox_error;
+  }
+  PreparedSandbox sandbox;
+  if (!PrepareSandbox(broker->plugin_name,
+                      copied.empty() ? nullptr : copied.data(), copied.size(),
+                      sandbox))
+    return sbox_error;
+  auto worker = std::make_unique<sbox_broker_worker_s>();
+  worker->broker = broker;
+  worker->callback = on_message;
+  worker->callback_context = callback_context;
+  worker->session =
+      sbox_broker_spawn(broker->self_path.c_str(), &sandbox.policy,
+                        &OnBrokerWorkerMessage, worker.get());
+  if (!worker->session)
+    return sbox_error;
+  {
+    std::lock_guard<std::mutex> lock(broker->mutex);
+    if (broker->stopping) {
+      sbox_broker_close(worker->session);
+      sbox_broker_wait(worker->session);
+      return sbox_error;
+    }
+    broker->workers.insert(worker.get());
+  }
+  *out_worker = worker.release();
+  return sbox_ok;
 }
 
-// Long-lived broker: ONE per user. Race-free create-or-lose via
-// FILE_FLAG_FIRST_PIPE_INSTANCE; serves many clients concurrently; idle-exits.
-int RunBrokerService(const std::wstring& plugin_name) {
-  printf("[sbox] role=broker-service pid=%lu\n", ::GetCurrentProcessId());
-  sbox_harden::HardenDllSearch();
-  // Prepare the plugin-supplied policy ONCE; every client spawns a worker from
-  // it. Intentionally leaked (process-lifetime singleton): client threads hold
-  // &policy and may still run when this function returns on shutdown.
-  auto* sb = new PreparedSandbox();
-  if (!PrepareSandbox(plugin_name, *sb)) {
-    printf("[sbox] broker-service: sandbox preparation failed\n");
+sbox_status SBOX_CALL BrokerPostMessage(sbox_broker_worker worker,
+                                        sbox_msg_kind kind,
+                                        const void* data,
+                                        size_t size) {
+  if (!worker || !worker->session || (size && !data))
+    return sbox_error_args;
+  return sbox_broker_post_message(worker->session, static_cast<int>(kind), data,
+                                  size) == 0
+             ? sbox_ok
+             : sbox_error;
+}
+
+sbox_status SBOX_CALL BrokerClose(sbox_broker_worker worker) {
+  if (!worker || !worker->session)
+    return sbox_error_args;
+  if (worker->close_called)
+    return sbox_ok;
+  worker->close_called = true;
+  return sbox_broker_close(worker->session) == 0 ? sbox_ok : sbox_error;
+}
+
+sbox_status SBOX_CALL BrokerWait(sbox_broker_worker worker,
+                                 int32_t* out_exit_code) {
+  if (!worker || !worker->session || worker->wait_called)
+    return sbox_error_args;
+  worker->wait_called = true;
+  sbox_broker_s* broker = worker->broker;
+  const int exit_code = sbox_broker_wait(worker->session);
+  {
+    std::lock_guard<std::mutex> lock(broker->mutex);
+    broker->workers.erase(worker);
+  }
+  if (out_exit_code)
+    *out_exit_code = exit_code;
+  delete worker;
+  return sbox_ok;
+}
+
+sbox_broker_api MakeBrokerApi() {
+  sbox_broker_api api = {};
+  api.struct_size = sizeof(api);
+  api.configure_and_spawn = &BrokerConfigureAndSpawn;
+  api.post_message = &BrokerPostMessage;
+  api.close = &BrokerClose;
+  api.wait = &BrokerWait;
+  return api;
+}
+
+int RunBrokerPlugin(int argc,
+                    char** argv,
+                    const std::wstring& plugin_name) {
+  sbox_broker_mode mode = sbox_broker_mode_shared;
+  std::wstring endpoint;
+  std::array<uint8_t, 16> nonce = {};
+  if (!ParseBrokerMode(argc, argv, &mode) ||
+      !ParsePipeName(argc, argv, &endpoint) ||
+      (mode == sbox_broker_mode_dedicated &&
+       !ParseNonce(argc, argv, &nonce))) {
+    printf("[sbox] broker: invalid coordinator arguments\n");
     return 2;
   }
-  const std::wstring self = SelfPath();
-  const std::wstring name = BrokerPipeName();
-
-  const DWORD kIdleMs = 3000;      // idle shutdown once no clients remain
-  const DWORD kMaxLifeMs = 60000;  // hard safety cap
-  const DWORD t_start = ::GetTickCount();
-  bool first = true;
-  int served = 0;
-
-  for (;;) {
-    HANDLE pipe = ::CreateNamedPipeW(
-        name.c_str(),
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
-            (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
-        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
-            PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, nullptr);
-    if (pipe == INVALID_HANDLE_VALUE) {
-      const DWORD e = ::GetLastError();
-      if (first && e == ERROR_ACCESS_DENIED) {
-        printf("[sbox] broker-service: pipe already owned -> lost race, "
-               "exit 0\n");
-        return 0;  // another broker won the rendezvous
-      }
-      printf("[sbox] broker-service: CreateNamedPipe failed: %lu\n", e);
-      return 2;
-    }
-    if (first) {
-      printf("[sbox] broker-service: WON rendezvous, listening (%ls)\n",
-             name.c_str());
-      first = false;
-    }
-
-    OVERLAPPED ov = {};
-    ov.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    bool have_client = false;
-    if (::ConnectNamedPipe(pipe, &ov)) {
-      have_client = true;
-    } else {
-      const DWORD e = ::GetLastError();
-      if (e == ERROR_PIPE_CONNECTED) {
-        have_client = true;
-      } else if (e == ERROR_IO_PENDING) {
-        if (::WaitForSingleObject(ov.hEvent, kIdleMs) == WAIT_OBJECT_0) {
-          DWORD xfer = 0;
-          have_client = ::GetOverlappedResult(pipe, &ov, &xfer, FALSE);
-        } else {
-          ::CancelIo(pipe);
-        }
-      }
-    }
-    ::CloseHandle(ov.hEvent);
-
-    if (have_client) {
-      ++served;
-      g_active_clients.fetch_add(1);
-      auto* job = new ClientJob{pipe, self, &sb->policy};
-      HANDLE th = ::CreateThread(nullptr, 0, &HandleClientThread, job, 0, nullptr);
-      if (th) {
-        ::CloseHandle(th);
-      } else {
-        g_active_clients.fetch_sub(1);
-        delete job;
-        ::CloseHandle(pipe);
-      }
-    } else {
-      ::CloseHandle(pipe);  // idle instance
-      if (g_active_clients.load() == 0) {
-        printf("[sbox] broker-service: idle %lums, no clients -> shutdown "
-               "(served=%d)\n", kIdleMs, served);
-        return 0;
-      }
-    }
-    if (::GetTickCount() - t_start > kMaxLifeMs) {
-      printf("[sbox] broker-service: max lifetime -> exit (served=%d)\n",
-             served);
-      return 0;
-    }
+  sbox_harden::HardenDllSearch();
+  sbox_broker_s broker;
+  broker.self_path = SelfPath();
+  broker.plugin_name = plugin_name;
+  v8host::HeldFile container_file;
+  v8host::HeldFile plugin_file;
+  DWORD error = ERROR_SUCCESS;
+  if (!v8host::OpenImmutableFile(broker.self_path, &container_file, &error) ||
+      !LoadPlugin(plugin_name, true, "broker-plugin", &broker.plugin_module,
+                  &broker.plugin, &plugin_file)) {
+    printf("[sbox] broker: immutable payload verification failed\n");
+    return 3;
   }
-}
-
-// Client: connect to the per-user broker, launching one if absent (the launched
-// broker then wins-or-loses the create race). One request -> one response.
-int RunClient(const std::wstring& plugin_name) {
-  printf("[sbox] role=client pid=%lu\n", ::GetCurrentProcessId());
-  const std::wstring name = BrokerPipeName();
-  const std::wstring self = SelfPath();
-
-  HANDLE pipe = INVALID_HANDLE_VALUE;
-  bool launched = false;
-  const DWORD deadline = ::GetTickCount() + 10000;
-  for (;;) {
-    pipe = ::CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                         OPEN_EXISTING, 0, nullptr);
-    if (pipe != INVALID_HANDLE_VALUE) break;
-    const DWORD e = ::GetLastError();
-    if (e == ERROR_PIPE_BUSY) {
-      ::WaitNamedPipeW(name.c_str(), 2000);
-    } else if (e == ERROR_FILE_NOT_FOUND) {
-      if (!launched) {
-        std::wstring cmd =
-            L"\"" + self + L"\" --broker-service --plugin " + plugin_name;
-        STARTUPINFOW si = {sizeof(si)};
-        PROCESS_INFORMATION pi = {};
-        if (::CreateProcessW(self.c_str(), &cmd[0], nullptr, nullptr, FALSE,
-                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-          ::CloseHandle(pi.hProcess);
-          ::CloseHandle(pi.hThread);
-        }
-        launched = true;
-      }
-      ::Sleep(50);
-    } else {
-      printf("[sbox] client %lu: connect failed: %lu\n",
-             ::GetCurrentProcessId(), e);
-      return 2;
-    }
-    if (::GetTickCount() > deadline) {
-      printf("[sbox] client %lu: broker unavailable\n",
-             ::GetCurrentProcessId());
-      return 2;
-    }
+  sbox_broker_start start = {};
+  start.struct_size = sizeof(start);
+  start.mode = mode;
+  start.endpoint_name = endpoint.c_str();
+  start.native_machine = container_file.machine();
+  start.container_sha256 = container_file.sha256().data();
+  start.plugin_sha256 = plugin_file.sha256().data();
+  start.container_final_path = container_file.final_path().c_str();
+  start.plugin_final_path = plugin_file.final_path().c_str();
+  start.container_file_token = &container_file;
+  start.plugin_file_token = &plugin_file;
+  if (mode == sbox_broker_mode_dedicated) {
+    start.dedicated_nonce = nonce.data();
+    start.dedicated_nonce_size = nonce.size();
   }
-
-  DWORD mode = PIPE_READMODE_MESSAGE;
-  ::SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr);
-  const std::string req =
-      "ping from client " + std::to_string(::GetCurrentProcessId());
-  DWORD wrote = 0, got = 0;
-  char resp[512] = {};
-  ::WriteFile(pipe, req.data(), static_cast<DWORD>(req.size()), &wrote, nullptr);
-  const bool ok =
-      ::ReadFile(pipe, resp, sizeof(resp) - 1, &got, nullptr) && got > 0;
-  ::CloseHandle(pipe);
-  if (!ok) {
-    printf("[sbox] client %lu: no response\n", ::GetCurrentProcessId());
-    return 1;
+  const sbox_broker_api api = MakeBrokerApi();
+  const sbox_status status = broker.plugin->broker_run(&broker, &api, &start);
+  std::vector<sbox_broker_worker_s*> leaked;
+  {
+    std::lock_guard<std::mutex> lock(broker.mutex);
+    broker.stopping = true;
+    leaked.assign(broker.workers.begin(), broker.workers.end());
   }
-  printf("[sbox] client %lu got: %.*s\n", ::GetCurrentProcessId(),
-         static_cast<int>(got), resp);
-  return 0;
+  for (sbox_broker_worker_s* worker : leaked) {
+    BrokerClose(worker);
+    BrokerWait(worker, nullptr);
+  }
+  ::FreeLibrary(broker.plugin_module);
+  broker.plugin_module = nullptr;
+  if (!leaked.empty()) {
+    printf("[sbox] broker: plugin returned with live workers\n");
+    return 4;
+  }
+  return status == sbox_ok ? 0 : 1;
 }
 
 // Role dispatch. Kept deliberately dumb and FIRST so neither persona can fall
@@ -860,9 +915,7 @@ enum class Role {
   kNone,
   kBroker,
   kWorker,
-  kPipeBench,
-  kBrokerService,
-  kClient
+  kPipeBench
 };
 
 Role ParseRole(int argc, char** argv) {
@@ -870,9 +923,6 @@ Role ParseRole(int argc, char** argv) {
     if (std::strcmp(argv[i], "--worker") == 0) return Role::kWorker;
     if (std::strcmp(argv[i], "--broker") == 0) return Role::kBroker;
     if (std::strcmp(argv[i], "--pipe-bench") == 0) return Role::kPipeBench;
-    if (std::strcmp(argv[i], "--broker-service") == 0)
-      return Role::kBrokerService;
-    if (std::strcmp(argv[i], "--client") == 0) return Role::kClient;
   }
   return Role::kNone;
 }
@@ -884,11 +934,9 @@ int main(int argc, char** argv) {
   const Role role = ParseRole(argc, argv);
   const std::wstring plugin = ParsePluginName(argc, argv);
 
-  // The broker/worker/rendezvous roles are all driven by a plugin; require its
+  // The broker/worker roles are driven by a plugin; require its
   // name up front (the container is app-agnostic and has no built-in default).
-  const bool needs_plugin = role == Role::kBroker || role == Role::kWorker ||
-                            role == Role::kBrokerService ||
-                            role == Role::kClient;
+  const bool needs_plugin = role == Role::kBroker || role == Role::kWorker;
   if (needs_plugin && plugin.empty()) {
     printf("[sbox] this role requires --plugin <filename>\n");
     return 2;
@@ -896,19 +944,17 @@ int main(int argc, char** argv) {
 
   switch (role) {
     case Role::kBroker:
-      return RunBroker(plugin);
+      return ParseValue(argc, argv, "--pipe").empty()
+                 ? RunBroker(plugin)
+                 : RunBrokerPlugin(argc, argv, plugin);
     case Role::kWorker:
       return RunWorker(plugin);
     case Role::kPipeBench:
       return RunPipeBench();
-    case Role::kBrokerService:
-      return RunBrokerService(plugin);
-    case Role::kClient:
-      return RunClient(plugin);
     case Role::kNone:
     default:
-      printf("Usage: sbox.exe --broker|--worker|--broker-service|--client "
-             "--plugin <filename> | --pipe-bench\n");
+      printf("Usage: sbox.exe --broker|--worker --plugin <filename> | "
+             "--pipe-bench\n");
       return 2;
   }
 }

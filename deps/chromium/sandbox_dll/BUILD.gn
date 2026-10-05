@@ -17,9 +17,11 @@ executable("sbox") {
   deps = [
     "//base",
     "//sandbox/win:sandbox",
+    "//v8host:file_identity",
   ]
   libs = [
     "advapi32.lib",  # token / SID plumbing pulled in by the sandbox core
+    "bcrypt.lib",
     "wintrust.lib",  # WinVerifyTrust (sbox_harden.h)
   ]
 
