@@ -1,29 +1,14 @@
 #include "v8host_broker_rendezvous.h"
 
 #include "v8host_peer_auth.h"
+#include "v8host_protocol.h"
+#include "v8host_protocol_messages.h"
 
 #include <algorithm>
 #include <utility>
 
 namespace v8host {
 namespace {
-
-constexpr uint32_t kProbeMagic = 0x31504256;
-constexpr uint32_t kProbeResponseMagic = 0x31524256;
-
-void PutLe32(uint8_t* out, uint32_t value) {
-  out[0] = static_cast<uint8_t>(value);
-  out[1] = static_cast<uint8_t>(value >> 8);
-  out[2] = static_cast<uint8_t>(value >> 16);
-  out[3] = static_cast<uint8_t>(value >> 24);
-}
-
-uint32_t GetLe32(const uint8_t* in) {
-  return static_cast<uint32_t>(in[0]) |
-         (static_cast<uint32_t>(in[1]) << 8) |
-         (static_cast<uint32_t>(in[2]) << 16) |
-         (static_cast<uint32_t>(in[3]) << 24);
-}
 
 bool IoWithDeadline(HANDLE pipe,
                     bool write,
@@ -54,6 +39,43 @@ bool IoWithDeadline(HANDLE pipe,
   }
   ::CloseHandle(overlapped.hEvent);
   return ok && transferred == size;
+}
+
+// Reads exactly one pipe message (a full Contract B frame) into a bounded
+// buffer. Unlike IoWithDeadline, the transferred size is variable, so success
+// does not require filling the buffer. Handshake control frames are small
+// (HELLO_ACK is 72 bytes, ERROR is tiny): a message larger than the buffer
+// surfaces as ERROR_MORE_DATA and is treated as fatal (fail-closed), never
+// reassembled.
+bool ReadFrameMessage(HANDLE pipe,
+                      uint8_t* buf,
+                      DWORD buf_size,
+                      DWORD* out_len,
+                      DWORD timeout_ms) {
+  OVERLAPPED overlapped = {};
+  overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!overlapped.hEvent)
+    return false;
+  DWORD transferred = 0;
+  BOOL started = ::ReadFile(pipe, buf, buf_size, nullptr, &overlapped);
+  bool pending = !started && ::GetLastError() == ERROR_IO_PENDING;
+  bool ok = false;
+  if (started) {
+    ok = ::GetOverlappedResult(pipe, &overlapped, &transferred, FALSE) != FALSE;
+  } else if (pending &&
+             ::WaitForSingleObject(overlapped.hEvent, timeout_ms) ==
+                 WAIT_OBJECT_0) {
+    ok = ::GetOverlappedResult(pipe, &overlapped, &transferred, FALSE) != FALSE;
+    pending = false;
+  }
+  if (pending) {
+    ::CancelIoEx(pipe, &overlapped);
+    ::GetOverlappedResult(pipe, &overlapped, &transferred, TRUE);
+  }
+  ::CloseHandle(overlapped.hEvent);
+  if (ok)
+    *out_len = transferred;
+  return ok;
 }
 
 std::wstring Quote(const std::wstring& value) {
@@ -110,27 +132,63 @@ void BrokerConnection::Close() {
   }
 }
 
-RendezvousStatus BrokerConnection::Probe(uint32_t sequence,
-                                         ProbeResult* result) {
-  if (!result || pipe() == INVALID_HANDLE_VALUE)
+RendezvousStatus BrokerConnection::Handshake(uint32_t request_id,
+                                             HelloResult* result) {
+  if (!result || pipe() == INVALID_HANDLE_VALUE || request_id == 0)
     return RendezvousStatus::kInvalidArgument;
-  uint8_t request[16] = {};
-  PutLe32(request, kProbeMagic);
-  PutLe32(request + 4, static_cast<uint32_t>(state_->mode));
-  PutLe32(request + 8, sequence);
-  uint8_t response[24] = {};
-  const bool wrote =
-      IoWithDeadline(pipe(), true, request, sizeof(request), 2000);
-  const bool read =
-      wrote && IoWithDeadline(pipe(), false, response, sizeof(response), 2000);
-  if (!wrote || !read ||
-      GetLe32(response) != kProbeResponseMagic ||
-      GetLe32(response + 12) != sequence) {
+
+  // Contract B §8.2: HELLO is the first frame after server auth, with zero
+  // addressing ids and a nonzero request id. The builder stamps type + length.
+  protocol::FrameHeader request_header;
+  request_header.version_major = protocol::kWireVersionMajor;
+  request_header.version_minor = protocol::kWireVersionMinor;
+  request_header.conn_id = 0;
+  request_header.session_id = 0;
+  request_header.run_id = 0;
+  request_header.request_id = request_id;
+  std::vector<uint8_t> frame = protocol::BuildHelloFrame(request_header);
+  if (!IoWithDeadline(pipe(), /*write=*/true, frame.data(),
+                      static_cast<DWORD>(frame.size()), 2000)) {
     return RendezvousStatus::kIoFailed;
   }
-  result->broker_pid = GetLe32(response + 4);
-  result->observed_client_pid = GetLe32(response + 8);
-  result->sequence = GetLe32(response + 12);
+
+  uint8_t buffer[512] = {};
+  DWORD len = 0;
+  if (!ReadFrameMessage(pipe(), buffer, sizeof(buffer), &len, 2000))
+    return RendezvousStatus::kIoFailed;
+
+  protocol::FrameHeader ack_header;
+  const uint8_t* payload = nullptr;
+  size_t payload_size = 0;
+  if (protocol::DecodeAndValidateFrame(buffer, len, &ack_header, &payload,
+                                       &payload_size) !=
+      protocol::DecodeStatus::kOk) {
+    return RendezvousStatus::kIoFailed;
+  }
+  if (ack_header.type == protocol::MessageType::ERROR) {
+    // A broker reject during negotiation (e.g. a major-version mismatch).
+    // Unreachable at wire v1.0 since both peers speak the same major; treated
+    // as a failed rendezvous.
+    return RendezvousStatus::kPeerAuthenticationFailed;
+  }
+  if (ack_header.type != protocol::MessageType::HELLO_ACK)
+    return RendezvousStatus::kIoFailed;
+
+  protocol::HelloAckPayload ack_payload;
+  if (!protocol::DecodeHelloAckPayload(payload, payload_size, &ack_payload))
+    return RendezvousStatus::kIoFailed;
+  if (ack_header.request_id != request_id || ack_header.conn_id == 0 ||
+      ack_header.version_major != protocol::kWireVersionMajor) {
+    return RendezvousStatus::kIoFailed;
+  }
+
+  result->conn_id = ack_header.conn_id;
+  result->selected_major = ack_header.version_major;
+  result->selected_minor = ack_header.version_minor;
+  result->broker_max_major = ack_payload.broker_version_major;
+  result->broker_max_minor = ack_payload.broker_version_minor;
+  result->endpoint_mode = ack_payload.endpoint_mode;
+  result->request_id = request_id;
   return RendezvousStatus::kOk;
 }
 

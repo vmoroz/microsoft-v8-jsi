@@ -79,6 +79,7 @@ source_set("client_persona") {
   public_deps = [
     ":payload_identity",
     ":peer_auth",
+    ":protocol",
   ]
   public_configs = [ ":v8host_common_config" ]
 }
@@ -100,6 +101,7 @@ source_set("coordinator_persona") {
   public_deps = [
     ":payload_identity",
     ":peer_auth",
+    ":protocol",
   ]
   public_configs = [ ":v8host_common_config" ]
   libs = [ "advapi32.lib" ]

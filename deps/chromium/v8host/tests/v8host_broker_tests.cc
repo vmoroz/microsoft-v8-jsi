@@ -27,26 +27,36 @@ namespace {
 using v8host::BrokerConnection;
 using v8host::BrokerMode;
 using v8host::BrokerRendezvous;
-using v8host::ProbeResult;
+using v8host::HelloResult;
 using v8host::RendezvousStatus;
 using v8host::test::ExecutableDirectory;
 
-bool ConnectAndProbe(BrokerMode mode,
-                     uint32_t sequence,
-                     BrokerConnection* connection,
-                     ProbeResult* result,
-                     std::string* detail) {
+bool ConnectAndHandshake(BrokerMode mode,
+                         uint32_t request_id,
+                         BrokerConnection* connection,
+                         HelloResult* result,
+                         std::string* detail) {
   BrokerRendezvous rendezvous(ExecutableDirectory(), mode);
   const RendezvousStatus connected = rendezvous.ConnectOrLaunch(connection);
   if (connected != RendezvousStatus::kOk) {
     *detail = "connect status=" + std::to_string(static_cast<int>(connected));
     return false;
   }
-  const RendezvousStatus probed = connection->Probe(sequence, result);
-  if (probed != RendezvousStatus::kOk ||
-      result->observed_client_pid != ::GetCurrentProcessId() ||
-      result->sequence != sequence) {
-    *detail = "probe status=" + std::to_string(static_cast<int>(probed));
+  const RendezvousStatus handshook = connection->Handshake(request_id, result);
+  // Reciprocal peer auth plus a successful HELLO_ACK already prove the broker
+  // authenticated this client, so no observed-client-pid echo is checked here;
+  // client-identity rejection is covered by the dedicated peer-auth suite.
+  if (handshook != RendezvousStatus::kOk) {
+    *detail = "handshake status=" + std::to_string(static_cast<int>(handshook));
+    return false;
+  }
+  // End-to-end check of the negotiated endpoint mode: the broker advertises its
+  // own mode in HELLO_ACK, which must match this client's requested BrokerMode
+  // on the wire (Dedicated=0 / Shared=1 on both surfaces). This is the only
+  // place the coordinator's mode->endpoint_mode mapping is proven end-to-end.
+  if (result->endpoint_mode != static_cast<uint32_t>(mode)) {
+    *detail = "endpoint_mode=" + std::to_string(result->endpoint_mode) +
+              " expected=" + std::to_string(static_cast<uint32_t>(mode));
     return false;
   }
   return true;
@@ -55,17 +65,19 @@ bool ConnectAndProbe(BrokerMode mode,
 bool SharedFanIn(std::string* detail) {
   constexpr size_t kClients = 16;
   std::array<DWORD, kClients> pids = {};
+  std::array<uint32_t, kClients> conn_ids = {};
   std::array<bool, kClients> passed = {};
   std::array<std::string, kClients> details;
   std::vector<std::thread> threads;
   for (size_t i = 0; i < kClients; ++i) {
     threads.emplace_back([&, i] {
       BrokerConnection connection;
-      ProbeResult result;
-      passed[i] = ConnectAndProbe(BrokerMode::kShared,
-                                  static_cast<uint32_t>(i + 1), &connection,
-                                  &result, &details[i]);
-      pids[i] = result.broker_pid;
+      HelloResult result;
+      passed[i] = ConnectAndHandshake(BrokerMode::kShared,
+                                      static_cast<uint32_t>(i + 1), &connection,
+                                      &result, &details[i]);
+      pids[i] = connection.broker_pid();
+      conn_ids[i] = result.conn_id;
     });
   }
   for (std::thread& thread : threads)
@@ -84,6 +96,13 @@ bool SharedFanIn(std::string* detail) {
   std::set<DWORD> unique(pids.begin(), pids.end());
   if (unique.size() != 1 || *unique.begin() == 0) {
     *detail = "clients observed multiple broker PIDs";
+    return false;
+  }
+  // The single shared broker assigns conn_ids monotonically, so every client
+  // must have received a distinct one.
+  std::set<uint32_t> unique_conn_ids(conn_ids.begin(), conn_ids.end());
+  if (unique_conn_ids.size() != kClients) {
+    *detail = "broker reused a connection id across fan-in clients";
     return false;
   }
   printf("endpoint fan-in broker pid=%lu clients=%zu\n", *unique.begin(),
@@ -118,15 +137,15 @@ bool ExactPayloadSeparation(std::string* detail) {
 bool DedicatedUnique(std::string* detail) {
   BrokerConnection first;
   BrokerConnection second;
-  ProbeResult first_result;
-  ProbeResult second_result;
-  if (!ConnectAndProbe(BrokerMode::kDedicated, 101, &first, &first_result,
-                       detail) ||
-      !ConnectAndProbe(BrokerMode::kDedicated, 102, &second, &second_result,
-                       detail))
+  HelloResult first_result;
+  HelloResult second_result;
+  if (!ConnectAndHandshake(BrokerMode::kDedicated, 101, &first, &first_result,
+                           detail) ||
+      !ConnectAndHandshake(BrokerMode::kDedicated, 102, &second, &second_result,
+                           detail))
     return false;
   if (first.endpoint() == second.endpoint() ||
-      first_result.broker_pid == second_result.broker_pid) {
+      first.broker_pid() == second.broker_pid()) {
     *detail = "dedicated endpoint or PID reused";
     return false;
   }
@@ -137,18 +156,18 @@ bool MixedMode(std::string* detail) {
   BrokerConnection shared;
   BrokerConnection first;
   BrokerConnection second;
-  ProbeResult shared_result;
-  ProbeResult first_result;
-  ProbeResult second_result;
-  if (!ConnectAndProbe(BrokerMode::kShared, 201, &shared, &shared_result,
-                       detail) ||
-      !ConnectAndProbe(BrokerMode::kDedicated, 202, &first, &first_result,
-                       detail) ||
-      !ConnectAndProbe(BrokerMode::kDedicated, 203, &second, &second_result,
-                       detail))
+  HelloResult shared_result;
+  HelloResult first_result;
+  HelloResult second_result;
+  if (!ConnectAndHandshake(BrokerMode::kShared, 201, &shared, &shared_result,
+                           detail) ||
+      !ConnectAndHandshake(BrokerMode::kDedicated, 202, &first, &first_result,
+                           detail) ||
+      !ConnectAndHandshake(BrokerMode::kDedicated, 203, &second, &second_result,
+                           detail))
     return false;
-  std::set<DWORD> pids = {shared_result.broker_pid, first_result.broker_pid,
-                          second_result.broker_pid};
+  std::set<DWORD> pids = {shared.broker_pid(), first.broker_pid(),
+                          second.broker_pid()};
   if (pids.size() != 3) {
     *detail = "mixed brokers did not isolate PIDs";
     return false;
@@ -158,21 +177,24 @@ bool MixedMode(std::string* detail) {
 
 bool IdleExitRelaunch(std::string* detail) {
   BrokerConnection connection;
-  ProbeResult first;
-  if (!ConnectAndProbe(BrokerMode::kShared, 301, &connection, &first, detail))
+  HelloResult first;
+  if (!ConnectAndHandshake(BrokerMode::kShared, 301, &connection, &first,
+                           detail))
     return false;
+  const DWORD first_pid = connection.broker_pid();
   connection.Close();
   const ULONGLONG start = ::GetTickCount64();
-  if (!v8host::test::WaitForProcessExit(first.broker_pid, 8000) ||
+  if (!v8host::test::WaitForProcessExit(first_pid, 8000) ||
       ::GetTickCount64() - start < 4900) {
     *detail = "broker did not honor five-second idle grace";
     return false;
   }
   BrokerConnection replacement;
-  ProbeResult second;
-  if (!ConnectAndProbe(BrokerMode::kShared, 302, &replacement, &second, detail))
+  HelloResult second;
+  if (!ConnectAndHandshake(BrokerMode::kShared, 302, &replacement, &second,
+                           detail))
     return false;
-  if (first.broker_pid == second.broker_pid) {
+  if (first_pid == replacement.broker_pid()) {
     *detail = "broker PID did not change after relaunch";
     return false;
   }
@@ -181,18 +203,19 @@ bool IdleExitRelaunch(std::string* detail) {
 
 bool GraceCancel(std::string* detail) {
   BrokerConnection first_connection;
-  ProbeResult first;
-  if (!ConnectAndProbe(BrokerMode::kShared, 401, &first_connection, &first,
-                       detail))
+  HelloResult first;
+  if (!ConnectAndHandshake(BrokerMode::kShared, 401, &first_connection, &first,
+                           detail))
     return false;
+  const DWORD first_pid = first_connection.broker_pid();
   first_connection.Close();
   ::Sleep(1500);
   BrokerConnection second_connection;
-  ProbeResult second;
-  if (!ConnectAndProbe(BrokerMode::kShared, 402, &second_connection, &second,
-                       detail))
+  HelloResult second;
+  if (!ConnectAndHandshake(BrokerMode::kShared, 402, &second_connection, &second,
+                           detail))
     return false;
-  if (first.broker_pid != second.broker_pid) {
+  if (first_pid != second_connection.broker_pid()) {
     *detail = "connection during grace did not preserve broker";
     return false;
   }
@@ -231,11 +254,12 @@ bool EndpointSquatter(std::string* detail) {
   const RendezvousStatus init = rendezvous.ConnectOrLaunch(&warmup);
   if (init != RendezvousStatus::kOk)
     return false;
-  ProbeResult response;
-  if (warmup.Probe(501, &response) != RendezvousStatus::kOk)
+  HelloResult info;
+  if (warmup.Handshake(501, &info) != RendezvousStatus::kOk)
     return false;
+  const DWORD broker_pid = warmup.broker_pid();
   warmup.Close();
-  if (!v8host::test::WaitForProcessExit(response.broker_pid, 8000))
+  if (!v8host::test::WaitForProcessExit(broker_pid, 8000))
     return false;
 
   SquatterState state;
@@ -317,12 +341,13 @@ bool PathPolicy(std::string* detail) {
 
 bool DedicatedOwnerExit(std::string* detail) {
   BrokerConnection connection;
-  ProbeResult result;
-  if (!ConnectAndProbe(BrokerMode::kDedicated, 601, &connection, &result,
-                       detail))
+  HelloResult result;
+  if (!ConnectAndHandshake(BrokerMode::kDedicated, 601, &connection, &result,
+                           detail))
     return false;
+  const DWORD broker_pid = connection.broker_pid();
   connection.Close();
-  if (!v8host::test::WaitForProcessExit(result.broker_pid, 3000)) {
+  if (!v8host::test::WaitForProcessExit(broker_pid, 3000)) {
     *detail = "dedicated broker did not join and exit";
     return false;
   }
@@ -332,9 +357,9 @@ bool DedicatedOwnerExit(std::string* detail) {
 bool DisconnectRaces(std::string* detail) {
   for (uint32_t i = 0; i < 64; ++i) {
     BrokerConnection connection;
-    ProbeResult result;
-    if (!ConnectAndProbe(BrokerMode::kShared, 700 + i, &connection, &result,
-                         detail))
+    HelloResult result;
+    if (!ConnectAndHandshake(BrokerMode::kShared, 700 + i, &connection, &result,
+                             detail))
       return false;
     connection.Close();
   }

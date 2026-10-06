@@ -3,6 +3,8 @@
 #include "v8host_file_identity.h"
 #include "v8host_payload_identity.h"
 #include "v8host_peer_auth.h"
+#include "v8host_protocol.h"
+#include "v8host_protocol_messages.h"
 
 #include <sddl.h>
 
@@ -20,22 +22,7 @@
 
 namespace {
 
-constexpr uint32_t kProbeMagic = 0x31504256;
-constexpr uint32_t kProbeResponseMagic = 0x31524256;
-
-uint32_t GetLe32(const uint8_t* in) {
-  return static_cast<uint32_t>(in[0]) |
-         (static_cast<uint32_t>(in[1]) << 8) |
-         (static_cast<uint32_t>(in[2]) << 16) |
-         (static_cast<uint32_t>(in[3]) << 24);
-}
-
-void PutLe32(uint8_t* out, uint32_t value) {
-  out[0] = static_cast<uint8_t>(value);
-  out[1] = static_cast<uint8_t>(value >> 8);
-  out[2] = static_cast<uint8_t>(value >> 16);
-  out[3] = static_cast<uint8_t>(value >> 24);
-}
+namespace protocol = v8host::protocol;
 
 bool IoWithDeadline(HANDLE pipe,
                     bool write,
@@ -66,6 +53,42 @@ bool IoWithDeadline(HANDLE pipe,
   }
   ::CloseHandle(overlapped.hEvent);
   return ok && transferred == size;
+}
+
+// Reads exactly one pipe message (a full Contract B frame) into a bounded
+// buffer. The transferred size is variable, so success does not require filling
+// the buffer. Handshake control frames are small (HELLO is 36 bytes); a message
+// larger than the buffer surfaces as ERROR_MORE_DATA and is fatal
+// (fail-closed), never reassembled.
+bool ReadFrameMessage(HANDLE pipe,
+                      uint8_t* buf,
+                      DWORD buf_size,
+                      DWORD* out_len,
+                      DWORD timeout_ms) {
+  OVERLAPPED overlapped = {};
+  overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!overlapped.hEvent)
+    return false;
+  DWORD transferred = 0;
+  BOOL started = ::ReadFile(pipe, buf, buf_size, nullptr, &overlapped);
+  bool pending = !started && ::GetLastError() == ERROR_IO_PENDING;
+  bool ok = false;
+  if (started) {
+    ok = ::GetOverlappedResult(pipe, &overlapped, &transferred, FALSE) != FALSE;
+  } else if (pending &&
+             ::WaitForSingleObject(overlapped.hEvent, timeout_ms) ==
+                 WAIT_OBJECT_0) {
+    ok = ::GetOverlappedResult(pipe, &overlapped, &transferred, FALSE) != FALSE;
+    pending = false;
+  }
+  if (pending) {
+    ::CancelIoEx(pipe, &overlapped);
+    ::GetOverlappedResult(pipe, &overlapped, &transferred, TRUE);
+  }
+  ::CloseHandle(overlapped.hEvent);
+  if (ok)
+    *out_len = transferred;
+  return ok;
 }
 
 class PipeSecurity {
@@ -281,17 +304,30 @@ class BrokerService {
       }
     }
     if (authenticated) {
-      uint8_t request[16] = {};
-      if (IoWithDeadline(pipe, false, request, sizeof(request), 2000) &&
-          GetLe32(request) == kProbeMagic &&
-          GetLe32(request + 4) == static_cast<uint32_t>(mode_) &&
-          GetLe32(request + 12) == 0) {
-        uint8_t response[24] = {};
-        PutLe32(response, kProbeResponseMagic);
-        PutLe32(response + 4, ::GetCurrentProcessId());
-        PutLe32(response + 8, peer.pid());
-        PutLe32(response + 12, GetLe32(request + 8));
-        IoWithDeadline(pipe, true, response, sizeof(response), 2000);
+      // Contract B §8.2: the first post-auth frame must be HELLO with zero
+      // addressing ids and a nonzero request id. Malformed or unexpected input
+      // fails closed — no reply — and falls through to teardown below.
+      uint8_t buffer[512] = {};
+      DWORD len = 0;
+      protocol::FrameHeader hello_header;
+      const uint8_t* payload = nullptr;
+      size_t payload_size = 0;
+      protocol::HelloPayload hello_payload;
+      if (ReadFrameMessage(pipe, buffer, sizeof(buffer), &len, 2000) &&
+          protocol::DecodeAndValidateFrame(buffer, len, &hello_header, &payload,
+                                           &payload_size) ==
+              protocol::DecodeStatus::kOk &&
+          hello_header.type == protocol::MessageType::HELLO &&
+          hello_header.conn_id == 0 && hello_header.session_id == 0 &&
+          hello_header.run_id == 0 && hello_header.request_id != 0 &&
+          protocol::DecodeHelloPayload(payload, payload_size, &hello_payload)) {
+        const uint32_t conn_id = next_conn_id_.fetch_add(1);
+        protocol::BrokerCapabilities caps;
+        caps.endpoint_mode = static_cast<uint32_t>(mode_);
+        protocol::NegotiationResult negotiation =
+            protocol::NegotiateHello(hello_header, hello_payload, caps, conn_id);
+        IoWithDeadline(pipe, true, negotiation.frame.data(),
+                       static_cast<DWORD>(negotiation.frame.size()), 2000);
       }
     }
     ::FlushFileBuffers(pipe);
@@ -318,6 +354,9 @@ class BrokerService {
   size_t connection_count_ = 0;
   bool owner_seen_ = false;
   std::atomic<bool> draining_{false};
+  // Process-unique, nonzero, monotonic connection id (design §8.3: never reused
+  // within this broker process).
+  std::atomic<uint32_t> next_conn_id_{1};
 };
 
 #if defined(SBOX_DEV_ALLOW_UNSIGNED)

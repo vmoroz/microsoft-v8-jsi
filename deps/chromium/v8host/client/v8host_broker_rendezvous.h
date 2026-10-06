@@ -18,10 +18,14 @@ enum class RendezvousStatus {
   kIoFailed,
 };
 
-struct ProbeResult {
-  DWORD broker_pid = 0;
-  DWORD observed_client_pid = 0;
-  uint32_t sequence = 0;
+struct HelloResult {
+  uint32_t conn_id = 0;          // broker-assigned, nonzero
+  uint16_t selected_major = 0;   // negotiated wire version (HELLO_ACK header)
+  uint16_t selected_minor = 0;
+  uint16_t broker_max_major = 0; // broker's advertised maximum
+  uint16_t broker_max_minor = 0;
+  uint32_t endpoint_mode = 0;    // kEndpointMode* value from HELLO_ACK
+  uint32_t request_id = 0;       // echoed HELLO request_id
 };
 
 class BrokerConnection {
@@ -36,7 +40,7 @@ class BrokerConnection {
   HANDLE pipe() const;
   DWORD broker_pid() const;
   const std::wstring& endpoint() const;
-  RendezvousStatus Probe(uint32_t sequence, ProbeResult* result);
+  RendezvousStatus Handshake(uint32_t request_id, HelloResult* result);
   void Close();
 
  private:
