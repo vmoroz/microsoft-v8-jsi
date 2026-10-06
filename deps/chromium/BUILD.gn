@@ -25,6 +25,11 @@ group("v8host_protocol_tests") {
   deps = [ "//v8host:v8host_protocol_tests" ]
 }
 
+group("v8host_protocol_fuzz") {
+  testonly = true
+  deps = [ "//v8host:v8host_protocol_fuzz" ]
+}
+
 if (current_cpu == "x64") {
   group("sbox_trust_transition_tests") {
     testonly = true

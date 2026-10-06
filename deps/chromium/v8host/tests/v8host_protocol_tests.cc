@@ -416,6 +416,14 @@ std::vector<uint8_t> CanonicalConcat() {
   return all;
 }
 
+// The frozen cross-arch canonical-vector contract: the SHA-256 over
+// CanonicalConcat() (every canonical vector, fixed order). `--vectors-only`
+// asserts the live digest equals this on whatever arch it runs, so an identical
+// value on x86/x64/arm64 IS the cross-arch equality gate and any wire/byte
+// change trips it. Update this ONLY together with a deliberate wire change.
+constexpr const char kExpectedVectorsSha256[] =
+    "b885520dcb3dc1ad9ccf0d9c07baba850eec4b56b09041d03e97b723daf8efef";
+
 // Hard-coded expected bytes (computed independently). These exact-byte asserts
 // are the cross-arch contract: any arch must produce precisely these bytes.
 const uint8_t kExpectAllDistinct[32] = {
@@ -2204,12 +2212,24 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--vectors-only") == 0) {
       // One deterministic digest line over all canonical vectors (fixed order),
-      // then run the vectors suite so a byte regression also fails here.
-      std::printf("vectors-sha256=%s\n", Sha256Hex(CanonicalConcat()).c_str());
+      // then the self-check against the frozen cross-arch contract, then the
+      // vectors suite so a byte regression fails here too. The digest doubles as
+      // the cross-arch gate (same bytes on x86/x64/arm64 -> same digest), so a
+      // mismatch fails the run on whatever arch it executes.
+      const std::string digest = Sha256Hex(CanonicalConcat());
+      std::printf("vectors-sha256=%s\n", digest.c_str());
+      const bool digest_ok = digest == kExpectedVectorsSha256;
+      if (!digest_ok)
+        std::printf(
+            "vectors-sha256 FAIL: expected %s (frozen cross-arch canonical-"
+            "vector contract); a differing digest means a wire/byte regression "
+            "or a cross-arch divergence\n",
+            kExpectedVectorsSha256);
       std::fflush(stdout);
       char suite_arg[] = "--suite=vectors";
       char* synthetic[] = {argv[0], suite_arg};
-      return v8host::test::RunTests(2, synthetic, tests);
+      const int suite_result = v8host::test::RunTests(2, synthetic, tests);
+      return (digest_ok && suite_result == 0) ? 0 : 1;
     }
   }
 

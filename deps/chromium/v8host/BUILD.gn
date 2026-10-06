@@ -187,6 +187,18 @@ executable("v8host_protocol_tests") {
   deps = [ ":protocol" ]
 }
 
+# Deterministic in-process fuzz harness for //v8host:protocol. Mutates a built-in
+# + on-disk corpus and feeds the bytes to every decoder, proving robustness (no
+# crash/hang/unbounded allocation) on arbitrary input. NOT libFuzzer (that config
+# is x64+ASan-only and off by default here); a plain executable is portable
+# across x86/x64/arm64 and flake-free. Only the codec is linked — the corpus dir
+# is passed by path arg at run time (the lone bit of Win32 lives in the harness).
+executable("v8host_protocol_fuzz") {
+  testonly = true
+  sources = [ "tests/v8host_protocol_fuzz.cc" ]
+  deps = [ ":protocol" ]
+}
+
 # Deliberately invalid plugin used by the host-rejects-bad-plugin-abi case.
 shared_library("v8host_fake_plugin") {
   testonly = true
