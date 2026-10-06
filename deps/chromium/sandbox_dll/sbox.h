@@ -41,7 +41,7 @@ extern "C" {
 #define SBOX_EXPORT
 #endif
 
-#define SBOX_ABI_VERSION 2u
+#define SBOX_ABI_VERSION 3u
 
 // Opaque, typed handles (Node-API style — never void*).
 typedef struct sbox_config_s* sbox_config;  // broker: the policy builder
@@ -69,6 +69,17 @@ typedef enum {
   sbox_integrity_low = 0,
   sbox_integrity_untrusted = 1,
 } sbox_integrity_level;
+
+// Restricted-token levels for set_tokens: the worker's initial token and its
+// lowered lockdown token (ordinary non-AppContainer mode). The host maps these
+// 1:1 to its internal enum (static_assert'd in sbox_config.cc).
+typedef enum {
+  sbox_token_lockdown = 0,                // null SID only; most restrictive
+  sbox_token_limited = 1,                 // restricting SIDs
+  sbox_token_interactive = 2,             // + Owner
+  sbox_token_restricted_non_admin = 3,    // keeps user/authenticated SIDs
+  sbox_token_restricted_same_access = 4,  // all SIDs (~ caller access); least restrictive
+} sbox_token_level;
 
 typedef void(SBOX_CALL* sbox_message_cb)(void* ctx, sbox_msg_kind kind,
                                          const void* data, size_t len);
@@ -115,24 +126,32 @@ typedef struct sbox_broker_api {
 } sbox_broker_api;
 
 // --- sbox.exe -> plugin, BROKER role: services configure() uses to describe
-// the sandbox. sbox speaks ACG (a mitigation), never JIT. ---
+// the sandbox. sbox speaks ACG (a mitigation), never JIT. Every setter returns
+// sbox_status; a rejected setter poisons the builder so a partial/invalid config
+// can never spawn (fail closed). Limits: <=64 file rules, <=64 capabilities,
+// <=4096 plugin-data bytes. ---
 typedef struct sbox_config_api {
   uint32_t struct_size;  // sizeof(sbox_config_api); lets the plugin version-check
-  void (SBOX_CALL* set_acg)(sbox_config, int enable);  // Arbitrary Code Guard
-  void (SBOX_CALL* set_integrity)(sbox_config, int initial, int delayed);
+  sbox_status (SBOX_CALL* set_acg)(sbox_config, int enable);  // Arbitrary Code Guard
+  sbox_status (SBOX_CALL* set_integrity)(sbox_config, int initial, int delayed);
   sbox_status (SBOX_CALL* add_file_rule)(sbox_config, const wchar_t* pattern,
                                          int readonly);
   sbox_status (SBOX_CALL* add_capability)(sbox_config,
                                           const wchar_t* capability_sid);
-  void (SBOX_CALL* set_app_container)(sbox_config, int enable, int lpac,
-                                      const wchar_t* profile);
+  sbox_status (SBOX_CALL* set_app_container)(sbox_config, int enable, int lpac,
+                                             const wchar_t* profile);
   // DLLs the worker will LoadLibrary pre-lockdown. sbox verifies each (app-dir
   // filename only, Authenticode). The plugin DLL itself is implicit.
   sbox_status (SBOX_CALL* allow_engine_dll)(sbox_config, const wchar_t* filename);
   // Opaque app-knowledge blob carried broker->worker; sbox NEVER interprets it.
   // The plugin encodes its own run profile here (e.g. jitless engine choice,
   // snapshot path) and reads it back in warmup via sbox_worker_api.get_plugin_data.
-  void (SBOX_CALL* set_plugin_data)(sbox_config, const void* data, size_t len);
+  sbox_status (SBOX_CALL* set_plugin_data)(sbox_config, const void* data, size_t len);
+  // Restricted-token levels (sbox_token_level) for ordinary (non-AppContainer)
+  // mode: the worker's initial token and the lowered lockdown token. Appended
+  // last to keep the vtable append-only across the ABI bump.
+  sbox_status (SBOX_CALL* set_tokens)(sbox_config, int initial_token,
+                                      int lockdown_token);
 } sbox_config_api;
 
 // --- sbox.exe -> plugin, WORKER role: services warmup()/run() use. ---

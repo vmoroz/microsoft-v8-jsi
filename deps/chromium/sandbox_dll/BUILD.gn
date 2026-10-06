@@ -3,6 +3,24 @@
 # the EXE loads v8host.dll (the engine payload) at runtime.
 # Build everything: `ninja -C out/sandbox-x64 generic`.
 
+# The broker's sandbox-policy builder (host side of sbox.h's sbox_config_api) +
+# the fail-closed marshal/discard gate. Factored out of sbox_main.cc so the
+# status-returning setters and the gate are unit-testable (see
+# //v8host:v8host_config_tests) without the sbox.exe role dispatch or a spawned
+# worker. SBOX_STATIC keeps sbox_core_internal.h's SBOX_API as plain extern "C".
+config("sbox_config_public") {
+  include_dirs = [ "." ]  # sbox.h, sbox_core_internal.h, sbox_config.h
+}
+
+static_library("sbox_config") {
+  sources = [
+    "sbox_config.cc",
+    "sbox_config.h",
+  ]
+  public_configs = [ ":sbox_config_public" ]
+  defines = [ "SBOX_STATIC" ]
+}
+
 # sbox.exe — the V8-agnostic sandbox container. Statically links the broker/
 # target core (sbox_dll.cc) and the role-dispatch + fail-closed lifecycle driver
 # (sbox_main.cc). SBOX_STATIC makes SBOX_API plain extern "C" so the core's
@@ -15,6 +33,7 @@ executable("sbox") {
   include_dirs = [ "." ]  # sbox_core_internal.h, sbox.h, msg_channel.h, sbox_harden.h
   defines = [ "SBOX_STATIC", "SBOX_DEV_ALLOW_UNSIGNED" ]
   deps = [
+    ":sbox_config",
     "//base",
     "//sandbox/win:sandbox",
     "//v8host:file_identity",

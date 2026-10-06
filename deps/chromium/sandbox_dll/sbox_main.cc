@@ -20,6 +20,7 @@
 #include "sbox_core_internal.h"
 #include "sbox_harden.h"
 #include "sbox.h"
+#include "sbox_config.h"
 #include "v8host_file_identity.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -44,23 +45,9 @@
 
 // The host's private definitions of sbox.h's opaque handles. Defined at GLOBAL
 // scope (matching sbox.h's forward declarations), not in the anonymous namespace
-// below, so they are the SAME ::sbox_config_s / ::sbox_worker_s the typedefs name.
-
-// sbox_config: the broker's policy builder. plugin.configure() writes into it via
-// the sbox_config_api setters; PrepareSandbox then marshals it to an SboxPolicy.
-struct sbox_config_s {
-  bool acg = false;
-  int initial_integrity = SBOX_INTEGRITY_LOW;
-  int delayed_integrity = SBOX_INTEGRITY_UNTRUSTED;
-  std::vector<std::wstring> file_patterns;
-  std::vector<int> file_readonly;
-  std::vector<std::wstring> capabilities;
-  bool use_app_container = false;
-  bool lpac = false;
-  std::wstring profile;
-  std::vector<std::wstring> engine_dlls;  // verified by the broker before spawn
-  std::string plugin_data;                // opaque app blob, carried to the worker
-};
+// below, so they are the SAME ::sbox_worker_s / ::sbox_broker_s the typedefs
+// name. (::sbox_config_s + its setters live in sbox_config.h/.cc, shared with the
+// config unit test.)
 
 // sbox_worker: the worker's run context — just the sandbox target the worker_api
 // services bridge to.
@@ -172,14 +159,6 @@ bool ParseNonce(int argc, char** argv, std::array<uint8_t, 16>* nonce) {
   return true;
 }
 
-// A plugin name must be a BARE app-dir filename (e.g. "v8host.dll") — never a
-// path. The broker Authenticode-verifies it inside the app dir, so rejecting
-// separators / ".." closes the only planting vector the name itself could open.
-bool IsBareFilename(const std::wstring& name) {
-  return !name.empty() && name.find_first_of(L"\\/:") == std::wstring::npos &&
-         name.find(L"..") == std::wstring::npos;
-}
-
 // Widen a narrow argv token (plugin names are ASCII; UTF-8 is a safe superset).
 std::wstring Widen(const char* s) {
   if (!s || !*s)
@@ -208,14 +187,8 @@ std::wstring ParsePluginName(int argc, char** argv) {
 // ===== the sbox.h plugin ABI, host side =====
 // sbox.exe is a generic container; the plugin DLL (resolved by --plugin) carries
 // all app knowledge. The broker calls plugin.configure to collect the sandbox
-// policy; the worker drives warmup -> lower_token -> run -> shutdown.
-
-// The plugin passes sbox.h's integrity constants; pin them to the core's enum.
-static_assert(static_cast<int>(sbox_integrity_low) ==
-                      static_cast<int>(SBOX_INTEGRITY_LOW) &&
-                  static_cast<int>(sbox_integrity_untrusted) ==
-                      static_cast<int>(SBOX_INTEGRITY_UNTRUSTED),
-              "sbox.h integrity levels must match SboxIntegrityLevel");
+// policy (the sbox_config_api setters + the MarshalSboxConfig gate live in
+// sbox_config.cc); the worker drives warmup -> lower_token -> run -> shutdown.
 
 // WkDrainMessages hands the plugin's sbox_message_cb to the core's drain, which
 // calls it as SboxMessageCb; the two differ only in the kind parameter type
@@ -226,67 +199,6 @@ static_assert(sizeof(sbox_msg_kind) == sizeof(int) &&
                   static_cast<int>(sbox_msg_binary) ==
                       static_cast<int>(SBOX_MSG_BINARY),
               "sbox_msg_kind must match SboxMsgKind for the drain cast");
-
-// --- sbox_config_api: broker services the plugin's configure() calls ---
-void SBOX_CALL CfgSetAcg(sbox_config c, int enable) {
-  if (c)
-    c->acg = enable != 0;
-}
-void SBOX_CALL CfgSetIntegrity(sbox_config c, int initial, int delayed) {
-  if (!c)
-    return;
-  c->initial_integrity = initial;
-  c->delayed_integrity = delayed;
-}
-sbox_status SBOX_CALL CfgAddFileRule(sbox_config c, const wchar_t* pattern,
-                                     int readonly) {
-  if (!c || !pattern || !pattern[0])
-    return sbox_error_args;
-  c->file_patterns.emplace_back(pattern);
-  c->file_readonly.push_back(readonly ? 1 : 0);
-  return sbox_ok;
-}
-sbox_status SBOX_CALL CfgAddCapability(sbox_config c, const wchar_t* sid) {
-  if (!c || !sid || !sid[0])
-    return sbox_error_args;
-  c->capabilities.emplace_back(sid);
-  return sbox_ok;
-}
-void SBOX_CALL CfgSetAppContainer(sbox_config c, int enable, int lpac,
-                                  const wchar_t* profile) {
-  if (!c)
-    return;
-  c->use_app_container = enable != 0;
-  c->lpac = lpac != 0;
-  c->profile = profile ? profile : L"";
-}
-sbox_status SBOX_CALL CfgAllowEngineDll(sbox_config c, const wchar_t* filename) {
-  if (!c || !filename || !IsBareFilename(filename))
-    return sbox_error_args;
-  c->engine_dlls.emplace_back(filename);
-  return sbox_ok;
-}
-void SBOX_CALL CfgSetPluginData(sbox_config c, const void* data, size_t len) {
-  if (!c)
-    return;
-  if (data && len)
-    c->plugin_data.assign(static_cast<const char*>(data), len);
-  else
-    c->plugin_data.clear();
-}
-
-sbox_config_api MakeConfigApi() {
-  sbox_config_api api = {};
-  api.struct_size = sizeof(api);
-  api.set_acg = &CfgSetAcg;
-  api.set_integrity = &CfgSetIntegrity;
-  api.add_file_rule = &CfgAddFileRule;
-  api.add_capability = &CfgAddCapability;
-  api.set_app_container = &CfgSetAppContainer;
-  api.allow_engine_dll = &CfgAllowEngineDll;
-  api.set_plugin_data = &CfgSetPluginData;
-  return api;
-}
 
 // --- sbox_worker_api: worker services the plugin's warmup()/run() call, bridged
 // to the sandbox core's sbox_target_* message channel ---
@@ -396,20 +308,18 @@ bool LoadPlugin(const std::wstring& plugin_name, bool verify, const char* tag,
 
 // The broker's prepared sandbox: the plugin vtable + the SboxPolicy it described,
 // with all pointer-referenced storage owned here. Must outlive every spawn that
-// uses `policy` (its pointers alias the members below), so never copy it after
-// PrepareSandbox fills it.
+// uses `marshal.policy` (its pointers alias cfg + marshal), so never copy it
+// after PrepareSandbox fills it.
 struct PreparedSandbox {
   HMODULE plugin_mod = nullptr;
   const sbox_plugin* plugin = nullptr;
   std::wstring plugin_name;
   v8host::HeldFile plugin_file;
-  sbox_config_s cfg;                     // collected by configure()
-  std::vector<SboxFileRule> file_rules;  // pattern ptrs into cfg.file_patterns
-  std::vector<const wchar_t*> cap_ptrs;  // into cfg.capabilities
-  SboxPolicy policy = {};
+  sbox_config_s cfg;          // collected by configure()
+  SboxConfigMarshal marshal;  // the SboxPolicy + the storage its pointers alias
 
   PreparedSandbox() = default;
-  // policy aliases the members above, so a copy/move would leave it dangling.
+  // marshal.policy aliases cfg + marshal, so a copy/move would leave it dangling.
   PreparedSandbox(const PreparedSandbox&) = delete;
   PreparedSandbox& operator=(const PreparedSandbox&) = delete;
   ~PreparedSandbox() {
@@ -448,37 +358,14 @@ bool PrepareSandbox(const std::wstring& plugin_name,
     }
   }
 
-  // Marshal the collected config into an SboxPolicy. Token levels are the
-  // container's default (ordinary restricted-token mode); the plugin owns ACG,
-  // integrity, AppContainer, file rules, capabilities, and the opaque blob.
-  SboxPolicy& p = out.policy;
-  p = {};
-  p.struct_size = sizeof(p);
-  p.initial_token = SBOX_TOKEN_RESTRICTED_SAME_ACCESS;
-  p.lockdown_token = SBOX_TOKEN_LOCKDOWN;
-  p.integrity = out.cfg.initial_integrity;
-  p.delayed_integrity = out.cfg.delayed_integrity;
-  p.prohibit_dynamic_code = out.cfg.acg ? 1 : 0;
-  for (size_t i = 0; i < out.cfg.file_patterns.size(); ++i) {
-    SboxFileRule r = {};
-    r.pattern = out.cfg.file_patterns[i].c_str();
-    r.readonly = out.cfg.file_readonly[i];
-    out.file_rules.push_back(r);
+  // Marshal the collected config into an SboxPolicy. THE DISCARD GATE: if any
+  // setter poisoned the builder, or a cross-setter rule fails, this returns false
+  // and we fail closed here — before sbox_broker_spawn, so NO worker is resumed
+  // and no partial policy is applied.
+  if (!MarshalSboxConfig(out.cfg, out.plugin_name.c_str(), out.marshal)) {
+    printf("[sbox] plugin.configure produced an invalid policy; no spawn\n");
+    return false;
   }
-  p.file_rules = out.file_rules.empty() ? nullptr : out.file_rules.data();
-  p.file_rule_count = out.file_rules.size();
-  p.use_app_container = out.cfg.use_app_container ? 1 : 0;
-  p.low_privilege_app_container = out.cfg.lpac ? 1 : 0;
-  p.app_container_profile_name =
-      out.cfg.profile.empty() ? nullptr : out.cfg.profile.c_str();
-  for (const std::wstring& cap : out.cfg.capabilities)
-    out.cap_ptrs.push_back(cap.c_str());
-  p.capabilities = out.cap_ptrs.empty() ? nullptr : out.cap_ptrs.data();
-  p.capability_count = out.cap_ptrs.size();
-  p.worker_plugin_name = out.plugin_name.c_str();
-  p.plugin_data =
-      out.cfg.plugin_data.empty() ? nullptr : out.cfg.plugin_data.data();
-  p.plugin_data_len = out.cfg.plugin_data.size();
   return true;
 }
 
@@ -619,7 +506,7 @@ int RunBroker(const std::wstring& plugin_name) {
   Perf perf;
   const LONGLONG t_spawn0 = perf.now();
   SboxSession* session =
-      sbox_broker_spawn(self.c_str(), &sb.policy, &OnBrokerReply, &mctx);
+      sbox_broker_spawn(self.c_str(), &sb.marshal.policy, &OnBrokerReply, &mctx);
   const LONGLONG t_spawn1 = perf.now();
   if (!session) {
     printf("[sbox] broker: spawn failed\n");
@@ -782,7 +669,7 @@ sbox_status SBOX_CALL BrokerConfigureAndSpawn(
   worker->callback = on_message;
   worker->callback_context = callback_context;
   worker->session =
-      sbox_broker_spawn(broker->self_path.c_str(), &sandbox.policy,
+      sbox_broker_spawn(broker->self_path.c_str(), &sandbox.marshal.policy,
                         &OnBrokerWorkerMessage, worker.get());
   if (!worker->session)
     return sbox_error;

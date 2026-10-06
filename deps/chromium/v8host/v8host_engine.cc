@@ -7,9 +7,11 @@
 // lifecycle; this DLL links ONLY sbox.h (never the sandbox core) and reaches the
 // message channel through the sbox_worker_api function pointers.
 //
-//   configure  BROKER        : describe the sandbox (ACG + integrity + the engine
-//                              DLL allow) and encode the run profile (engine DLL,
-//                              jitless, optional snapshot) into opaque plugin_data.
+//   configure  BROKER        : decode the V8HostSpawnConfigV1 (session envelope +
+//                              effective worker profile), drive every sbox config
+//                              setter, and encode the V8HostWorkerProfileV1
+//                              (engine DLL, jitless, optional snapshot) into
+//                              opaque plugin_data.
 //   warmup     PRE-lockdown  : decode plugin_data, load the engine DLL, set
 //                              --jitless, (optional) startup snapshot, read the
 //                              guest JS, create the JSI runtime, install `host`.
@@ -32,6 +34,7 @@
 // single sbox_plugin_main entry.
 #include "sbox.h"
 #include "v8host_broker.h"
+#include "v8host_spawn_apply.h"  // ApplySpawnConfig + the spawn/worker-profile codec
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -74,27 +77,6 @@ using namespace facebook::jsi;  // Runtime, Value, Object, Function, String, ...
 sbox_worker g_worker = nullptr;          // the worker run context (opaque)
 const sbox_worker_api* g_api = nullptr;  // worker services (message channel)
 
-// The run profile the broker's configure() encodes into the opaque plugin_data
-// and the worker's warmup() decodes. Both run in THIS DLL, so the layout agrees;
-// sbox.exe never looks inside it.
-constexpr uint32_t kRunProfileMagic = 0x56384850u;  // 'V8HP'
-constexpr uint32_t kRunProfileVersion = 1u;
-struct RunProfile {
-  uint32_t magic;
-  uint32_t version;            // == kRunProfileVersion
-  uint32_t jitless;            // 1 = jitless + ACG; 0 = JIT (Trusted)
-  wchar_t engine_dll[64];      // engine filename (bare, app-dir)
-  wchar_t snapshot_path[260];  // optional startup snapshot; empty = none
-};
-
-// Copy a wstring into a fixed wchar_t[N], always NUL-terminated (bounded).
-template <size_t N>
-void CopyBounded(wchar_t (&dst)[N], const std::wstring& src) {
-  const size_t n = src.size() < (N - 1) ? src.size() : (N - 1);
-  if (n)
-    ::memcpy(dst, src.data(), n * sizeof(wchar_t));
-  dst[n] = L'\0';
-}
 HMODULE g_engine = nullptr;                // the loaded engine DLL
 Runtime* g_rt = nullptr;                   // owned; deleted in shutdown
 std::string g_guest_src;                   // guest source, read pre-lockdown
@@ -195,6 +177,36 @@ std::wstring EnvW(const wchar_t* name) {
   wchar_t buf[MAX_PATH] = {};
   DWORD n = ::GetEnvironmentVariableW(name, buf, MAX_PATH);
   return (n == 0 || n >= MAX_PATH) ? std::wstring() : std::wstring(buf, n);
+}
+
+// UTF-8 <-> UTF-16 bridges between the neutral spawn/worker-profile codec (UTF-8)
+// and the Win32 wide APIs (engine DLL / snapshot paths). Lossless for valid
+// Unicode (the codec guarantees strict UTF-8 / no NUL); empty maps to empty.
+std::wstring Utf8ToWide(const std::string& utf8) {
+  if (utf8.empty())
+    return std::wstring();
+  const int needed =
+      ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(),
+                            static_cast<int>(utf8.size()), nullptr, 0);
+  if (needed <= 0)
+    return std::wstring();
+  std::wstring wide(static_cast<size_t>(needed), L'\0');
+  ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(),
+                        static_cast<int>(utf8.size()), wide.data(), needed);
+  return wide;
+}
+std::string WideToUtf8(const std::wstring& wide) {
+  if (wide.empty())
+    return std::string();
+  const int needed =
+      ::WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
+                            nullptr, 0, nullptr, nullptr);
+  if (needed <= 0)
+    return std::string();
+  std::string utf8(static_cast<size_t>(needed), '\0');
+  ::WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
+                        utf8.data(), needed, nullptr, nullptr);
+  return utf8;
 }
 
 bool ReadGuestPath(std::wstring& path) {
@@ -504,26 +516,22 @@ static sbox_status SBOX_CALL Warmup(sbox_worker w,
   ::InitializeCriticalSection(&g_tasks->cs);
   g_tasks->wake = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset
 
-  // The broker's configure() encoded the run profile (engine DLL + jitless +
-  // optional startup snapshot) into the opaque plugin_data; decode it here. The
-  // SAME configure() set ACG, so the jitless choice matches the mitigation.
-  RunProfile prof = {};
+  // The broker's configure() encoded the bound worker profile (engine DLL +
+  // jitless + optional startup snapshot) into the opaque plugin_data; decode it
+  // here. The SAME configure() armed ACG to match the jitless choice.
+  v8host::V8HostWorkerProfileV1 prof;
   {
     const void* pd = nullptr;
     size_t pd_len = 0;
-    if (api->get_plugin_data(w, &pd, &pd_len) != sbox_ok || !pd ||
-        pd_len < sizeof(RunProfile)) {
-      printf("[v8host] warmup: missing/undersized plugin_data run profile\n");
-      return sbox_error;
-    }
-    ::memcpy(&prof, pd, sizeof(prof));
-    if (prof.magic != kRunProfileMagic || prof.version != kRunProfileVersion) {
-      printf("[v8host] warmup: bad run profile magic/version\n");
+    if (api->get_plugin_data(w, &pd, &pd_len) != sbox_ok || !pd || pd_len == 0 ||
+        !v8host::V8HostWorkerProfileV1::Decode(
+            static_cast<const uint8_t*>(pd), pd_len, &prof)) {
+      printf("[v8host] warmup: missing/invalid worker profile plugin_data\n");
       return sbox_error;
     }
   }
   const bool jitless = prof.jitless != 0;
-  std::wstring engine_dll = prof.engine_dll;
+  std::wstring engine_dll = Utf8ToWide(prof.engine_dll);
   printf("[v8host] tier = %s\n",
          jitless ? "Untrusted (jitless + ACG)" : "Trusted (JIT, ACG off)");
   if (engine_dll.empty()) {
@@ -533,7 +541,7 @@ static sbox_status SBOX_CALL Warmup(sbox_worker w,
 
   // Startup snapshot from the run profile (read NOW, pre-lockdown). A set-but-
   // unreadable path is a warning, not fatal (falls back to a normal runtime).
-  const std::wstring snapshot_path = prof.snapshot_path;
+  const std::wstring snapshot_path = Utf8ToWide(prof.snapshot_path);
   if (!snapshot_path.empty()) {
     if (ReadFileBytes(snapshot_path, g_snapshot_blob)) {
       g_have_snapshot = true;
@@ -796,11 +804,37 @@ static void SBOX_CALL Shutdown(sbox_worker /*w*/) {
 
 //==========================================================================
 // BROKER role. Runs in the broker process (which loads this DLL only to call
-// configure). Decides the tier — ACG + jitless engine for Untrusted, JIT for
-// Trusted (both overridable via env for testing) — declares the engine DLL for
-// the broker to Authenticode-verify, and encodes the run profile into the opaque
-// plugin_data the worker reads back in warmup.
+// configure). On the coordinator path it decodes the V8HostSpawnConfigV1
+// (session security envelope + bound effective worker profile) from
+// configure_data; the standalone broker smoke passes none, so a dev fallback
+// derives the tier/engine/snapshot from env + container defaults. Either way it
+// drives every sbox config setter from the spawn config and encodes the
+// V8HostWorkerProfileV1 into the opaque plugin_data the worker reads in warmup.
 //==========================================================================
+
+// Build the dev-fallback spawn config used when configure() is handed no
+// configure_data (the standalone `sbox.exe --broker` smoke). ACG forces jitless
+// for Untrusted; Trusted leaves ACG off so V8's JIT can run (ApplySpawnConfig
+// enforces that jitless<->ACG match). The SBOX_TIER / V8HOST_ENGINE_DLL /
+// V8HOST_SNAPSHOT overrides stay dev-test-only.
+static void BuildDevSpawnConfig(v8host::V8HostSpawnConfigV1& spawn) {
+  const bool trusted = EnvW(L"SBOX_TIER") == L"trusted";
+  std::wstring engine = EnvW(L"V8HOST_ENGINE_DLL");
+  if (engine.empty())
+    engine = trusted ? L"v8jsi.dll" : L"v8jsisb.dll";
+  spawn.tier = trusted ? v8host::kTierTrusted : v8host::kTierUntrusted;
+  spawn.effective_tier = spawn.tier;
+  spawn.prohibit_dynamic_code = !trusted;
+  spawn.integrity = sbox_integrity_low;
+  spawn.delayed_integrity = sbox_integrity_untrusted;
+  spawn.initial_token = sbox_token_restricted_same_access;
+  spawn.lockdown_token = sbox_token_lockdown;
+  spawn.use_app_container = false;
+  spawn.low_privilege_app_container = false;
+  spawn.engine_dll = WideToUtf8(engine);
+  spawn.snapshot_path = WideToUtf8(EnvW(L"V8HOST_SNAPSHOT"));
+}
+
 static sbox_status SBOX_CALL Configure(sbox_config cfg,
                                        const sbox_config_api* api,
                                        const void* configure_data,
@@ -810,26 +844,28 @@ static sbox_status SBOX_CALL Configure(sbox_config cfg,
   if ((configure_data_size && !configure_data) ||
       configure_data_size > 64 * 1024)
     return sbox_error_args;
-  const bool trusted = EnvW(L"SBOX_TIER") == L"trusted";
-  std::wstring engine = EnvW(L"V8HOST_ENGINE_DLL");
-  if (engine.empty())
-    engine = trusted ? L"v8jsi.dll" : L"v8jsisb.dll";
 
-  // Sandbox policy: ACG forces jitless (no executable codegen) for Untrusted;
-  // Trusted leaves ACG off so V8's JIT can run. Delayed integrity UNTRUSTED.
-  api->set_acg(cfg, trusted ? 0 : 1);
-  api->set_integrity(cfg, sbox_integrity_low, sbox_integrity_untrusted);
-  if (api->allow_engine_dll(cfg, engine.c_str()) != sbox_ok)
+  v8host::V8HostSpawnConfigV1 spawn;
+  if (configure_data && configure_data_size) {
+    // Coordinator path: a malformed spawn config fails closed (no half-described
+    // sandbox is ever spawned).
+    if (!v8host::V8HostSpawnConfigV1::Decode(
+            static_cast<const uint8_t*>(configure_data), configure_data_size,
+            &spawn)) {
+      printf("[v8host] configure: bad V8HostSpawnConfigV1\n");
+      return sbox_error;
+    }
+  } else {
+    BuildDevSpawnConfig(spawn);
+  }
+
+  // Drive every applicable config setter from the spawn config, enforce the
+  // effective-tier/ACG consistency rule, and encode the worker profile into the
+  // opaque plugin_data. Any rejected setter or inconsistency fails closed.
+  if (!v8host::ApplySpawnConfig(spawn, api, cfg)) {
+    printf("[v8host] configure: ApplySpawnConfig failed (fail closed)\n");
     return sbox_error;
-
-  // Opaque run profile carried broker->worker (sbox never interprets it).
-  RunProfile prof = {};
-  prof.magic = kRunProfileMagic;
-  prof.version = kRunProfileVersion;
-  prof.jitless = trusted ? 0u : 1u;
-  CopyBounded(prof.engine_dll, engine);
-  CopyBounded(prof.snapshot_path, EnvW(L"V8HOST_SNAPSHOT"));
-  api->set_plugin_data(cfg, &prof, sizeof(prof));
+  }
   return sbox_ok;
 }
 

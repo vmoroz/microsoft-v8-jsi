@@ -20,9 +20,24 @@ group("v8host_broker_tests") {
   deps = [ "//v8host:v8host_broker_tests" ]
 }
 
+group("v8host_config_tests") {
+  testonly = true
+  deps = [ "//v8host:v8host_config_tests" ]
+}
+
 group("v8host_protocol_tests") {
   testonly = true
   deps = [ "//v8host:v8host_protocol_tests" ]
+}
+
+group("v8host_dispatcher_tests") {
+  testonly = true
+  deps = [ "//v8host:v8host_dispatcher_tests" ]
+}
+
+group("v8host_spawn_config_tests") {
+  testonly = true
+  deps = [ "//v8host:v8host_spawn_config_tests" ]
 }
 
 group("v8host_protocol_fuzz") {

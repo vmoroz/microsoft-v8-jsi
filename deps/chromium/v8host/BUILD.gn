@@ -71,6 +71,50 @@ static_library("protocol") {
   public_configs = [ ":protocol_config" ]
 }
 
+# The neutral spawn/worker-profile codec: the two bounded little-endian encodings
+# (V8HostSpawnConfigV1 = the configure_data; V8HostWorkerProfileV1 = the
+# broker->worker plugin_data) shared only between the coordinator (producer,
+# Stage 4) and the engine/configure code (consumer). It reuses the Contract B
+# Writer/Reader (:protocol) and references no client/coordinator/engine symbol,
+# so the layering stays clean. Dependency-light: only common/ is on the include
+# path (for v8host_spawn_config.h).
+config("spawn_config_config") {
+  include_dirs = [ "common" ]
+}
+
+static_library("spawn_config") {
+  sources = [
+    "common/v8host_spawn_config.cc",
+    "common/v8host_spawn_config.h",
+  ]
+  public_deps = [ ":protocol" ]
+  public_configs = [ ":spawn_config_config" ]
+}
+
+# The app-thread callback dispatcher (Stage 3): pure client-side threading that
+# marshals session/run/relay/disconnect callbacks onto the captured app thread
+# through a message-only window + bounded per-session queues. Deliberately
+# dependency-light — it needs only the public Contract C client header and
+# user32 (message window), NOT the sandbox core, protocol lib, or coordinator —
+# so the dispatcher can be built and unit-tested in isolation (slice (c) before
+# the client persona wires real events into it). client/ is on the include path
+# for the dispatcher header; //../../src/public resolves the public header.
+config("dispatcher_config") {
+  include_dirs = [
+    "client",
+    "//../../src/public",
+  ]
+}
+
+source_set("dispatcher") {
+  sources = [
+    "client/v8host_dispatcher.cc",
+    "client/v8host_dispatcher.h",
+  ]
+  public_configs = [ ":dispatcher_config" ]
+  libs = [ "user32.lib" ]
+}
+
 source_set("client_persona") {
   sources = [
     "client/v8host_broker_rendezvous.cc",
@@ -102,13 +146,24 @@ source_set("coordinator_persona") {
     ":payload_identity",
     ":peer_auth",
     ":protocol",
+
+    # The coordinator is the Stage 4 producer of V8HostSpawnConfigV1 (it encodes
+    # the session envelope + effective worker profile and hands it to configure).
+    ":spawn_config",
   ]
   public_configs = [ ":v8host_common_config" ]
   libs = [ "advapi32.lib" ]
 }
 
 source_set("engine_persona") {
-  sources = [ "v8host_engine.cc" ]
+  sources = [
+    "v8host_engine.cc",
+
+    # The spawn-config -> sbox setter lowering, shared with the unit test so the
+    # real configure() lowering is exercised in-process (not only by the smoke).
+    "v8host_spawn_apply.cc",
+    "v8host_spawn_apply.h",
+  ]
 
   # //sandbox_dll for sbox.h (the plugin ABI) + sbox_harden.h (header-only
   # ExeDir); //../../src for the JSI C++ API headers (jsi/jsi.h,
@@ -128,6 +183,7 @@ source_set("engine_persona") {
   deps = [
     "//jsi_cpp",
     ":coordinator_persona",
+    ":spawn_config",
   ]
   defines = [ "SBOX_PLUGIN_IMPL" ]
 
@@ -197,6 +253,71 @@ executable("v8host_protocol_fuzz") {
   testonly = true
   sources = [ "tests/v8host_protocol_fuzz.cc" ]
   deps = [ ":protocol" ]
+}
+
+# Deterministic, in-process unit tests for the app-thread callback dispatcher
+# (:dispatcher). The test IS the app thread: it initializes the dispatcher on
+# its main thread, drives posts from worker std::threads, pumps the message loop
+# with a bounded deadline, and asserts app-thread delivery, ordering, table
+# snapshots, backpressure, reentrancy, close suppression, and one-terminal-per-
+# run. No pipes or spawned processes (no data_deps); the dispatcher public
+# config supplies the client/ and public-header include paths, and
+# v8host_test_support.h resolves same-dir. user32 is needed for the message
+# pump in the test TU itself.
+executable("v8host_dispatcher_tests") {
+  testonly = true
+  sources = [
+    "tests/v8host_dispatcher_tests.cc",
+    "tests/v8host_test_support.cc",
+    "tests/v8host_test_support.h",
+  ]
+  deps = [ ":dispatcher" ]
+  libs = [ "user32.lib" ]
+}
+
+# Deterministic, in-process unit tests for the sbox_config builder: the
+# status-returning sbox_config_api setters + the MarshalSboxConfig discard gate
+# (//sandbox_dll:sbox_config). No pipes or spawned processes — it drives the real
+# setter vtable and the marshal gate directly, so every setter success/failure,
+# the 64/64 + 4 KiB limits, the AppContainer cross-field rules, and the key safety
+# property "a poisoned builder spawns no worker" are all checked without a worker.
+executable("v8host_config_tests") {
+  testonly = true
+  sources = [
+    "tests/v8host_config_tests.cc",
+    "tests/v8host_test_support.cc",
+    "tests/v8host_test_support.h",
+  ]
+  deps = [ "//sandbox_dll:sbox_config" ]
+  public_configs = [ ":v8host_common_config" ]
+  defines = [ "SBOX_STATIC" ]
+}
+
+# Deterministic, in-process conformance tests for the neutral spawn/worker-profile
+# codec (:spawn_config) and the engine's real spawn-config -> sbox setter lowering
+# (v8host_spawn_apply.cc, compiled in). No pipes or spawned processes: the codec
+# round-trips/rejects are pure byte vectors, and the lowering is driven onto the
+# real MakeConfigApi builder + MarshalSboxConfig gate (//sandbox_dll:sbox_config)
+# so the configure() path is exercised without a worker. Mirrors
+# v8host_protocol_tests (byte vectors) + v8host_config_tests (real builder).
+executable("v8host_spawn_config_tests") {
+  testonly = true
+  sources = [
+    "tests/v8host_spawn_config_tests.cc",
+    "tests/v8host_test_support.cc",
+    "tests/v8host_test_support.h",
+    "v8host_spawn_apply.cc",
+    "v8host_spawn_apply.h",
+  ]
+  deps = [
+    ":spawn_config",
+    "//sandbox_dll:sbox_config",
+  ]
+
+  # v8host_spawn_apply.h lives in the v8host root (next to v8host_engine.cc); put
+  # it on the include path so the test .cc (in tests/) can reach the lowering.
+  include_dirs = [ "." ]
+  defines = [ "SBOX_STATIC" ]
 }
 
 # Deliberately invalid plugin used by the host-rejects-bad-plugin-abi case.
