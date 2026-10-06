@@ -357,10 +357,56 @@ std::vector<uint8_t> VectorErrorFrame() {
   return BuildErrorFrame(h, p);
 }
 
+// V9: a CREATE_SESSION frame (client -> broker) with AppContainer + LPAC armed,
+// a non-empty profile, two file rules (one read-only), and two capabilities.
+std::vector<uint8_t> VectorCreateSessionFrame() {
+  FrameHeader h;
+  h.version_major = 1;
+  h.version_minor = 0;
+  h.conn_id = 9;
+  h.request_id = 0x30;
+  CreateSessionPayload p;
+  p.broker_mode = 1;
+  p.tier = 2;
+  p.integrity = 3;
+  p.delayed_integrity = 4;
+  p.initial_token = 5;
+  p.lockdown_token = 6;
+  p.prohibit_dynamic_code = true;
+  p.use_app_container = true;
+  p.low_privilege_app_container = true;
+  p.app_container_profile = "profile";
+  p.file_rules = {FileRule{true, "r1"}, FileRule{false, "r2"}};
+  p.capabilities = {"cap1", "cap2"};
+  return BuildCreateSessionFrame(h, p);
+}
+
+// V10: a START_RUN frame (client -> broker) with an engine override, a snapshot
+// path, and a short opaque guest payload.
+std::vector<uint8_t> VectorStartRunFrame() {
+  FrameHeader h;
+  h.version_major = 1;
+  h.version_minor = 0;
+  h.conn_id = 9;
+  h.session_id = 2;
+  h.run_id = 3;
+  h.request_id = 0x31;
+  StartRunPayload p;
+  p.tier_override = 1;
+  p.has_engine_override = true;
+  p.has_snapshot = true;
+  p.engine_filename = "engine.dll";
+  p.snapshot_path = "snap.bin";
+  p.guest_payload = {0xDE, 0xAD, 0xBE, 0xEF};
+  return BuildStartRunFrame(h, p);
+}
+
 std::vector<std::vector<uint8_t>> CanonicalVectors() {
-  return {VectorAllDistinctHeader(), VectorHelloHeader(), VectorWriterPayload(),
-          VectorFullFrame(),         VectorHelloFrame(),  VectorHelloAckFrame(),
-          VectorAckFrame(),          VectorErrorFrame()};
+  return {VectorAllDistinctHeader(),  VectorHelloHeader(),
+          VectorWriterPayload(),      VectorFullFrame(),
+          VectorHelloFrame(),         VectorHelloAckFrame(),
+          VectorAckFrame(),           VectorErrorFrame(),
+          VectorCreateSessionFrame(), VectorStartRunFrame()};
 }
 
 std::vector<uint8_t> CanonicalConcat() {
@@ -412,6 +458,31 @@ const uint8_t kExpectErrorFrame[49] = {
     0x2B, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
     0x05, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x71, 0x75, 0x6F, 0x74,
     0x61};
+
+// Slice (d) message frames. Exact bytes computed independently; any arch must
+// produce precisely these for the CREATE_SESSION / START_RUN payloads.
+const uint8_t kExpectCreateSessionFrame[131] = {
+    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x30, 0x00, 0x00, 0x00, 0x63, 0x00, 0x00, 0x00, 0x01, 0x00, 0x34, 0x00,
+    0x63, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+    0x06, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x07, 0x00, 0x00, 0x00, 0x70, 0x72, 0x6F, 0x66, 0x69, 0x6C, 0x65, 0x01,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x72, 0x31, 0x00, 0x00, 0x00,
+    0x00, 0x02, 0x00, 0x00, 0x00, 0x72, 0x32, 0x04, 0x00, 0x00, 0x00, 0x63,
+    0x61, 0x70, 0x31, 0x04, 0x00, 0x00, 0x00, 0x63, 0x61, 0x70, 0x32};
+
+const uint8_t kExpectStartRunFrame[86] = {
+    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+    0x09, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x31, 0x00, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x01, 0x00, 0x18, 0x00,
+    0x36, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00,
+    0x65, 0x6E, 0x67, 0x69, 0x6E, 0x65, 0x2E, 0x64, 0x6C, 0x6C, 0x08, 0x00,
+    0x00, 0x00, 0x73, 0x6E, 0x61, 0x70, 0x2E, 0x62, 0x69, 0x6E, 0xDE, 0xAD,
+    0xBE, 0xEF};
 
 // ---------------------------------------------------------------------------
 // vectors suite.
@@ -473,6 +544,17 @@ bool CanonicalAckFrame(std::string* detail) {
 bool CanonicalErrorFrame(std::string* detail) {
   return CheckBytes("error-frame", VectorErrorFrame(), kExpectErrorFrame,
                     sizeof(kExpectErrorFrame), detail);
+}
+
+bool CanonicalCreateSessionFrame(std::string* detail) {
+  return CheckBytes("create-session-frame", VectorCreateSessionFrame(),
+                    kExpectCreateSessionFrame,
+                    sizeof(kExpectCreateSessionFrame), detail);
+}
+
+bool CanonicalStartRunFrame(std::string* detail) {
+  return CheckBytes("start-run-frame", VectorStartRunFrame(),
+                    kExpectStartRunFrame, sizeof(kExpectStartRunFrame), detail);
 }
 
 // ---------------------------------------------------------------------------
@@ -1131,6 +1213,695 @@ bool MessagesCorrelation(std::string* detail) {
 }
 
 // ---------------------------------------------------------------------------
+// session suite: CREATE_SESSION codec (§8.5) + per-message structural quotas.
+// ---------------------------------------------------------------------------
+
+// Overwrites a little-endian u16/u32 already present in an encoded payload, used
+// to inject malformed field values the struct encoder cannot express.
+void PatchU16(std::vector<uint8_t>& b, size_t off, uint16_t v) {
+  b[off] = static_cast<uint8_t>(v & 0xFF);
+  b[off + 1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+}
+
+void PatchU32(std::vector<uint8_t>& b, size_t off, uint32_t v) {
+  b[off] = static_cast<uint8_t>(v & 0xFF);
+  b[off + 1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+  b[off + 2] = static_cast<uint8_t>((v >> 16) & 0xFF);
+  b[off + 3] = static_cast<uint8_t>((v >> 24) & 0xFF);
+}
+
+std::vector<uint8_t> EncodeSession(const CreateSessionPayload& p) {
+  Writer w;
+  EncodeCreateSessionPayload(p, w);
+  return w.buffer();
+}
+
+bool DecodeSessionOk(const std::vector<uint8_t>& b, CreateSessionPayload* out) {
+  return DecodeCreateSessionPayload(b.data(), b.size(), out);
+}
+
+bool DecodeSessionRejects(const std::vector<uint8_t>& b) {
+  CreateSessionPayload out;
+  return !DecodeCreateSessionPayload(b.data(), b.size(), &out);
+}
+
+bool SessionEq(const CreateSessionPayload& a,
+               const CreateSessionPayload& b,
+               std::string* detail) {
+  if (a.broker_mode != b.broker_mode || a.tier != b.tier ||
+      a.integrity != b.integrity || a.delayed_integrity != b.delayed_integrity ||
+      a.initial_token != b.initial_token ||
+      a.lockdown_token != b.lockdown_token ||
+      a.prohibit_dynamic_code != b.prohibit_dynamic_code ||
+      a.use_app_container != b.use_app_container ||
+      a.low_privilege_app_container != b.low_privilege_app_container ||
+      a.app_container_profile != b.app_container_profile)
+    return Fail(detail, "session scalar/profile mismatch");
+  if (a.file_rules.size() != b.file_rules.size())
+    return Fail(detail, "file-rule count mismatch");
+  for (size_t i = 0; i < a.file_rules.size(); ++i) {
+    if (a.file_rules[i].readonly != b.file_rules[i].readonly ||
+        a.file_rules[i].pattern != b.file_rules[i].pattern)
+      return Fail(detail, "file-rule mismatch");
+  }
+  if (a.capabilities != b.capabilities)
+    return Fail(detail, "capabilities mismatch");
+  return true;
+}
+
+// A fully-populated, cross-field-valid session (AppContainer + LPAC armed).
+CreateSessionPayload ValidSession() {
+  CreateSessionPayload p;
+  p.broker_mode = 1;
+  p.tier = 2;
+  p.integrity = 3;
+  p.delayed_integrity = 4;
+  p.initial_token = 5;
+  p.lockdown_token = 6;
+  p.prohibit_dynamic_code = true;
+  p.use_app_container = true;
+  p.low_privilege_app_container = true;
+  p.app_container_profile = "profile";
+  p.file_rules = {FileRule{true, "ro"}, FileRule{false, "rw"}};
+  p.capabilities = {"capA", "capB"};
+  return p;
+}
+
+bool SessionRoundTrip(std::string* detail) {
+  // Empty: AppContainer off, empty profile, no rules/caps; extreme i32 values
+  // (incl. negative) prove the signed fields transport verbatim.
+  {
+    CreateSessionPayload in;
+    in.broker_mode = -5;
+    in.tier = 0x7FFFFFFF;
+    in.lockdown_token = static_cast<int32_t>(0x80000000);  // INT32_MIN
+    in.use_app_container = false;
+    CreateSessionPayload out;
+    if (!DecodeSessionOk(EncodeSession(in), &out))
+      return Fail(detail, "empty session decode failed");
+    if (!SessionEq(in, out, detail))
+      return false;
+    if (!out.file_rules.empty() || !out.capabilities.empty())
+      return Fail(detail, "empty session had rules/caps");
+  }
+  // Boundary: exactly 64 file rules + 64 capabilities with AppContainer armed.
+  {
+    CreateSessionPayload in = ValidSession();
+    in.file_rules.clear();
+    in.capabilities.clear();
+    for (uint32_t i = 0; i < kMaxFileRules; ++i)
+      in.file_rules.push_back(FileRule{(i & 1) == 0, "rule" + std::to_string(i)});
+    for (uint32_t i = 0; i < kMaxCapabilities; ++i)
+      in.capabilities.push_back("cap" + std::to_string(i));
+    CreateSessionPayload out;
+    if (!DecodeSessionOk(EncodeSession(in), &out))
+      return Fail(detail, "boundary session decode failed");
+    if (!SessionEq(in, out, detail))
+      return false;
+    if (out.file_rules.size() != kMaxFileRules ||
+        out.capabilities.size() != kMaxCapabilities)
+      return Fail(detail, "boundary counts wrong");
+  }
+  // Frame round-trip exercises BuildCreateSessionFrame + the frame validator.
+  {
+    FrameHeader h;
+    h.version_major = 1;
+    h.conn_id = 9;
+    h.request_id = 0x30;
+    const std::vector<uint8_t> frame =
+        BuildCreateSessionFrame(h, ValidSession());
+    FrameHeader out_h;
+    const uint8_t* payload = nullptr;
+    size_t payload_size = 0;
+    if (DecodeAndValidateFrame(frame.data(), frame.size(), &out_h, &payload,
+                               &payload_size) != DecodeStatus::kOk)
+      return Fail(detail, "session frame failed validation");
+    if (out_h.type != MessageType::CREATE_SESSION)
+      return Fail(detail, "session frame wrong type");
+    CreateSessionPayload out;
+    if (!DecodeCreateSessionPayload(payload, payload_size, &out))
+      return Fail(detail, "session frame payload decode failed");
+    if (!SessionEq(ValidSession(), out, detail))
+      return false;
+  }
+  return true;
+}
+
+bool SessionRejectCounts(std::string* detail) {
+  // 65 file rules → reject (AppContainer off, so the count is the only fault).
+  {
+    CreateSessionPayload in;
+    in.use_app_container = false;
+    for (uint32_t i = 0; i <= kMaxFileRules; ++i)
+      in.file_rules.push_back(FileRule{false, "r"});
+    if (!DecodeSessionRejects(EncodeSession(in)))
+      return Fail(detail, "65 file rules accepted");
+  }
+  // 65 capabilities → reject (AppContainer on + profile, so only the count).
+  {
+    CreateSessionPayload in;
+    in.use_app_container = true;
+    in.app_container_profile = "p";
+    for (uint32_t i = 0; i <= kMaxCapabilities; ++i)
+      in.capabilities.push_back("c");
+    if (!DecodeSessionRejects(EncodeSession(in)))
+      return Fail(detail, "65 capabilities accepted");
+  }
+  return true;
+}
+
+// A count that lies BEYOND a valid-total_size body: the element reads run off
+// the real body and must fail-closed (no over-read, no fabricated elements) —
+// distinct from reject-counts, which uses a consistent oversized body.
+bool SessionRejectLyingCount(std::string* detail) {
+  {
+    std::vector<uint8_t> b = EncodeSession(ValidSession());  // 2 rules, 2 caps
+    PatchU32(b, 44, 4);  // file_rule_count 2 -> 4, total_size left valid
+    if (!DecodeSessionRejects(b))
+      return Fail(detail, "lying file_rule_count accepted");
+  }
+  {
+    std::vector<uint8_t> b = EncodeSession(ValidSession());
+    PatchU32(b, 48, 8);  // capability_count 2 -> 8, total_size left valid
+    if (!DecodeSessionRejects(b))
+      return Fail(detail, "lying capability_count accepted");
+  }
+  return true;
+}
+
+bool SessionRejectBadBool(std::string* detail) {
+  // The three fixed booleans live at payload offsets 32/36/40.
+  struct Case {
+    const char* name;
+    size_t off;
+  };
+  const Case fixed_bools[] = {{"prohibit_dynamic_code", 32},
+                              {"use_app_container", 36},
+                              {"low_privilege_app_container", 40}};
+  for (const Case& c : fixed_bools) {
+    std::vector<uint8_t> bytes = EncodeSession(ValidSession());
+    PatchU32(bytes, c.off, 2);  // neither 0 nor 1
+    if (!DecodeSessionRejects(bytes))
+      return Fail(detail, std::string("bad bool accepted: ") + c.name);
+  }
+  // A file_rule.readonly of 2 is equally malformed. With AppContainer off and an
+  // empty profile, the readonly u32 sits at a known offset:
+  //   52 fixed + profile string(4 bytes, empty) => readonly at offset 56.
+  {
+    CreateSessionPayload in;
+    in.use_app_container = false;
+    in.file_rules = {FileRule{false, "r"}};
+    std::vector<uint8_t> bytes = EncodeSession(in);
+    PatchU32(bytes, 56, 2);
+    if (!DecodeSessionRejects(bytes))
+      return Fail(detail, "bad file_rule.readonly accepted");
+  }
+  return true;
+}
+
+bool SessionRejectStringLimit(std::string* detail) {
+  // A profile of exactly 32 KiB decodes.
+  {
+    CreateSessionPayload in;
+    in.use_app_container = false;
+    in.app_container_profile = std::string(kMaxStringBytes, 'a');
+    CreateSessionPayload out;
+    if (!DecodeSessionOk(EncodeSession(in), &out))
+      return Fail(detail, "32 KiB profile rejected");
+    if (out.app_container_profile.size() != kMaxStringBytes)
+      return Fail(detail, "32 KiB profile truncated");
+  }
+  // 32 KiB + 1 is rejected by GetString.
+  {
+    CreateSessionPayload in;
+    in.use_app_container = false;
+    in.app_container_profile = std::string(kMaxStringBytes + 1, 'a');
+    if (!DecodeSessionRejects(EncodeSession(in)))
+      return Fail(detail, "oversize profile accepted");
+  }
+  return true;
+}
+
+bool SessionRejectBadUtf8(std::string* detail) {
+  // Invalid UTF-8 in the profile (lone continuation byte).
+  {
+    CreateSessionPayload in;
+    in.use_app_container = false;
+    in.app_container_profile = std::string(1, static_cast<char>(0x80));
+    if (!DecodeSessionRejects(EncodeSession(in)))
+      return Fail(detail, "invalid-UTF-8 profile accepted");
+  }
+  // Invalid UTF-8 in a file-rule pattern (overlong C0 80).
+  {
+    CreateSessionPayload in;
+    in.use_app_container = false;
+    in.file_rules = {FileRule{
+        false, std::string({static_cast<char>(0xC0), static_cast<char>(0x80)})}};
+    if (!DecodeSessionRejects(EncodeSession(in)))
+      return Fail(detail, "invalid-UTF-8 pattern accepted");
+  }
+  // Embedded NUL in a capability (AppContainer on so the cap is otherwise legal).
+  {
+    CreateSessionPayload in;
+    in.use_app_container = true;
+    in.app_container_profile = "p";
+    in.capabilities = {std::string({'a', '\0', 'b'})};
+    if (!DecodeSessionRejects(EncodeSession(in)))
+      return Fail(detail, "embedded-NUL capability accepted");
+  }
+  return true;
+}
+
+bool SessionRejectTotalSize(std::string* detail) {
+  const std::vector<uint8_t> valid = EncodeSession(ValidSession());
+  {
+    std::vector<uint8_t> b = valid;
+    PatchU32(b, 4, static_cast<uint32_t>(valid.size()) + 1);  // too big
+    if (!DecodeSessionRejects(b))
+      return Fail(detail, "total_size too big accepted");
+  }
+  {
+    std::vector<uint8_t> b = valid;
+    PatchU32(b, 4, static_cast<uint32_t>(valid.size()) - 1);  // too small
+    if (!DecodeSessionRejects(b))
+      return Fail(detail, "total_size too small accepted");
+  }
+  return true;
+}
+
+bool SessionRejectFixedSize(std::string* detail) {
+  const std::vector<uint8_t> valid = EncodeSession(ValidSession());
+  // fixed_size below the v1 known section.
+  {
+    std::vector<uint8_t> b = valid;
+    PatchU16(b, 2, kCreateSessionFixedSize - 1);  // 51
+    if (!DecodeSessionRejects(b))
+      return Fail(detail, "fixed_size < 52 accepted");
+  }
+  // fixed_size beyond total_size.
+  {
+    std::vector<uint8_t> b = valid;
+    PatchU16(b, 2, static_cast<uint16_t>(valid.size() + 1));
+    if (!DecodeSessionRejects(b))
+      return Fail(detail, "fixed_size > total_size accepted");
+  }
+  return true;
+}
+
+bool SessionForwardCompat(std::string* detail) {
+  // A future minor version appends `extra` fixed bytes after the 52-byte v1
+  // section; a v1 reader skips them (variable section starts at fixed_size).
+  const CreateSessionPayload in = ValidSession();
+  std::vector<uint8_t> b = EncodeSession(in);
+  const uint16_t extra = 4;
+  b.insert(b.begin() + kCreateSessionFixedSize, extra, 0x7E);
+  PatchU16(b, 2, kCreateSessionFixedSize + extra);  // fixed_size = 56
+  PatchU32(b, 4, static_cast<uint32_t>(b.size()));   // new total_size
+  CreateSessionPayload out;
+  if (!DecodeSessionOk(b, &out))
+    return Fail(detail, "forward-compat payload rejected");
+  if (!SessionEq(in, out, detail))
+    return false;
+  return true;
+}
+
+bool SessionRejectTrailingShort(std::string* detail) {
+  const std::vector<uint8_t> valid = EncodeSession(ValidSession());
+  // Trailing byte beyond total_size: size grows, stale total_size → mismatch.
+  {
+    std::vector<uint8_t> b = valid;
+    b.push_back(0x00);
+    if (!DecodeSessionRejects(b))
+      return Fail(detail, "trailing byte accepted");
+  }
+  // Short buffer: size shrinks, stale total_size → mismatch.
+  {
+    std::vector<uint8_t> b = valid;
+    b.pop_back();
+    if (!DecodeSessionRejects(b))
+      return Fail(detail, "short buffer accepted");
+  }
+  // Declared-but-unconsumed: total_size counts an extra byte the structure never
+  // reads, so AtEnd() must still reject (exact consumption).
+  {
+    std::vector<uint8_t> b = valid;
+    b.push_back(0x00);
+    PatchU32(b, 4, static_cast<uint32_t>(b.size()));
+    if (!DecodeSessionRejects(b))
+      return Fail(detail, "unconsumed trailing byte accepted");
+  }
+  return true;
+}
+
+bool SessionRejectCrossField(std::string* detail) {
+  // Empty profile with AppContainer enabled → reject.
+  {
+    CreateSessionPayload in;
+    in.use_app_container = true;
+    in.app_container_profile = "";
+    if (!DecodeSessionRejects(EncodeSession(in)))
+      return Fail(detail, "empty profile + AppContainer accepted");
+  }
+  // A capability with AppContainer disabled → reject.
+  {
+    CreateSessionPayload in;
+    in.use_app_container = false;
+    in.capabilities = {"cap"};
+    if (!DecodeSessionRejects(EncodeSession(in)))
+      return Fail(detail, "capability without AppContainer accepted");
+  }
+  // LPAC without AppContainer → reject.
+  {
+    CreateSessionPayload in;
+    in.use_app_container = false;
+    in.low_privilege_app_container = true;
+    if (!DecodeSessionRejects(EncodeSession(in)))
+      return Fail(detail, "LPAC without AppContainer accepted");
+  }
+  return true;
+}
+
+bool SessionNearMaxFrame(std::string* detail) {
+  // Two file-rule patterns bring the payload to exactly kMaxFramePayload:
+  //   52 fixed + profile(4, empty) + 2*(4 readonly + 4 len + pat) == 65528
+  //   => pat == 32728 (below the 32 KiB per-string cap).
+  const size_t pat = (kMaxFramePayload - (kCreateSessionFixedSize + 4)) / 2 - 8;
+  {
+    CreateSessionPayload in;
+    in.use_app_container = false;
+    in.file_rules = {FileRule{false, std::string(pat, 'a')},
+                     FileRule{true, std::string(pat, 'b')}};
+    const std::vector<uint8_t> bytes = EncodeSession(in);
+    if (bytes.size() != kMaxFramePayload)
+      return Fail(detail, "near-max payload not at the ceiling");
+    CreateSessionPayload out;
+    if (!DecodeSessionOk(bytes, &out))
+      return Fail(detail, "max-size payload rejected");
+    if (out.file_rules.size() != 2 ||
+        out.file_rules[0].pattern.size() != pat ||
+        out.file_rules[1].pattern.size() != pat)
+      return Fail(detail, "max-size patterns wrong");
+  }
+  // One byte over the ceiling → reject (total_size > kMaxFramePayload).
+  {
+    CreateSessionPayload in;
+    in.use_app_container = false;
+    in.file_rules = {FileRule{false, std::string(pat, 'a')},
+                     FileRule{true, std::string(pat + 1, 'b')}};
+    const std::vector<uint8_t> bytes = EncodeSession(in);
+    if (bytes.size() != kMaxFramePayload + 1)
+      return Fail(detail, "over-ceiling payload not 65529");
+    if (!DecodeSessionRejects(bytes))
+      return Fail(detail, "over-ceiling payload accepted");
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// run suite: START_RUN codec (§8.6) + field-format rules.
+// ---------------------------------------------------------------------------
+std::vector<uint8_t> EncodeRun(const StartRunPayload& p) {
+  Writer w;
+  EncodeStartRunPayload(p, w);
+  return w.buffer();
+}
+
+bool DecodeRunOk(const std::vector<uint8_t>& b, StartRunPayload* out) {
+  return DecodeStartRunPayload(b.data(), b.size(), out);
+}
+
+bool DecodeRunRejects(const std::vector<uint8_t>& b) {
+  StartRunPayload out;
+  return !DecodeStartRunPayload(b.data(), b.size(), &out);
+}
+
+bool RunEq(const StartRunPayload& a,
+           const StartRunPayload& b,
+           std::string* detail) {
+  if (a.tier_override != b.tier_override ||
+      a.has_engine_override != b.has_engine_override ||
+      a.has_snapshot != b.has_snapshot ||
+      a.engine_filename != b.engine_filename ||
+      a.snapshot_path != b.snapshot_path || a.guest_payload != b.guest_payload)
+    return Fail(detail, "start-run field mismatch");
+  return true;
+}
+
+bool RunRoundTrip(std::string* detail) {
+  // Full: a bare engine override, a snapshot path (separators allowed for the
+  // snapshot, unlike the engine filename), an opaque guest payload, negative
+  // tier override.
+  {
+    StartRunPayload in;
+    in.tier_override = -1;
+    in.has_engine_override = true;
+    in.engine_filename = "v8jsi.dll";
+    in.has_snapshot = true;
+    in.snapshot_path = "cache/app.snapshot";
+    in.guest_payload = {0x00, 0x01, 0x02, 0xFE, 0xFF};
+    StartRunPayload out;
+    if (!DecodeRunOk(EncodeRun(in), &out))
+      return Fail(detail, "full run decode failed");
+    if (!RunEq(in, out, detail))
+      return false;
+  }
+  // Minimal: no override, no snapshot, empty guest payload.
+  {
+    StartRunPayload in;
+    in.tier_override = 7;
+    StartRunPayload out;
+    if (!DecodeRunOk(EncodeRun(in), &out))
+      return Fail(detail, "minimal run decode failed");
+    if (!RunEq(in, out, detail))
+      return false;
+    if (!out.engine_filename.empty() || !out.snapshot_path.empty() ||
+        !out.guest_payload.empty())
+      return Fail(detail, "minimal run not empty");
+  }
+  // Frame round-trip exercises BuildStartRunFrame + the frame validator.
+  {
+    FrameHeader h;
+    h.version_major = 1;
+    h.conn_id = 9;
+    h.session_id = 2;
+    h.run_id = 3;
+    h.request_id = 0x31;
+    StartRunPayload in;
+    in.has_engine_override = true;
+    in.engine_filename = "engine.dll";
+    in.guest_payload = {0xAA, 0xBB};
+    const std::vector<uint8_t> frame = BuildStartRunFrame(h, in);
+    FrameHeader out_h;
+    const uint8_t* payload = nullptr;
+    size_t payload_size = 0;
+    if (DecodeAndValidateFrame(frame.data(), frame.size(), &out_h, &payload,
+                               &payload_size) != DecodeStatus::kOk)
+      return Fail(detail, "run frame failed validation");
+    if (out_h.type != MessageType::START_RUN)
+      return Fail(detail, "run frame wrong type");
+    StartRunPayload out;
+    if (!DecodeStartRunPayload(payload, payload_size, &out))
+      return Fail(detail, "run frame payload decode failed");
+    if (!RunEq(in, out, detail))
+      return false;
+  }
+  return true;
+}
+
+bool RunRejectEngineFilename(std::string* detail) {
+  // has_engine_override == 1 but the filename is not a bare payload-dir name.
+  const char* bad[] = {"sub\\engine.dll", "sub/engine.dll", "c:engine.dll",
+                       "..", ".", ""};
+  for (const char* name : bad) {
+    StartRunPayload in;
+    in.has_engine_override = true;
+    in.engine_filename = name;
+    if (!DecodeRunRejects(EncodeRun(in)))
+      return Fail(detail, std::string("non-bare engine filename accepted: '") +
+                              name + "'");
+  }
+  // A plain bare filename still decodes.
+  {
+    StartRunPayload in;
+    in.has_engine_override = true;
+    in.engine_filename = "engine.dll";
+    StartRunPayload out;
+    if (!DecodeRunOk(EncodeRun(in), &out))
+      return Fail(detail, "bare engine filename rejected");
+  }
+  return true;
+}
+
+bool RunRejectEngineRequiredEmpty(std::string* detail) {
+  // has_engine_override == 0 but a non-empty filename → reject.
+  StartRunPayload in;
+  in.has_engine_override = false;
+  in.engine_filename = "engine.dll";
+  if (!DecodeRunRejects(EncodeRun(in)))
+    return Fail(detail, "no-override + non-empty filename accepted");
+  return true;
+}
+
+bool RunRejectSnapshot(std::string* detail) {
+  // has_snapshot == 0 but a non-empty path → reject.
+  {
+    StartRunPayload in;
+    in.has_snapshot = false;
+    in.snapshot_path = "snap.bin";
+    if (!DecodeRunRejects(EncodeRun(in)))
+      return Fail(detail, "no-snapshot + non-empty path accepted");
+  }
+  // has_snapshot == 1 but an empty path → reject.
+  {
+    StartRunPayload in;
+    in.has_snapshot = true;
+    in.snapshot_path = "";
+    if (!DecodeRunRejects(EncodeRun(in)))
+      return Fail(detail, "snapshot + empty path accepted");
+  }
+  return true;
+}
+
+bool RunRejectStrings(std::string* detail) {
+  // Oversize snapshot path (> 32 KiB) → GetString rejects.
+  {
+    StartRunPayload in;
+    in.has_snapshot = true;
+    in.snapshot_path = std::string(kMaxStringBytes + 1, 'a');
+    if (!DecodeRunRejects(EncodeRun(in)))
+      return Fail(detail, "oversize snapshot path accepted");
+  }
+  // Invalid UTF-8 in the engine filename.
+  {
+    StartRunPayload in;
+    in.has_engine_override = true;
+    in.engine_filename = std::string(1, static_cast<char>(0x80));
+    if (!DecodeRunRejects(EncodeRun(in)))
+      return Fail(detail, "invalid-UTF-8 engine filename accepted");
+  }
+  // Embedded NUL in the snapshot path.
+  {
+    StartRunPayload in;
+    in.has_snapshot = true;
+    in.snapshot_path = std::string({'a', '\0', 'b'});
+    if (!DecodeRunRejects(EncodeRun(in)))
+      return Fail(detail, "embedded-NUL snapshot path accepted");
+  }
+  return true;
+}
+
+bool RunRejectFraming(std::string* detail) {
+  StartRunPayload base;
+  base.has_engine_override = true;
+  base.engine_filename = "engine.dll";
+  base.has_snapshot = true;
+  base.snapshot_path = "snap.bin";
+  base.guest_payload = {0xDE, 0xAD};
+  const std::vector<uint8_t> valid = EncodeRun(base);
+  {
+    std::vector<uint8_t> b = valid;
+    PatchU32(b, 4, static_cast<uint32_t>(valid.size()) + 1);  // total too big
+    if (!DecodeRunRejects(b))
+      return Fail(detail, "total_size too big accepted");
+  }
+  {
+    std::vector<uint8_t> b = valid;
+    PatchU32(b, 4, static_cast<uint32_t>(valid.size()) - 1);  // total too small
+    if (!DecodeRunRejects(b))
+      return Fail(detail, "total_size too small accepted");
+  }
+  {
+    std::vector<uint8_t> b = valid;
+    PatchU16(b, 2, kStartRunFixedSize - 1);  // fixed_size < 24
+    if (!DecodeRunRejects(b))
+      return Fail(detail, "fixed_size < 24 accepted");
+  }
+  {
+    std::vector<uint8_t> b = valid;
+    b.push_back(0x00);  // trailing byte beyond total_size
+    if (!DecodeRunRejects(b))
+      return Fail(detail, "trailing byte accepted");
+  }
+  {
+    std::vector<uint8_t> b = valid;
+    b.pop_back();  // short buffer
+    if (!DecodeRunRejects(b))
+      return Fail(detail, "short buffer accepted");
+  }
+  {
+    std::vector<uint8_t> b = valid;
+    b.push_back(0x00);
+    PatchU32(b, 4, static_cast<uint32_t>(b.size()));  // declared but unconsumed
+    if (!DecodeRunRejects(b))
+      return Fail(detail, "unconsumed trailing byte accepted");
+  }
+  return true;
+}
+
+bool RunForwardCompat(std::string* detail) {
+  StartRunPayload in;
+  in.tier_override = 3;
+  in.has_engine_override = true;
+  in.engine_filename = "engine.dll";
+  in.has_snapshot = true;
+  in.snapshot_path = "snap.bin";
+  in.guest_payload = {0x11, 0x22, 0x33};
+  std::vector<uint8_t> b = EncodeRun(in);
+  const uint16_t extra = 4;
+  b.insert(b.begin() + kStartRunFixedSize, extra, 0x7E);
+  PatchU16(b, 2, kStartRunFixedSize + extra);  // fixed_size = 28
+  PatchU32(b, 4, static_cast<uint32_t>(b.size()));
+  StartRunPayload out;
+  if (!DecodeRunOk(b, &out))
+    return Fail(detail, "run forward-compat payload rejected");
+  if (!RunEq(in, out, detail))
+    return false;
+  return true;
+}
+
+// guest_payload_length lying BEYOND a valid-total_size body: GetBytes must
+// bound the claim against the remaining bytes and fail-closed (no over-read).
+bool RunRejectLyingGuestLen(std::string* detail) {
+  StartRunPayload in;
+  in.tier_override = 1;
+  in.guest_payload = {1, 2, 3, 4, 5};
+  std::vector<uint8_t> b = EncodeRun(in);
+  PatchU32(b, 20, 99);  // guest_payload_length 5 -> 99, total_size left valid
+  if (!DecodeRunRejects(b))
+    return Fail(detail, "lying guest_payload_length accepted");
+  return true;
+}
+
+bool RunGuestCeiling(std::string* detail) {
+  // Guest payload sized so the whole payload is exactly kMaxFramePayload:
+  //   24 fixed + engine(4, empty) + snapshot(4, empty) + guest == 65528.
+  const size_t guest_max = kMaxFramePayload - (kStartRunFixedSize + 4 + 4);
+  {
+    StartRunPayload in;
+    in.guest_payload = std::vector<uint8_t>(guest_max, 0x5A);
+    const std::vector<uint8_t> bytes = EncodeRun(in);
+    if (bytes.size() != kMaxFramePayload)
+      return Fail(detail, "ceiling guest payload not at 65528");
+    StartRunPayload out;
+    if (!DecodeRunOk(bytes, &out))
+      return Fail(detail, "max guest payload rejected");
+    if (out.guest_payload.size() != guest_max)
+      return Fail(detail, "max guest payload truncated");
+  }
+  // One byte over → reject (total_size > kMaxFramePayload).
+  {
+    StartRunPayload in;
+    in.guest_payload = std::vector<uint8_t>(guest_max + 1, 0x5A);
+    const std::vector<uint8_t> bytes = EncodeRun(in);
+    if (bytes.size() != kMaxFramePayload + 1)
+      return Fail(detail, "over-ceiling guest payload not 65529");
+    if (!DecodeRunRejects(bytes))
+      return Fail(detail, "over-ceiling guest payload accepted");
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // negotiate suite: version matrix (E15).
 // ---------------------------------------------------------------------------
 NegotiationResult RunNegotiate(uint16_t client_major,
@@ -1376,6 +2147,8 @@ int main(int argc, char** argv) {
       {"vectors", "canonical-hello-ack-frame", CanonicalHelloAckFrame},
       {"vectors", "canonical-ack-frame", CanonicalAckFrame},
       {"vectors", "canonical-error-frame", CanonicalErrorFrame},
+      {"vectors", "canonical-create-session-frame", CanonicalCreateSessionFrame},
+      {"vectors", "canonical-start-run-frame", CanonicalStartRunFrame},
       {"protocol", "sha256-self-test", Sha256SelfTest},
       {"protocol", "header-round-trip", HeaderRoundTrip},
       {"protocol", "magic-reject", MagicReject},
@@ -1396,6 +2169,27 @@ int main(int argc, char** argv) {
       {"messages", "reject-error-string", MessagesRejectErrorString},
       {"messages", "builders-stamp-type", MessagesBuildersStampType},
       {"messages", "correlation", MessagesCorrelation},
+      {"session", "round-trip", SessionRoundTrip},
+      {"session", "reject-counts", SessionRejectCounts},
+      {"session", "reject-lying-count", SessionRejectLyingCount},
+      {"session", "reject-bad-bool", SessionRejectBadBool},
+      {"session", "reject-string-limit", SessionRejectStringLimit},
+      {"session", "reject-bad-utf8", SessionRejectBadUtf8},
+      {"session", "reject-total-size", SessionRejectTotalSize},
+      {"session", "reject-fixed-size", SessionRejectFixedSize},
+      {"session", "forward-compat", SessionForwardCompat},
+      {"session", "reject-trailing-short", SessionRejectTrailingShort},
+      {"session", "reject-cross-field", SessionRejectCrossField},
+      {"session", "near-max-frame", SessionNearMaxFrame},
+      {"run", "round-trip", RunRoundTrip},
+      {"run", "reject-engine-filename", RunRejectEngineFilename},
+      {"run", "reject-engine-required-empty", RunRejectEngineRequiredEmpty},
+      {"run", "reject-snapshot", RunRejectSnapshot},
+      {"run", "reject-strings", RunRejectStrings},
+      {"run", "reject-framing", RunRejectFraming},
+      {"run", "reject-lying-guest-len", RunRejectLyingGuestLen},
+      {"run", "forward-compat", RunForwardCompat},
+      {"run", "guest-ceiling", RunGuestCeiling},
       {"negotiate", "equal-minor", NegotiateEqualMinor},
       {"negotiate", "newer-broker", NegotiateNewerBroker},
       {"negotiate", "newer-client", NegotiateNewerClient},

@@ -94,6 +94,13 @@ bool Reader::GetString(std::string* out) {
   return true;
 }
 
+bool Reader::Skip(size_t n) {
+  if (size_ - offset_ < n)
+    return false;
+  offset_ += n;
+  return true;
+}
+
 bool ValidateUtf8NoNul(const uint8_t* data, size_t size) {
   size_t i = 0;
   while (i < size) {

@@ -187,6 +187,10 @@ class Reader {
   // kMaxStringBytes and <= remaining, strict UTF-8, and no embedded NUL. On any
   // failure the offset is unchanged.
   bool GetString(std::string* out);
+  // Advances the offset by `n` bytes without reading them, used to skip the
+  // bounded forward-compat fields a future minor version may append to a fixed
+  // section. Returns false (offset unchanged) if n > BytesRemaining().
+  bool Skip(size_t n);
 
   size_t offset() const { return offset_; }
   size_t size() const { return size_; }

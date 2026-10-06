@@ -154,6 +154,54 @@ bool ReadSchemaPrologue(Reader& reader, uint16_t* schema, uint16_t* reserved) {
   return true;
 }
 
+// Decodes a wire boolean: exactly 0 or 1, anything else is malformed.
+bool DecodeBool(uint32_t value, bool* out) {
+  if (value > 1)
+    return false;
+  *out = (value != 0);
+  return true;
+}
+
+// Reads the {schema_version==1, fixed_size, total_size} header shared by the
+// CREATE_SESSION / START_RUN variable-length payloads and enforces the framing
+// invariants: total_size must equal the whole handed payload and stay within the
+// frame ceiling, and fixed_size must cover the v1 known section yet fit inside
+// total_size. On success the reader is positioned just past total_size.
+bool ReadVariablePayloadHeader(Reader& reader,
+                               size_t size,
+                               uint16_t known_fixed_size,
+                               uint16_t* fixed_size) {
+  uint16_t schema = 0;
+  uint32_t total_size = 0;
+  if (!reader.GetU16(&schema) || schema != kMessageSchemaVersion)
+    return false;
+  if (!reader.GetU16(fixed_size))
+    return false;
+  if (!reader.GetU32(&total_size))
+    return false;
+  if (total_size != size)
+    return false;  // declared length must match the actual payload exactly
+  if (total_size > kMaxFramePayload)
+    return false;  // per-message ceiling (also the frame payload ceiling)
+  if (*fixed_size < known_fixed_size || *fixed_size > total_size)
+    return false;
+  return true;
+}
+
+// True iff `name` is a bare payload-directory filename: non-empty, no path
+// separator or drive colon, and not "." or "..". Full canonicalization under the
+// payload dir is the coordinator's Stage-4 job; this is only the wire-format
+// guard that an override can never be an arbitrary path.
+bool IsBareFilename(const std::string& name) {
+  if (name.empty() || name == "." || name == "..")
+    return false;
+  for (const char c : name) {
+    if (c == '\\' || c == '/' || c == ':')
+      return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -263,6 +311,190 @@ bool DecodeErrorPayload(const uint8_t* data, size_t size, ErrorPayload* out) {
   return true;
 }
 
+void EncodeCreateSessionPayload(const CreateSessionPayload& payload,
+                                Writer& writer) {
+  // Encode the variable section first so total_size is known before the fixed
+  // header is stamped. (Encode trusts the caller's struct; the decoder is the
+  // enforcement point for counts, booleans, strings, and cross-field rules.)
+  Writer var;
+  var.PutString(payload.app_container_profile);
+  for (const FileRule& rule : payload.file_rules) {
+    var.PutU32(rule.readonly ? 1u : 0u);
+    var.PutString(rule.pattern);
+  }
+  for (const std::string& capability : payload.capabilities)
+    var.PutString(capability);
+
+  const uint32_t total_size =
+      kCreateSessionFixedSize + static_cast<uint32_t>(var.size());
+
+  writer.PutU16(payload.schema_version);
+  writer.PutU16(kCreateSessionFixedSize);
+  writer.PutU32(total_size);
+  writer.PutU32(static_cast<uint32_t>(payload.broker_mode));
+  writer.PutU32(static_cast<uint32_t>(payload.tier));
+  writer.PutU32(static_cast<uint32_t>(payload.integrity));
+  writer.PutU32(static_cast<uint32_t>(payload.delayed_integrity));
+  writer.PutU32(static_cast<uint32_t>(payload.initial_token));
+  writer.PutU32(static_cast<uint32_t>(payload.lockdown_token));
+  writer.PutU32(payload.prohibit_dynamic_code ? 1u : 0u);
+  writer.PutU32(payload.use_app_container ? 1u : 0u);
+  writer.PutU32(payload.low_privilege_app_container ? 1u : 0u);
+  writer.PutU32(static_cast<uint32_t>(payload.file_rules.size()));
+  writer.PutU32(static_cast<uint32_t>(payload.capabilities.size()));
+  writer.PutBytes(var.buffer());
+}
+
+bool DecodeCreateSessionPayload(const uint8_t* data,
+                                size_t size,
+                                CreateSessionPayload* out) {
+  Reader reader(data, size);
+  CreateSessionPayload p;
+
+  uint16_t fixed_size = 0;
+  if (!ReadVariablePayloadHeader(reader, size, kCreateSessionFixedSize,
+                                 &fixed_size))
+    return false;
+
+  // The i32 enum/token fields are transported as-is; the coordinator validates
+  // them against allowlists at bind time.
+  uint32_t v[6] = {};
+  for (uint32_t& field : v) {
+    if (!reader.GetU32(&field))
+      return false;
+  }
+  p.broker_mode = static_cast<int32_t>(v[0]);
+  p.tier = static_cast<int32_t>(v[1]);
+  p.integrity = static_cast<int32_t>(v[2]);
+  p.delayed_integrity = static_cast<int32_t>(v[3]);
+  p.initial_token = static_cast<int32_t>(v[4]);
+  p.lockdown_token = static_cast<int32_t>(v[5]);
+
+  uint32_t prohibit = 0, use_ac = 0, lpac = 0, file_rule_count = 0,
+           capability_count = 0;
+  if (!reader.GetU32(&prohibit) || !reader.GetU32(&use_ac) ||
+      !reader.GetU32(&lpac) || !reader.GetU32(&file_rule_count) ||
+      !reader.GetU32(&capability_count))
+    return false;
+  if (!DecodeBool(prohibit, &p.prohibit_dynamic_code) ||
+      !DecodeBool(use_ac, &p.use_app_container) ||
+      !DecodeBool(lpac, &p.low_privilege_app_container))
+    return false;
+  // Bound the counts before any length-keyed allocation.
+  if (file_rule_count > kMaxFileRules || capability_count > kMaxCapabilities)
+    return false;
+
+  // Forward-compat: skip any additive fixed fields a future minor version
+  // appended, so the variable section starts exactly at fixed_size. (The 52
+  // v1 bytes have been consumed, so this skips fixed_size - 52 bytes.)
+  if (!reader.Skip(fixed_size - kCreateSessionFixedSize))
+    return false;
+
+  if (!reader.GetString(&p.app_container_profile))
+    return false;
+  p.file_rules.resize(file_rule_count);
+  for (FileRule& rule : p.file_rules) {
+    uint32_t readonly = 0;
+    if (!reader.GetU32(&readonly) || !DecodeBool(readonly, &rule.readonly))
+      return false;
+    if (!reader.GetString(&rule.pattern))
+      return false;
+  }
+  p.capabilities.resize(capability_count);
+  for (std::string& capability : p.capabilities) {
+    if (!reader.GetString(&capability))
+      return false;
+  }
+
+  // Cross-field policy rules (design §8.5), fail-closed.
+  if (p.app_container_profile.empty() && p.use_app_container)
+    return false;  // an empty profile is legal only when AppContainer is off
+  if (!p.capabilities.empty() && !p.use_app_container)
+    return false;  // capabilities are legal only when AppContainer is on
+  if (p.low_privilege_app_container && !p.use_app_container)
+    return false;  // LPAC implies AppContainer
+
+  if (!reader.AtEnd())
+    return false;  // the body must be consumed exactly (ends at total_size)
+  *out = std::move(p);
+  return true;
+}
+
+void EncodeStartRunPayload(const StartRunPayload& payload, Writer& writer) {
+  Writer var;
+  var.PutString(payload.engine_filename);
+  var.PutString(payload.snapshot_path);
+  var.PutBytes(payload.guest_payload);
+
+  const uint32_t total_size =
+      kStartRunFixedSize + static_cast<uint32_t>(var.size());
+
+  writer.PutU16(payload.schema_version);
+  writer.PutU16(kStartRunFixedSize);
+  writer.PutU32(total_size);
+  writer.PutU32(static_cast<uint32_t>(payload.tier_override));
+  writer.PutU32(payload.has_engine_override ? 1u : 0u);
+  writer.PutU32(payload.has_snapshot ? 1u : 0u);
+  writer.PutU32(static_cast<uint32_t>(payload.guest_payload.size()));
+  writer.PutBytes(var.buffer());
+}
+
+bool DecodeStartRunPayload(const uint8_t* data,
+                           size_t size,
+                           StartRunPayload* out) {
+  Reader reader(data, size);
+  StartRunPayload p;
+
+  uint16_t fixed_size = 0;
+  if (!ReadVariablePayloadHeader(reader, size, kStartRunFixedSize, &fixed_size))
+    return false;
+
+  uint32_t tier_override = 0, has_engine = 0, has_snapshot = 0, guest_len = 0;
+  if (!reader.GetU32(&tier_override) || !reader.GetU32(&has_engine) ||
+      !reader.GetU32(&has_snapshot) || !reader.GetU32(&guest_len))
+    return false;
+  p.tier_override = static_cast<int32_t>(tier_override);
+  if (!DecodeBool(has_engine, &p.has_engine_override) ||
+      !DecodeBool(has_snapshot, &p.has_snapshot))
+    return false;
+
+  // Forward-compat: skip any additive fixed fields to reach the variable
+  // section, which starts at fixed_size.
+  if (!reader.Skip(fixed_size - kStartRunFixedSize))
+    return false;
+
+  if (!reader.GetString(&p.engine_filename))
+    return false;
+  if (!reader.GetString(&p.snapshot_path))
+    return false;
+  // guest_payload is opaque bytes; GetBytes bounds guest_len <= remaining, so
+  // it always stays within total_size (and thus the frame ceiling).
+  if (!reader.GetBytes(guest_len, &p.guest_payload))
+    return false;
+
+  // Structural field-format rules (design §8.6), fail-closed. Full
+  // canonicalization under the payload directory, held-file signature
+  // verification, and opening the snapshot are the coordinator's Stage-4 job —
+  // this codec never touches the filesystem.
+  if (p.has_engine_override) {
+    if (!IsBareFilename(p.engine_filename))
+      return false;  // an override must be a bare payload-dir filename
+  } else if (!p.engine_filename.empty()) {
+    return false;  // no override => the filename must be empty
+  }
+  if (p.has_snapshot) {
+    if (p.snapshot_path.empty())
+      return false;  // a declared snapshot must name a payload-relative path
+  } else if (!p.snapshot_path.empty()) {
+    return false;  // no snapshot => the path must be empty
+  }
+
+  if (!reader.AtEnd())
+    return false;  // the body must be consumed exactly (ends at total_size)
+  *out = std::move(p);
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Full-frame builders.
 // ---------------------------------------------------------------------------
@@ -308,6 +540,23 @@ std::vector<uint8_t> BuildErrorFrame(FrameHeader header,
   Writer writer;
   EncodeErrorPayload(payload, writer);
   header.type = MessageType::ERROR;
+  return AssembleFrame(header, writer.buffer());
+}
+
+std::vector<uint8_t> BuildCreateSessionFrame(
+    FrameHeader header,
+    const CreateSessionPayload& payload) {
+  Writer writer;
+  EncodeCreateSessionPayload(payload, writer);
+  header.type = MessageType::CREATE_SESSION;
+  return AssembleFrame(header, writer.buffer());
+}
+
+std::vector<uint8_t> BuildStartRunFrame(FrameHeader header,
+                                        const StartRunPayload& payload) {
+  Writer writer;
+  EncodeStartRunPayload(payload, writer);
+  header.type = MessageType::START_RUN;
   return AssembleFrame(header, writer.buffer());
 }
 

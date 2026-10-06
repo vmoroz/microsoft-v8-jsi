@@ -2,11 +2,12 @@
 // Licensed under the MIT license.
 
 // Contract B wire protocol — message layer: the HELLO / HELLO_ACK / ACK / ERROR
-// payload codecs, version negotiation, request correlation, and the bounded
-// duplicate-request cache. This builds on the framing core in
-// v8host_protocol.h and reuses its Writer/Reader for all encoding/decoding.
-// This wire surface is EXPERIMENTAL and NOT yet ABI-stable; it may be reshaped
-// between revisions and must not be relied on as a stable contract yet.
+// / CREATE_SESSION / START_RUN payload codecs, version negotiation, request
+// correlation, and the bounded duplicate-request cache. This builds on the
+// framing core in v8host_protocol.h and reuses its Writer/Reader for all
+// encoding/decoding. This wire surface is EXPERIMENTAL and NOT yet ABI-stable;
+// it may be reshaped between revisions and must not be relied on as a stable
+// contract yet.
 //
 // Like the framing core, every field crosses the wire as explicit little-endian
 // fixed-width bytes (via Writer/Reader). No Windows types, pointers, handles,
@@ -86,6 +87,54 @@ struct ErrorPayload {
   std::string message;
 };
 
+// CREATE_SESSION (client -> broker, design §8.5). The fixed section is a frozen
+// 52-byte v1 layout; `fixed_size` lets a future minor version append bounded
+// trailing fixed fields that a v1 reader skips. The i32 enum/token fields are
+// transported as-is and are NOT range-validated against allowlists here — the
+// coordinator does that at bind time (mirroring how the framing core tolerates
+// unknown message types). `fixed_size`/`total_size` are computed on encode and
+// validated on decode, so they are not stored as struct fields.
+inline constexpr uint16_t kCreateSessionFixedSize = 52;
+
+// One file-access rule: a read-only flag plus an opaque path/pattern string
+// (patterns may legitimately contain separators/colons; the coordinator
+// normalizes them, so this codec only enforces strict UTF-8 / no NUL / bounded).
+struct FileRule {
+  bool readonly = false;
+  std::string pattern;
+};
+
+struct CreateSessionPayload {
+  uint16_t schema_version = kMessageSchemaVersion;
+  int32_t broker_mode = 0;
+  int32_t tier = 0;
+  int32_t integrity = 0;
+  int32_t delayed_integrity = 0;
+  int32_t initial_token = 0;
+  int32_t lockdown_token = 0;
+  bool prohibit_dynamic_code = false;
+  bool use_app_container = false;
+  bool low_privilege_app_container = false;
+  std::string app_container_profile;
+  std::vector<FileRule> file_rules;
+  std::vector<std::string> capabilities;
+};
+
+// START_RUN (client -> broker, design §8.6). A versioned fixed section followed
+// by a strict-UTF-8 engine filename and snapshot path plus a bounded opaque
+// guest payload. tier_override is transported as-is (coordinator-validated).
+inline constexpr uint16_t kStartRunFixedSize = 24;
+
+struct StartRunPayload {
+  uint16_t schema_version = kMessageSchemaVersion;
+  int32_t tier_override = 0;
+  bool has_engine_override = false;
+  bool has_snapshot = false;
+  std::string engine_filename;
+  std::string snapshot_path;
+  std::vector<uint8_t> guest_payload;
+};
+
 // ---------------------------------------------------------------------------
 // Payload codecs. Encode* append the payload body to `writer`; Decode* read the
 // whole [data, data+size) payload, validate schema_version==1 and reserved==0,
@@ -105,6 +154,23 @@ bool DecodeAckPayload(const uint8_t* data, size_t size, AckPayload* out);
 void EncodeErrorPayload(const ErrorPayload& payload, Writer& writer);
 bool DecodeErrorPayload(const uint8_t* data, size_t size, ErrorPayload* out);
 
+// CREATE_SESSION / START_RUN carry a variable-length body, so Decode* also
+// enforce the per-message structural quotas (<= kMaxFileRules file rules, <=
+// kMaxCapabilities capabilities, each string <= kMaxStringBytes, the whole
+// payload <= kMaxFramePayload) and the fail-closed cross-field / field-format
+// rules below. Encode* compute fixed_size/total_size; the decoders require
+// total_size to equal the handed payload size and the body to be consumed
+// exactly. (Runtime quotas — sessions/connection, in-flight runs, relay
+// budgets — are coordinator control-loop state, not enforced here.)
+void EncodeCreateSessionPayload(const CreateSessionPayload& payload,
+                                Writer& writer);
+bool DecodeCreateSessionPayload(const uint8_t* data,
+                                size_t size,
+                                CreateSessionPayload* out);
+
+void EncodeStartRunPayload(const StartRunPayload& payload, Writer& writer);
+bool DecodeStartRunPayload(const uint8_t* data, size_t size, StartRunPayload* out);
+
 // ---------------------------------------------------------------------------
 // Full-frame builders. Each stamps header.type and header.payload_length, then
 // emits header + payload as a ready-to-send buffer. The caller supplies the
@@ -118,6 +184,10 @@ std::vector<uint8_t> BuildHelloAckFrame(FrameHeader header,
 std::vector<uint8_t> BuildAckFrame(FrameHeader header);
 std::vector<uint8_t> BuildErrorFrame(FrameHeader header,
                                      const ErrorPayload& payload);
+std::vector<uint8_t> BuildCreateSessionFrame(FrameHeader header,
+                                             const CreateSessionPayload& payload);
+std::vector<uint8_t> BuildStartRunFrame(FrameHeader header,
+                                        const StartRunPayload& payload);
 
 // ---------------------------------------------------------------------------
 // Version negotiation (design §8.2). Pure decision + frame builder: no pipe or
