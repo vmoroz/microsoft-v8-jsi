@@ -1,0 +1,423 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+#include "v8host_protocol_messages.h"
+
+#include <algorithm>
+#include <cstring>
+
+// Contract B message layer. Every multi-byte integer is read and written
+// through the framing core's Writer/Reader, so the bytes are identical on any
+// host arch. Exception-free: no throw/try — codecs report success through their
+// return value and the cache never throws.
+
+namespace v8host::protocol {
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Self-contained SHA-256 (FIPS 180-4), file-local so //v8host:protocol pulls in
+// no bcrypt/Windows dependency. This is an independent implementation from the
+// test's SHA-256 (which stays a separate oracle); both compute the standard
+// digest, so the cache fingerprint is a plain SHA-256 of the request payload.
+// ---------------------------------------------------------------------------
+class Sha256 {
+ public:
+  Sha256() {
+    h_[0] = 0x6a09e667u;
+    h_[1] = 0xbb67ae85u;
+    h_[2] = 0x3c6ef372u;
+    h_[3] = 0xa54ff53au;
+    h_[4] = 0x510e527fu;
+    h_[5] = 0x9b05688cu;
+    h_[6] = 0x1f83d9abu;
+    h_[7] = 0x5be0cd19u;
+  }
+
+  void Update(const uint8_t* data, size_t len) {
+    total_len_ += len;
+    for (size_t i = 0; i < len; ++i) {
+      block_[fill_++] = data[i];
+      if (fill_ == 64) {
+        Compress();
+        fill_ = 0;
+      }
+    }
+  }
+
+  void Finish(uint8_t out[32]) {
+    const uint64_t bit_len = static_cast<uint64_t>(total_len_) * 8;
+    // Append 0x80 then zero-pad to a 56-byte residue, then the 64-bit length.
+    block_[fill_++] = 0x80;
+    if (fill_ > 56) {
+      while (fill_ < 64)
+        block_[fill_++] = 0;
+      Compress();
+      fill_ = 0;
+    }
+    while (fill_ < 56)
+      block_[fill_++] = 0;
+    for (int i = 7; i >= 0; --i)
+      block_[fill_++] = static_cast<uint8_t>((bit_len >> (i * 8)) & 0xFF);
+    Compress();
+    for (int i = 0; i < 8; ++i) {
+      out[i * 4 + 0] = static_cast<uint8_t>((h_[i] >> 24) & 0xFF);
+      out[i * 4 + 1] = static_cast<uint8_t>((h_[i] >> 16) & 0xFF);
+      out[i * 4 + 2] = static_cast<uint8_t>((h_[i] >> 8) & 0xFF);
+      out[i * 4 + 3] = static_cast<uint8_t>(h_[i] & 0xFF);
+    }
+  }
+
+ private:
+  static uint32_t Rotr(uint32_t x, uint32_t n) {
+    return (x >> n) | (x << (32 - n));
+  }
+
+  void Compress() {
+    static const uint32_t k[64] = {
+        0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu,
+        0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u, 0xd807aa98u, 0x12835b01u,
+        0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u,
+        0xc19bf174u, 0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+        0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau, 0x983e5152u,
+        0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u,
+        0x06ca6351u, 0x14292967u, 0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu,
+        0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+        0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u,
+        0xd6990624u, 0xf40e3585u, 0x106aa070u, 0x19a4c116u, 0x1e376c08u,
+        0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu,
+        0x682e6ff3u, 0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+        0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u};
+    uint32_t w[64];
+    for (int i = 0; i < 16; ++i) {
+      w[i] = (static_cast<uint32_t>(block_[i * 4 + 0]) << 24) |
+             (static_cast<uint32_t>(block_[i * 4 + 1]) << 16) |
+             (static_cast<uint32_t>(block_[i * 4 + 2]) << 8) |
+             (static_cast<uint32_t>(block_[i * 4 + 3]));
+    }
+    for (int i = 16; i < 64; ++i) {
+      const uint32_t s0 =
+          Rotr(w[i - 15], 7) ^ Rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+      const uint32_t s1 =
+          Rotr(w[i - 2], 17) ^ Rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3];
+    uint32_t e = h_[4], f = h_[5], g = h_[6], h = h_[7];
+    for (int i = 0; i < 64; ++i) {
+      const uint32_t s1 = Rotr(e, 6) ^ Rotr(e, 11) ^ Rotr(e, 25);
+      const uint32_t ch = (e & f) ^ ((~e) & g);
+      const uint32_t t1 = h + s1 + ch + k[i] + w[i];
+      const uint32_t s0 = Rotr(a, 2) ^ Rotr(a, 13) ^ Rotr(a, 22);
+      const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+      const uint32_t t2 = s0 + maj;
+      h = g;
+      g = f;
+      f = e;
+      e = d + t1;
+      d = c;
+      c = b;
+      b = a;
+      a = t1 + t2;
+    }
+    h_[0] += a;
+    h_[1] += b;
+    h_[2] += c;
+    h_[3] += d;
+    h_[4] += e;
+    h_[5] += f;
+    h_[6] += g;
+    h_[7] += h;
+  }
+
+  uint32_t h_[8];
+  uint8_t block_[64] = {};
+  size_t fill_ = 0;
+  uint64_t total_len_ = 0;
+};
+
+void Sha256Fingerprint(const uint8_t* data, size_t len, uint8_t out[32]) {
+  Sha256 sha;
+  if (len != 0)
+    sha.Update(data, len);
+  sha.Finish(out);
+}
+
+// Reads and validates the common {schema_version==1, reserved==0} prologue that
+// opens every version-1 control payload. Returns false (reader unchanged on the
+// failing accessor) on a short read or a disallowed value.
+bool ReadSchemaPrologue(Reader& reader, uint16_t* schema, uint16_t* reserved) {
+  if (!reader.GetU16(schema) || *schema != kMessageSchemaVersion)
+    return false;
+  if (!reader.GetU16(reserved) || *reserved != 0)
+    return false;
+  return true;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Payload codecs.
+// ---------------------------------------------------------------------------
+void EncodeHelloPayload(const HelloPayload& payload, Writer& writer) {
+  writer.PutU16(payload.schema_version);
+  writer.PutU16(payload.reserved);
+}
+
+bool DecodeHelloPayload(const uint8_t* data, size_t size, HelloPayload* out) {
+  Reader reader(data, size);
+  HelloPayload p;
+  if (!ReadSchemaPrologue(reader, &p.schema_version, &p.reserved))
+    return false;
+  if (!reader.AtEnd())
+    return false;  // trailing bytes
+  *out = p;
+  return true;
+}
+
+void EncodeHelloAckPayload(const HelloAckPayload& payload, Writer& writer) {
+  writer.PutU16(payload.schema_version);
+  writer.PutU16(payload.reserved);
+  writer.PutU16(payload.broker_version_major);
+  writer.PutU16(payload.broker_version_minor);
+  writer.PutU32(payload.endpoint_mode);
+  writer.PutU32(payload.max_frame_payload);
+  writer.PutU32(payload.max_sessions_per_connection);
+  writer.PutU32(payload.max_in_flight_runs_per_session);
+  writer.PutU32(payload.max_file_rules);
+  writer.PutU32(payload.max_capabilities);
+  writer.PutU32(payload.max_queued_relay_bytes_per_run);
+  writer.PutU32(payload.max_queued_relay_bytes_per_connection);
+}
+
+bool DecodeHelloAckPayload(const uint8_t* data,
+                           size_t size,
+                           HelloAckPayload* out) {
+  Reader reader(data, size);
+  HelloAckPayload p;
+  if (!ReadSchemaPrologue(reader, &p.schema_version, &p.reserved))
+    return false;
+  if (!reader.GetU16(&p.broker_version_major))
+    return false;
+  if (!reader.GetU16(&p.broker_version_minor))
+    return false;
+  if (!reader.GetU32(&p.endpoint_mode))
+    return false;
+  if (!reader.GetU32(&p.max_frame_payload))
+    return false;
+  if (!reader.GetU32(&p.max_sessions_per_connection))
+    return false;
+  if (!reader.GetU32(&p.max_in_flight_runs_per_session))
+    return false;
+  if (!reader.GetU32(&p.max_file_rules))
+    return false;
+  if (!reader.GetU32(&p.max_capabilities))
+    return false;
+  if (!reader.GetU32(&p.max_queued_relay_bytes_per_run))
+    return false;
+  if (!reader.GetU32(&p.max_queued_relay_bytes_per_connection))
+    return false;
+  if (!reader.AtEnd())
+    return false;
+  *out = p;
+  return true;
+}
+
+void EncodeAckPayload(const AckPayload& payload, Writer& writer) {
+  writer.PutU16(payload.schema_version);
+  writer.PutU16(payload.reserved);
+}
+
+bool DecodeAckPayload(const uint8_t* data, size_t size, AckPayload* out) {
+  Reader reader(data, size);
+  AckPayload p;
+  if (!ReadSchemaPrologue(reader, &p.schema_version, &p.reserved))
+    return false;
+  if (!reader.AtEnd())
+    return false;
+  *out = p;
+  return true;
+}
+
+void EncodeErrorPayload(const ErrorPayload& payload, Writer& writer) {
+  writer.PutU16(payload.schema_version);
+  writer.PutU16(payload.reserved);
+  writer.PutU32(static_cast<uint32_t>(payload.status_code));
+  writer.PutString(payload.message);
+}
+
+bool DecodeErrorPayload(const uint8_t* data, size_t size, ErrorPayload* out) {
+  Reader reader(data, size);
+  ErrorPayload p;
+  if (!ReadSchemaPrologue(reader, &p.schema_version, &p.reserved))
+    return false;
+  uint32_t status = 0;
+  if (!reader.GetU32(&status))
+    return false;
+  p.status_code = static_cast<StatusCode>(status);  // tolerate unknown codes
+  if (!reader.GetString(&p.message))  // strict UTF-8 / no NUL / bounded
+    return false;
+  if (!reader.AtEnd())
+    return false;
+  *out = p;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Full-frame builders.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Assembles header + payload: stamps the length, encodes the 32-byte header,
+// then appends the already-encoded payload bytes.
+std::vector<uint8_t> AssembleFrame(FrameHeader header,
+                                   const std::vector<uint8_t>& payload) {
+  header.payload_length = static_cast<uint32_t>(payload.size());
+  std::vector<uint8_t> frame;
+  EncodeHeader(header, frame);
+  frame.insert(frame.end(), payload.begin(), payload.end());
+  return frame;
+}
+
+}  // namespace
+
+std::vector<uint8_t> BuildHelloFrame(FrameHeader header) {
+  Writer writer;
+  EncodeHelloPayload(HelloPayload{}, writer);
+  header.type = MessageType::HELLO;
+  return AssembleFrame(header, writer.buffer());
+}
+
+std::vector<uint8_t> BuildHelloAckFrame(FrameHeader header,
+                                        const HelloAckPayload& payload) {
+  Writer writer;
+  EncodeHelloAckPayload(payload, writer);
+  header.type = MessageType::HELLO_ACK;
+  return AssembleFrame(header, writer.buffer());
+}
+
+std::vector<uint8_t> BuildAckFrame(FrameHeader header) {
+  Writer writer;
+  EncodeAckPayload(AckPayload{}, writer);
+  header.type = MessageType::ACK;
+  return AssembleFrame(header, writer.buffer());
+}
+
+std::vector<uint8_t> BuildErrorFrame(FrameHeader header,
+                                     const ErrorPayload& payload) {
+  Writer writer;
+  EncodeErrorPayload(payload, writer);
+  header.type = MessageType::ERROR;
+  return AssembleFrame(header, writer.buffer());
+}
+
+// ---------------------------------------------------------------------------
+// Version negotiation.
+// ---------------------------------------------------------------------------
+NegotiationResult NegotiateHello(const FrameHeader& hello_header,
+                                 const HelloPayload& hello,
+                                 const BrokerCapabilities& caps,
+                                 uint32_t assigned_conn_id) {
+  (void)hello;  // reserved for future HELLO capability bits; unused in v1
+
+  NegotiationResult result;
+
+  // The reply always addresses the assigned connection and echoes the HELLO
+  // request_id; the broker speaks its own major in the header either way.
+  FrameHeader reply;
+  reply.version_major = caps.broker_version_major;
+  reply.conn_id = assigned_conn_id;
+  reply.request_id = hello_header.request_id;
+
+  if (hello_header.version_major != caps.broker_version_major) {
+    // Major mismatch: the broker cannot serve this client. Emit a bounded
+    // ERROR(ERROR_VERSION); the caller closes the connection afterward.
+    result.decision = NegotiationDecision::kReject;
+    result.selected_minor = 0;
+    reply.version_minor = caps.broker_version_minor;
+    ErrorPayload error;
+    error.status_code = StatusCode::ERROR_VERSION;
+    error.message = "unsupported wire protocol major version";
+    result.frame = BuildErrorFrame(reply, error);
+    return result;
+  }
+
+  // Equal major: the lower minor governs. The selected minor is <= the client's
+  // offer, so the client can always operate at it.
+  result.decision = NegotiationDecision::kAck;
+  result.selected_minor =
+      std::min(hello_header.version_minor, caps.broker_version_minor);
+  reply.version_minor = result.selected_minor;
+
+  HelloAckPayload ack;
+  ack.broker_version_major = caps.broker_version_major;
+  ack.broker_version_minor = caps.broker_version_minor;
+  ack.endpoint_mode = caps.endpoint_mode;
+  ack.max_frame_payload = caps.max_frame_payload;
+  ack.max_sessions_per_connection = caps.max_sessions_per_connection;
+  ack.max_in_flight_runs_per_session = caps.max_in_flight_runs_per_session;
+  ack.max_file_rules = caps.max_file_rules;
+  ack.max_capabilities = caps.max_capabilities;
+  ack.max_queued_relay_bytes_per_run = caps.max_queued_relay_bytes_per_run;
+  ack.max_queued_relay_bytes_per_connection =
+      caps.max_queued_relay_bytes_per_connection;
+  result.frame = BuildHelloAckFrame(reply, ack);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Correlation + duplicate-request cache.
+// ---------------------------------------------------------------------------
+bool operator==(const RequestIdentity& a, const RequestIdentity& b) {
+  return a.type == b.type && a.conn_id == b.conn_id &&
+         a.session_id == b.session_id && a.run_id == b.run_id &&
+         a.request_id == b.request_id && a.flags == b.flags;
+}
+
+ClassifyResult RequestCache::Classify(const RequestIdentity& identity,
+                                      const uint8_t* payload,
+                                      size_t payload_len) const {
+  ClassifyResult result;
+  const auto it = entries_.find(identity.request_id);
+  if (it != entries_.end()) {
+    // The request_id is cached. An exact duplicate must match both the full
+    // identity and the payload fingerprint; anything else is malformed.
+    uint8_t fingerprint[32];
+    Sha256Fingerprint(payload, payload_len, fingerprint);
+    if (it->second.identity == identity &&
+        std::memcmp(it->second.fingerprint, fingerprint, 32) == 0) {
+      result.classification = RequestClass::kExactDuplicate;
+      result.cached_response = &it->second.response;
+    } else {
+      result.classification = RequestClass::kMismatchedDuplicate;
+    }
+    return result;
+  }
+
+  // Not cached: fresh above the watermark, stale at or below it (evicted or an
+  // old/reused id). A cached id always has request_id <= watermark, so reaching
+  // here with request_id > watermark is unambiguously fresh.
+  result.classification = identity.request_id > watermark_
+                              ? RequestClass::kFresh
+                              : RequestClass::kStale;
+  return result;
+}
+
+void RequestCache::Record(const RequestIdentity& identity,
+                          const uint8_t* payload,
+                          size_t payload_len,
+                          std::vector<uint8_t> response_frame) {
+  Entry entry;
+  entry.identity = identity;
+  Sha256Fingerprint(payload, payload_len, entry.fingerprint);
+  entry.response = std::move(response_frame);
+  entries_[identity.request_id] = std::move(entry);
+
+  // Evict the oldest (lowest request_id) once over the 256-entry horizon.
+  if (entries_.size() > kDuplicateCacheSize)
+    entries_.erase(entries_.begin());
+
+  watermark_ = std::max(watermark_, identity.request_id);
+}
+
+}  // namespace v8host::protocol

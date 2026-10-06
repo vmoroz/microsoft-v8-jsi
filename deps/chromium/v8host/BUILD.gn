@@ -47,6 +47,30 @@ static_library("payload_identity") {
   libs = [ "bcrypt.lib" ]
 }
 
+# The Contract B framing codec is persona-neutral and dependency-free, so it
+# gets its own minimal public config: only protocol/ on the include path (no
+# sibling persona dirs, no SBOX_DEV_ALLOW_UNSIGNED). Anything that links it sees
+# just the codec header.
+config("protocol_config") {
+  include_dirs = [ "protocol" ]
+}
+
+# Hardened, persona-neutral Contract B codec: the framing core (byte
+# reader/writer, the fixed 32-byte header, strict UTF-8 strings,
+# one-frame-per-message validation, frozen limits) plus the message layer
+# (HELLO/HELLO_ACK/ACK/ERROR codecs, version negotiation, and the duplicate-
+# request cache with a self-contained SHA-256). No libs, no Windows; inherits
+# the default no-exceptions config, so it stays exception-free.
+static_library("protocol") {
+  sources = [
+    "protocol/v8host_protocol.cc",
+    "protocol/v8host_protocol.h",
+    "protocol/v8host_protocol_messages.cc",
+    "protocol/v8host_protocol_messages.h",
+  ]
+  public_configs = [ ":protocol_config" ]
+}
+
 source_set("client_persona") {
   sources = [
     "client/v8host_broker_rendezvous.cc",
@@ -145,6 +169,20 @@ executable("v8host_broker_tests") {
     ":v8host_fake_plugin",
     "//sandbox_dll:sbox",
   ]
+}
+
+# In-process codec conformance tests for //v8host:protocol. No pipes or spawned
+# processes (no data_deps), and only the codec header is needed: protocol/ is on
+# the include path via the :protocol public config, and v8host_test_support.h
+# resolves same-dir.
+executable("v8host_protocol_tests") {
+  testonly = true
+  sources = [
+    "tests/v8host_protocol_tests.cc",
+    "tests/v8host_test_support.cc",
+    "tests/v8host_test_support.h",
+  ]
+  deps = [ ":protocol" ]
 }
 
 # Deliberately invalid plugin used by the host-rejects-bad-plugin-abi case.
