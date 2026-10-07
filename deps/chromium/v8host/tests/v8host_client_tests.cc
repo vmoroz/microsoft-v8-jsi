@@ -192,6 +192,21 @@ std::vector<uint8_t> EventFrame(MessageType type,
   return out;
 }
 
+// RESULT frames carry the terminal-disposition codec, so build them through the
+// protocol builder rather than EventFrame (which is header-only).
+std::vector<uint8_t> ResultFrame(uint32_t session,
+                                 uint32_t run,
+                                 ResultDisposition disposition =
+                                     ResultDisposition::kCompleted) {
+  FrameHeader h;
+  h.version_major = kWireVersionMajor;
+  h.version_minor = kWireVersionMinor;
+  h.conn_id = 1;
+  h.session_id = session;
+  h.run_id = run;
+  return BuildResultFrame(h, disposition);
+}
+
 std::vector<uint8_t> AckFor(const std::vector<uint8_t>& request) {
   FrameHeader h;
   DecodeAndValidateFrame(request.data(), request.size(), &h);
@@ -444,7 +459,8 @@ bool ValidateRunPolicyAndOutputs(std::string* detail) {
         out != nullptr)
       return Fail(detail, "invalid tier/output");
   }
-  const wchar_t* bad[] = {L"a/b.dll", L"a\\b.dll", L"C:x.dll", L".", L".."};
+  const wchar_t* bad[] = {L"a/b.dll", L"a\\b.dll", L"C:x.dll", L".",
+                          L"..",      L"a..b",     L"..x",     L"x.."};
   for (const wchar_t* value : bad) {
     i = BasicRun();
     i.engine_dll_override = value;
@@ -561,21 +577,21 @@ bool BoundaryQuotas(std::string* detail) {
       session != nullptr)
     return Fail(detail, "65 capabilities not rejected/null");
 
-  std::wstring accepted(kMaxStringBytes - 1, L'a');
+  std::wstring accepted(kMaxStringBytes, L'a');
   V8HostFileRule long_rule{accepted.c_str(), 0};
   config = BasicConfig();
   config.file_rules = &long_rule;
   config.file_rule_count = 1;
   if (v8host_client_create_session(&config, &session) != V8HOST_OK)
-    return Fail(detail, "32767-byte string boundary rejected");
+    return Fail(detail, "32-KiB string boundary rejected");
   v8host_client_close_session(session);
   Drain();
-  std::wstring rejected(kMaxStringBytes, L'a');
+  std::wstring rejected(kMaxStringBytes + 1, L'a');
   long_rule.pattern = rejected.c_str();
   session = reinterpret_cast<V8HostSession*>(1);
   if (v8host_client_create_session(&config, &session) != V8HOST_E_QUOTA ||
       session != nullptr)
-    return Fail(detail, "32-KiB string not rejected/null");
+    return Fail(detail, "32-KiB+1 string not rejected/null");
 
   FakeTransport* fake = nullptr;
   session = Create(&fake);
@@ -803,8 +819,7 @@ bool InboundRunAndTerminal(std::string* detail) {
   std::thread io([&] {
     fake->Inbound(ack);
     fake->Inbound(relay_frame);
-    fake->Inbound(
-        EventFrame(MessageType::RESULT, start.session_id, start.run_id));
+    fake->Inbound(ResultFrame(start.session_id, start.run_id));
     fake->Inbound(
         EventFrame(MessageType::WORKER_EXIT, start.session_id, start.run_id));
   });
@@ -825,6 +840,35 @@ bool InboundRunAndTerminal(std::string* detail) {
   return ok || Fail(detail, "routing/one terminal/terminal handle");
 }
 
+bool InboundCancelledResult(std::string* detail) {
+  FakeTransport* fake = nullptr;
+  V8HostSession* session = Create(&fake);
+  Recorder r;
+  V8HostCallbacks cb = Callbacks(&r);
+  v8host_client_set_callbacks(session, &cb);
+  V8HostRunInputs input = BasicRun();
+  V8HostRun* run = nullptr;
+  v8host_client_start_run(session, &input, &run);
+  FrameHeader start;
+  const auto start_frame = fake->Frame(1);
+  DecodeAndValidateFrame(start_frame.data(), start_frame.size(), &start);
+  std::thread io([&] {
+    fake->Inbound(AckFor(fake->Frame(1)));
+    fake->Inbound(ResultFrame(start.session_id, start.run_id,
+                              ResultDisposition::kCancelled));
+  });
+  io.join();
+  if (!PumpUntil([&] { return r.total.load() >= 2; }))
+    return Fail(detail, "inbound callbacks");
+  const bool ok = r.events.size() == 2 &&
+                  r.events[0] == V8HOST_RUN_EVENT_STARTED &&
+                  r.events[1] == V8HOST_RUN_EVENT_CANCELLED &&
+                  v8host_client_cancel_run(run) == V8HOST_E_RUN_TERMINAL;
+  v8host_client_close_session(session);
+  Drain();
+  return ok || Fail(detail, "cancelled result -> CANCELLED terminal");
+}
+
 bool LateTrafficAfterTerminal(std::string* detail) {
   FakeTransport* fake = nullptr;
   V8HostSession* session = Create(&fake);
@@ -838,7 +882,7 @@ bool LateTrafficAfterTerminal(std::string* detail) {
   FrameHeader start;
   DecodeAndValidateFrame(start_frame.data(), start_frame.size(), &start);
 
-  fake->Inbound(EventFrame(MessageType::RESULT, start.session_id, start.run_id));
+  fake->Inbound(ResultFrame(start.session_id, start.run_id));
   fake->Inbound(AckFor(start_frame));
   const uint8_t byte = 0x5A;
   FrameHeader relay = start;
@@ -1243,6 +1287,7 @@ int main(int argc, char** argv) {
       {"callbacks", "replace-clear-app-thread", CallbackRoutingAndReplacement},
       {"callbacks", "alloc-failure-prior-intact", CallbackAllocationFailure},
       {"delivery", "inbound-run-terminal", InboundRunAndTerminal},
+      {"delivery", "inbound-cancelled-result", InboundCancelledResult},
       {"delivery", "terminal-then-late-ack-relay", LateTrafficAfterTerminal},
       {"protocol", "wrong-conn-session-run-correlation",
        CorrelationMismatchDisconnects},

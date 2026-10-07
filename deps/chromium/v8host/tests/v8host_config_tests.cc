@@ -137,7 +137,8 @@ bool CapabilityBadSid(std::string* detail) {
 
 bool EngineDllBadName(std::string* detail) {
   const sbox_config_api api = MakeConfigApi();
-  const wchar_t* bad[] = {L"", L"C:\\evil.dll", L"sub\\x.dll", L"..\\x.dll"};
+  const wchar_t* bad[] = {L"", L"C:\\evil.dll", L"sub\\x.dll", L"..\\x.dll",
+                          L"."};
   for (const wchar_t* name : bad) {
     sbox_config_s cfg;
     CHECK(api.allow_engine_dll(&cfg, name) == sbox_error_args,

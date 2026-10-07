@@ -107,6 +107,7 @@ enum class StatusCode : uint32_t {
   ERROR_QUOTA = 5,                // a frozen quota was exceeded
   ERROR_BAD_STATE = 6,            // impossible state or object reference
   ERROR_INTERNAL = 7,             // unexpected internal failure
+  ERROR_PROFILE_ALREADY_BOUND = 8,  // a later run's profile conflicts (Stage 4)
 };
 
 // Decoded form of the 32-byte frame header. This is NOT a wire-layout struct;

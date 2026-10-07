@@ -55,12 +55,12 @@ bool ReadHeader(Reader& reader,
   return true;
 }
 
-// True iff `name` is a bare payload-directory filename: non-empty, no path
-// separator or drive colon, and no ".." substring. Matches the sbox_config.cc
-// allow_engine_dll setter exactly, so the codec is never the weaker validator of
-// a directly-crafted worker/spawn blob.
+// True iff `name` is a bare payload-directory filename: non-empty, not ".", no
+// path separator or drive colon, and no ".." substring. Matches the
+// sbox_config.cc allow_engine_dll setter exactly, so the codec is never the
+// weaker validator of a directly-crafted worker/spawn blob.
 bool IsBareFilename(const std::string& name) {
-  if (name.empty() || name.find("..") != std::string::npos)
+  if (name.empty() || name == "." || name.find("..") != std::string::npos)
     return false;
   for (const char c : name) {
     if (c == '\\' || c == '/' || c == ':')

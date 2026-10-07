@@ -135,6 +135,21 @@ struct StartRunPayload {
   std::vector<uint8_t> guest_payload;
 };
 
+// RESULT (broker -> client, design §9). A run's terminal disposition. The guest's
+// own output rides ordinary RELAY_FROM_WORKER during the run; RESULT carries no
+// guest bytes, so the result channel stays non-data and the terminal stays
+// single. kCancelled is the inbound frame that drives V8HOST_RUN_EVENT_CANCELLED.
+enum class ResultDisposition : uint32_t {
+  kCompleted = 0,  // the run finished normally
+  kCancelled = 1,  // the run ended in response to CANCEL_RUN
+};
+
+struct ResultPayload {
+  uint16_t schema_version = kMessageSchemaVersion;
+  uint16_t reserved = 0;
+  ResultDisposition disposition = ResultDisposition::kCompleted;
+};
+
 // ---------------------------------------------------------------------------
 // Payload codecs. Encode* append the payload body to `writer`; Decode* read the
 // whole [data, data+size) payload, validate schema_version==1 and reserved==0,
@@ -171,6 +186,12 @@ bool DecodeCreateSessionPayload(const uint8_t* data,
 void EncodeStartRunPayload(const StartRunPayload& payload, Writer& writer);
 bool DecodeStartRunPayload(const uint8_t* data, size_t size, StartRunPayload* out);
 
+// RESULT disposition codec: u16 schema | u16 reserved | u32 disposition, where
+// disposition is exactly kCompleted(0) or kCancelled(1) (any other value is
+// rejected fail-closed). The payload must be consumed exactly.
+void EncodeResultPayload(const ResultPayload& payload, Writer& writer);
+bool DecodeResultPayload(const uint8_t* data, size_t size, ResultPayload* out);
+
 // ---------------------------------------------------------------------------
 // Full-frame builders. Each stamps header.type and header.payload_length, then
 // emits header + payload as a ready-to-send buffer. The caller supplies the
@@ -190,6 +211,17 @@ std::vector<uint8_t> BuildStartRunFrame(FrameHeader header,
                                         const StartRunPayload& payload);
 std::vector<uint8_t> BuildCancelRunFrame(FrameHeader header);
 std::vector<uint8_t> BuildCloseSessionFrame(FrameHeader header);
+
+// Event frames (broker -> client). SESSION_READY / STARTUP_READY /
+// SECURITY_READY / WORKER_EXIT are header-only (empty payload), addressed by the
+// frame header's session_id (run_id = 0); the client routes them by header type.
+// RESULT carries the 8-byte terminal-disposition codec above.
+std::vector<uint8_t> BuildSessionReadyFrame(FrameHeader header);
+std::vector<uint8_t> BuildStartupReadyFrame(FrameHeader header);
+std::vector<uint8_t> BuildSecurityReadyFrame(FrameHeader header);
+std::vector<uint8_t> BuildWorkerExitFrame(FrameHeader header);
+std::vector<uint8_t> BuildResultFrame(FrameHeader header,
+                                      ResultDisposition disposition);
 
 // Relay payloads are a little-endian signed kind followed by opaque bytes.
 // BuildRelayFrame preserves header.type so the same audited builder serves

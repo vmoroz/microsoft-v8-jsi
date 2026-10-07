@@ -38,7 +38,8 @@ sbox_status Poison(sbox_config c, sbox_status err) {
 }  // namespace
 
 bool IsBareFilename(const std::wstring& name) {
-  return !name.empty() && name.find_first_of(L"\\/:") == std::wstring::npos &&
+  return !name.empty() && name != L"." &&
+         name.find_first_of(L"\\/:") == std::wstring::npos &&
          name.find(L"..") == std::wstring::npos;
 }
 

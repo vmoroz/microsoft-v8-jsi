@@ -277,7 +277,7 @@ V8HostStatus WideToUtf8(const wchar_t* text,
       nullptr, nullptr);
   if (bytes <= 0)
     return V8HOST_E_INVALID_ARG;
-  if (static_cast<uint32_t>(bytes) >= protocol::kMaxStringBytes)
+  if (static_cast<uint32_t>(bytes) > protocol::kMaxStringBytes)
     return V8HOST_E_QUOTA;
   out->resize(bytes);
   if (::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text,
@@ -290,7 +290,8 @@ V8HostStatus WideToUtf8(const wchar_t* text,
 }
 
 bool IsBareFilename(const std::wstring& value) {
-  return !value.empty() && value != L"." && value != L".." &&
+  return !value.empty() && value != L"." &&
+         value.find(L"..") == std::wstring::npos &&
          value.find_first_of(L"\\/:") == std::wstring::npos;
 }
 
@@ -308,6 +309,8 @@ V8HostStatus MapStatus(protocol::StatusCode status) {
       return V8HOST_E_INVALID_STATE;
     case protocol::StatusCode::ERROR_INTERNAL:
       return V8HOST_E_INTERNAL;
+    case protocol::StatusCode::ERROR_PROFILE_ALREADY_BOUND:
+      return V8HOST_E_PROFILE_ALREADY_BOUND;
     case protocol::StatusCode::ERROR_UNSUPPORTED_MESSAGE:
     case protocol::StatusCode::ERROR_STALE_REQUEST:
       return V8HOST_E_PROTOCOL;
@@ -611,10 +614,17 @@ class ClientConnection final
             session->dispatch_id, it->second.get(), kind, body, body_len));
       }
       case protocol::MessageType::RESULT: {
+        protocol::ResultPayload result;
+        if (!protocol::DecodeResultPayload(payload, payload_len, &result))
+          break;  // malformed -> protocol-error disconnect (fail-closed)
         V8HostRun* run = FindRun(session, header.run_id);
-        if (run != nullptr)
-          MarkAndPostTerminal(session, run, V8HOST_RUN_EVENT_COMPLETED,
-                              V8HOST_OK);
+        if (run != nullptr) {
+          const int32_t event =
+              result.disposition == protocol::ResultDisposition::kCancelled
+                  ? V8HOST_RUN_EVENT_CANCELLED
+                  : V8HOST_RUN_EVENT_COMPLETED;
+          MarkAndPostTerminal(session, run, event, V8HOST_OK);
+        }
         return;
       }
       case protocol::MessageType::RUN_ERROR: {

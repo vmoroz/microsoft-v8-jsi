@@ -110,6 +110,9 @@ typedef enum V8HostStatus {
   // 0x4000 - asynchronous session/run terminal conditions.
   V8HOST_E_RUN_TERMINAL          = 0x4001,  // post/cancel on an ended run
   V8HOST_E_CALLBACK_BACKPRESSURE = 0x4002,  // app thread not draining callbacks
+  V8HOST_E_PROFILE_ALREADY_BOUND = 0x4003,  // a later start_run's tier/engine/
+                                            // snapshot conflicts with the
+                                            // profile bound by the first run
 
   // 0x7000 - unexpected internal failure.
   V8HOST_E_INTERNAL = 0x7001,

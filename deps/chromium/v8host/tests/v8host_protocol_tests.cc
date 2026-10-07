@@ -439,6 +439,59 @@ std::vector<uint8_t> VectorRelayFrame() {
   return BuildRelayFrame(h, -2, body, sizeof(body));
 }
 
+// V14 (Stage 4 slice a): header-only event frames + the RESULT disposition
+// codec. All addressed by the header; RESULT carries the 8-byte codec.
+std::vector<uint8_t> VectorSessionReadyFrame() {
+  FrameHeader h;
+  h.version_major = 1;
+  h.version_minor = 0;
+  h.conn_id = 9;
+  h.session_id = 2;
+  h.request_id = 0x35;
+  return BuildSessionReadyFrame(h);
+}
+
+std::vector<uint8_t> VectorStartupReadyFrame() {
+  FrameHeader h;
+  h.version_major = 1;
+  h.version_minor = 0;
+  h.conn_id = 9;
+  h.session_id = 2;
+  h.request_id = 0x36;
+  return BuildStartupReadyFrame(h);
+}
+
+std::vector<uint8_t> VectorSecurityReadyFrame() {
+  FrameHeader h;
+  h.version_major = 1;
+  h.version_minor = 0;
+  h.conn_id = 9;
+  h.session_id = 2;
+  h.request_id = 0x37;
+  return BuildSecurityReadyFrame(h);
+}
+
+std::vector<uint8_t> VectorWorkerExitFrame() {
+  FrameHeader h;
+  h.version_major = 1;
+  h.version_minor = 0;
+  h.conn_id = 9;
+  h.session_id = 2;
+  h.request_id = 0x38;
+  return BuildWorkerExitFrame(h);
+}
+
+std::vector<uint8_t> VectorResultFrame() {
+  FrameHeader h;
+  h.version_major = 1;
+  h.version_minor = 0;
+  h.conn_id = 9;
+  h.session_id = 2;
+  h.run_id = 3;
+  h.request_id = 0x39;
+  return BuildResultFrame(h, ResultDisposition::kCancelled);
+}
+
 std::vector<std::vector<uint8_t>> CanonicalVectors() {
   return {VectorAllDistinctHeader(),  VectorHelloHeader(),
           VectorWriterPayload(),      VectorFullFrame(),
@@ -446,7 +499,9 @@ std::vector<std::vector<uint8_t>> CanonicalVectors() {
           VectorAckFrame(),           VectorErrorFrame(),
           VectorCreateSessionFrame(), VectorStartRunFrame(),
           VectorCancelRunFrame(),     VectorCloseSessionFrame(),
-          VectorRelayFrame()};
+          VectorRelayFrame(),         VectorSessionReadyFrame(),
+          VectorStartupReadyFrame(),  VectorSecurityReadyFrame(),
+          VectorWorkerExitFrame(),    VectorResultFrame()};
 }
 
 std::vector<uint8_t> CanonicalConcat() {
@@ -462,7 +517,7 @@ std::vector<uint8_t> CanonicalConcat() {
 // value on x86/x64/arm64 IS the cross-arch equality gate and any wire/byte
 // change trips it. Update this ONLY together with a deliberate wire change.
 constexpr const char kExpectedVectorsSha256[] =
-    "91eebc27c9b9f08ea4995a8ee75b53e95c815fdf3dbfebac7a269b2ecd67acb3";
+    "0921a53c9361213e11c0fbe1490a97d909823e53d3f36a33412dcfdf2857e301";
 
 // Hard-coded expected bytes (computed independently). These exact-byte asserts
 // are the cross-arch contract: any arch must produce precisely these bytes.
@@ -659,6 +714,69 @@ bool RelayPayloadCodec(std::string* detail) {
       DecodeRelayPayload(payload, payload_len, nullptr, &body, &body_len)) {
     return Fail(detail, "malformed relay payload accepted");
   }
+  return true;
+}
+
+bool CanonicalEventFrames(std::string* detail) {
+  struct Case {
+    const char* name;
+    std::vector<uint8_t> frame;
+    MessageType type;
+  };
+  const Case cases[] = {
+      {"session-ready", VectorSessionReadyFrame(), MessageType::SESSION_READY},
+      {"startup-ready", VectorStartupReadyFrame(), MessageType::STARTUP_READY},
+      {"security-ready", VectorSecurityReadyFrame(),
+       MessageType::SECURITY_READY},
+      {"worker-exit", VectorWorkerExitFrame(), MessageType::WORKER_EXIT},
+  };
+  for (const Case& c : cases) {
+    FrameHeader header;
+    const uint8_t* payload = nullptr;
+    size_t payload_len = 0;
+    if (DecodeAndValidateFrame(c.frame.data(), c.frame.size(), &header,
+                               &payload, &payload_len) != DecodeStatus::kOk)
+      return Fail(detail, std::string(c.name) + " frame rejected");
+    if (header.type != c.type || payload_len != 0)
+      return Fail(detail, std::string(c.name) + " wrong type/payload");
+  }
+  // RESULT carries the disposition codec (here, cancelled).
+  const std::vector<uint8_t> result = VectorResultFrame();
+  FrameHeader header;
+  const uint8_t* payload = nullptr;
+  size_t payload_len = 0;
+  ResultPayload p;
+  if (DecodeAndValidateFrame(result.data(), result.size(), &header, &payload,
+                             &payload_len) != DecodeStatus::kOk ||
+      header.type != MessageType::RESULT ||
+      !DecodeResultPayload(payload, payload_len, &p) ||
+      p.disposition != ResultDisposition::kCancelled)
+    return Fail(detail, "result frame decode mismatch");
+  return true;
+}
+
+bool ResultPayloadCodec(std::string* detail) {
+  const uint8_t completed[] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  const uint8_t cancelled[] = {0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00};
+  ResultPayload out;
+  if (!DecodeResultPayload(completed, sizeof(completed), &out) ||
+      out.disposition != ResultDisposition::kCompleted ||
+      !DecodeResultPayload(cancelled, sizeof(cancelled), &out) ||
+      out.disposition != ResultDisposition::kCancelled)
+    return Fail(detail, "result disposition round-trip");
+  // Fail-closed: unknown disposition(2), trailing byte, short, bad schema.
+  const uint8_t bad_disposition[] = {0x01, 0x00, 0x00, 0x00,
+                                     0x02, 0x00, 0x00, 0x00};
+  const uint8_t trailing[] = {0x01, 0x00, 0x00, 0x00, 0x00,
+                              0x00, 0x00, 0x00, 0xFF};
+  const uint8_t short_payload[] = {0x01, 0x00, 0x00, 0x00, 0x00};
+  const uint8_t bad_schema[] = {0x02, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00};
+  if (DecodeResultPayload(bad_disposition, sizeof(bad_disposition), &out) ||
+      DecodeResultPayload(trailing, sizeof(trailing), &out) ||
+      DecodeResultPayload(short_payload, sizeof(short_payload), &out) ||
+      DecodeResultPayload(bad_schema, sizeof(bad_schema), &out))
+    return Fail(detail, "malformed result payload accepted");
   return true;
 }
 
@@ -1816,7 +1934,7 @@ bool RunRoundTrip(std::string* detail) {
 bool RunRejectEngineFilename(std::string* detail) {
   // has_engine_override == 1 but the filename is not a bare payload-dir name.
   const char* bad[] = {"sub\\engine.dll", "sub/engine.dll", "c:engine.dll",
-                       "..", ".", ""};
+                       "..", ".", "", "a..b", "..x", "x.."};
   for (const char* name : bad) {
     StartRunPayload in;
     in.has_engine_override = true;
@@ -2257,6 +2375,7 @@ int main(int argc, char** argv) {
       {"vectors", "canonical-cancel-run-frame", CanonicalCancelRunFrame},
       {"vectors", "canonical-close-session-frame", CanonicalCloseSessionFrame},
       {"vectors", "canonical-relay-frame", CanonicalRelayFrame},
+      {"vectors", "canonical-event-frames", CanonicalEventFrames},
       {"protocol", "sha256-self-test", Sha256SelfTest},
       {"protocol", "header-round-trip", HeaderRoundTrip},
       {"protocol", "magic-reject", MagicReject},
@@ -2278,6 +2397,7 @@ int main(int argc, char** argv) {
       {"messages", "builders-stamp-type", MessagesBuildersStampType},
       {"messages", "correlation", MessagesCorrelation},
       {"messages", "relay-payload", RelayPayloadCodec},
+      {"messages", "result-payload", ResultPayloadCodec},
       {"session", "round-trip", SessionRoundTrip},
       {"session", "reject-counts", SessionRejectCounts},
       {"session", "reject-lying-count", SessionRejectLyingCount},

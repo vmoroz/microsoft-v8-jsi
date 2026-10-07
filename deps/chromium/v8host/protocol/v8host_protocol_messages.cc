@@ -189,11 +189,13 @@ bool ReadVariablePayloadHeader(Reader& reader,
 }
 
 // True iff `name` is a bare payload-directory filename: non-empty, no path
-// separator or drive colon, and not "." or "..". Full canonicalization under the
-// payload dir is the coordinator's Stage-4 job; this is only the wire-format
-// guard that an override can never be an arbitrary path.
+// separator or drive colon, not ".", and with no ".." substring. Full
+// canonicalization under the payload dir is the coordinator's Stage-4 job; this
+// is only the wire-format guard that an override can never be an arbitrary path
+// or traverse out of the payload dir. The predicate is uniform with the client
+// and the spawn/config layers.
 bool IsBareFilename(const std::string& name) {
-  if (name.empty() || name == "." || name == "..")
+  if (name.empty() || name == "." || name.find("..") != std::string::npos)
     return false;
   for (const char c : name) {
     if (c == '\\' || c == '/' || c == ':')
@@ -305,6 +307,30 @@ bool DecodeErrorPayload(const uint8_t* data, size_t size, ErrorPayload* out) {
   p.status_code = static_cast<StatusCode>(status);  // tolerate unknown codes
   if (!reader.GetString(&p.message))  // strict UTF-8 / no NUL / bounded
     return false;
+  if (!reader.AtEnd())
+    return false;
+  *out = p;
+  return true;
+}
+
+void EncodeResultPayload(const ResultPayload& payload, Writer& writer) {
+  writer.PutU16(payload.schema_version);
+  writer.PutU16(payload.reserved);
+  writer.PutU32(static_cast<uint32_t>(payload.disposition));
+}
+
+bool DecodeResultPayload(const uint8_t* data, size_t size, ResultPayload* out) {
+  Reader reader(data, size);
+  ResultPayload p;
+  if (!ReadSchemaPrologue(reader, &p.schema_version, &p.reserved))
+    return false;
+  uint32_t disposition = 0;
+  if (!reader.GetU32(&disposition))
+    return false;
+  if (disposition != static_cast<uint32_t>(ResultDisposition::kCompleted) &&
+      disposition != static_cast<uint32_t>(ResultDisposition::kCancelled))
+    return false;  // fail-closed: unknown terminal disposition
+  p.disposition = static_cast<ResultDisposition>(disposition);
   if (!reader.AtEnd())
     return false;
   *out = p;
@@ -568,6 +594,36 @@ std::vector<uint8_t> BuildCancelRunFrame(FrameHeader header) {
 std::vector<uint8_t> BuildCloseSessionFrame(FrameHeader header) {
   header.type = MessageType::CLOSE_SESSION;
   return AssembleFrame(header, {});
+}
+
+std::vector<uint8_t> BuildSessionReadyFrame(FrameHeader header) {
+  header.type = MessageType::SESSION_READY;
+  return AssembleFrame(header, {});
+}
+
+std::vector<uint8_t> BuildStartupReadyFrame(FrameHeader header) {
+  header.type = MessageType::STARTUP_READY;
+  return AssembleFrame(header, {});
+}
+
+std::vector<uint8_t> BuildSecurityReadyFrame(FrameHeader header) {
+  header.type = MessageType::SECURITY_READY;
+  return AssembleFrame(header, {});
+}
+
+std::vector<uint8_t> BuildWorkerExitFrame(FrameHeader header) {
+  header.type = MessageType::WORKER_EXIT;
+  return AssembleFrame(header, {});
+}
+
+std::vector<uint8_t> BuildResultFrame(FrameHeader header,
+                                      ResultDisposition disposition) {
+  Writer writer;
+  ResultPayload payload;
+  payload.disposition = disposition;
+  EncodeResultPayload(payload, writer);
+  header.type = MessageType::RESULT;
+  return AssembleFrame(header, writer.buffer());
 }
 
 std::vector<uint8_t> BuildRelayFrame(FrameHeader header,

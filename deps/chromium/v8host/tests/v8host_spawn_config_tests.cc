@@ -335,6 +335,12 @@ bool WorkerRejectNonBareEngine(std::string* detail) {
   const std::vector<uint8_t> eb = empty.Encode();
   CHECK(!V8HostWorkerProfileV1::Decode(eb.data(), eb.size(), &out),
         "empty engine must be rejected");
+  // A lone "." is rejected too (uniform bare-filename predicate).
+  V8HostWorkerProfileV1 dot = SampleWorkerProfile();
+  dot.engine_dll = ".";
+  const std::vector<uint8_t> db = dot.Encode();
+  CHECK(!V8HostWorkerProfileV1::Decode(db.data(), db.size(), &out),
+        "lone-dot engine must be rejected");
   return true;
 }
 
@@ -584,6 +590,12 @@ bool SpawnRejectNonBareEngine(std::string* detail) {
   V8HostSpawnConfigV1 out;
   CHECK(!V8HostSpawnConfigV1::Decode(bytes.data(), bytes.size(), &out),
         "non-bare effective engine must be rejected");
+  // A lone "." is rejected too (uniform bare-filename predicate).
+  V8HostSpawnConfigV1 dot = SampleSpawnConfig();
+  dot.engine_dll = ".";
+  const std::vector<uint8_t> db = dot.Encode();
+  CHECK(!V8HostSpawnConfigV1::Decode(db.data(), db.size(), &out),
+        "lone-dot effective engine must be rejected");
   return true;
 }
 
