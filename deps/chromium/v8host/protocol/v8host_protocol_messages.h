@@ -188,6 +188,21 @@ std::vector<uint8_t> BuildCreateSessionFrame(FrameHeader header,
                                              const CreateSessionPayload& payload);
 std::vector<uint8_t> BuildStartRunFrame(FrameHeader header,
                                         const StartRunPayload& payload);
+std::vector<uint8_t> BuildCancelRunFrame(FrameHeader header);
+std::vector<uint8_t> BuildCloseSessionFrame(FrameHeader header);
+
+// Relay payloads are a little-endian signed kind followed by opaque bytes.
+// BuildRelayFrame preserves header.type so the same audited builder serves
+// RELAY_TO_WORKER and RELAY_FROM_WORKER.
+std::vector<uint8_t> BuildRelayFrame(FrameHeader header,
+                                     int32_t kind,
+                                     const uint8_t* data,
+                                     size_t len);
+bool DecodeRelayPayload(const uint8_t* data,
+                        size_t size,
+                        int32_t* out_kind,
+                        const uint8_t** out_body,
+                        size_t* out_body_len);
 
 // ---------------------------------------------------------------------------
 // Version negotiation (design §8.2). Pure decision + frame builder: no pipe or

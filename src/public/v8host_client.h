@@ -64,6 +64,21 @@ extern "C" {
 #define V8HOST_TIER_UNTRUSTED 0  // jitless + ACG (default)
 #define V8HOST_TIER_TRUSTED   1  // JIT, ACG off
 
+// Session-state codes (V8HostSessionStateCb `state`).
+#define V8HOST_SESSION_STATE_CREATING               0
+#define V8HOST_SESSION_STATE_READY                  1
+#define V8HOST_SESSION_STATE_WORKER_STARTUP_READY   2
+#define V8HOST_SESSION_STATE_WORKER_SECURITY_READY  3
+#define V8HOST_SESSION_STATE_CLOSED                 4
+
+// Run-event codes (V8HostRunEventCb `event`). All except STARTED are terminal.
+#define V8HOST_RUN_EVENT_STARTED        0
+#define V8HOST_RUN_EVENT_COMPLETED      1
+#define V8HOST_RUN_EVENT_FAILED         2
+#define V8HOST_RUN_EVENT_CANCELLED      3
+#define V8HOST_RUN_EVENT_WORKER_EXITED  4
+#define V8HOST_RUN_EVENT_BROKER_LOST    5
+
 // Stable result codes. 0 is success; errors are grouped into stable bands by
 // failure class so new codes can be added to a band without renumbering:
 //   0x1000 - caller/argument contract (validated synchronously, fail-closed)

@@ -35,6 +35,16 @@ group("v8host_dispatcher_tests") {
   deps = [ "//v8host:v8host_dispatcher_tests" ]
 }
 
+group("v8host_client_tests") {
+  testonly = true
+  deps = [ "//v8host:v8host_client_tests" ]
+}
+
+group("v8host_layering_tests") {
+  testonly = true
+  deps = [ "//v8host:v8host_layering_tests" ]
+}
+
 group("v8host_spawn_config_tests") {
   testonly = true
   deps = [ "//v8host:v8host_spawn_config_tests" ]

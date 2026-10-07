@@ -157,6 +157,32 @@ std::vector<std::vector<uint8_t>> BuiltinSeeds() {
     p.guest_payload = {0xDE, 0xAD, 0xBE, 0xEF};
     seeds.push_back(BuildStartRunFrame(h, p));
   }
+  {
+    FrameHeader h;
+    h.version_major = kWireVersionMajor;
+    h.version_minor = kWireVersionMinor;
+    h.flags = kFlagMustUnderstand;
+    h.conn_id = 9;
+    h.session_id = 2;
+    h.run_id = 3;
+    h.request_id = 0x32;
+    seeds.push_back(BuildCancelRunFrame(h));
+    h.run_id = 0;
+    h.request_id = 0x33;
+    seeds.push_back(BuildCloseSessionFrame(h));
+  }
+  {
+    FrameHeader h;
+    h.version_major = kWireVersionMajor;
+    h.version_minor = kWireVersionMinor;
+    h.type = MessageType::RELAY_TO_WORKER;
+    h.conn_id = 9;
+    h.session_id = 2;
+    h.run_id = 3;
+    h.request_id = 0x34;
+    const uint8_t body[] = {0xAA, 0x00, 0xBB};
+    seeds.push_back(BuildRelayFrame(h, -2, body, sizeof(body)));
+  }
 
   // A max-payload frame: a valid header whose payload_length is the ceiling,
   // followed by that many opaque bytes (stresses the length path at the limit).
@@ -332,6 +358,10 @@ void ExerciseDecoders(const uint8_t* data, size_t size) {
   DecodeCreateSessionPayload(data, size, &csp);
   StartRunPayload srp;
   DecodeStartRunPayload(data, size, &srp);
+  int32_t kind = 0;
+  const uint8_t* relay_body = nullptr;
+  size_t relay_body_len = 0;
+  DecodeRelayPayload(data, size, &kind, &relay_body, &relay_body_len);
 }
 
 // Drive the bounded Reader over the raw bytes with a pseudo-random op sequence,

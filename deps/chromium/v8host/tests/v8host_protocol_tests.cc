@@ -401,12 +401,52 @@ std::vector<uint8_t> VectorStartRunFrame() {
   return BuildStartRunFrame(h, p);
 }
 
+// V11/V12: header-only run/session controls.
+std::vector<uint8_t> VectorCancelRunFrame() {
+  FrameHeader h;
+  h.version_major = 1;
+  h.version_minor = 0;
+  h.flags = kFlagMustUnderstand;
+  h.conn_id = 9;
+  h.session_id = 2;
+  h.run_id = 3;
+  h.request_id = 0x32;
+  return BuildCancelRunFrame(h);
+}
+
+std::vector<uint8_t> VectorCloseSessionFrame() {
+  FrameHeader h;
+  h.version_major = 1;
+  h.version_minor = 0;
+  h.flags = kFlagMustUnderstand;
+  h.conn_id = 9;
+  h.session_id = 2;
+  h.request_id = 0x33;
+  return BuildCloseSessionFrame(h);
+}
+
+// V13: relay payload = [little-endian i32 kind | opaque bytes].
+std::vector<uint8_t> VectorRelayFrame() {
+  FrameHeader h;
+  h.version_major = 1;
+  h.version_minor = 0;
+  h.type = MessageType::RELAY_TO_WORKER;
+  h.conn_id = 9;
+  h.session_id = 2;
+  h.run_id = 3;
+  h.request_id = 0x34;
+  const uint8_t body[] = {0xAA, 0x00, 0xBB};
+  return BuildRelayFrame(h, -2, body, sizeof(body));
+}
+
 std::vector<std::vector<uint8_t>> CanonicalVectors() {
   return {VectorAllDistinctHeader(),  VectorHelloHeader(),
           VectorWriterPayload(),      VectorFullFrame(),
           VectorHelloFrame(),         VectorHelloAckFrame(),
           VectorAckFrame(),           VectorErrorFrame(),
-          VectorCreateSessionFrame(), VectorStartRunFrame()};
+          VectorCreateSessionFrame(), VectorStartRunFrame(),
+          VectorCancelRunFrame(),     VectorCloseSessionFrame(),
+          VectorRelayFrame()};
 }
 
 std::vector<uint8_t> CanonicalConcat() {
@@ -422,7 +462,7 @@ std::vector<uint8_t> CanonicalConcat() {
 // value on x86/x64/arm64 IS the cross-arch equality gate and any wire/byte
 // change trips it. Update this ONLY together with a deliberate wire change.
 constexpr const char kExpectedVectorsSha256[] =
-    "b885520dcb3dc1ad9ccf0d9c07baba850eec4b56b09041d03e97b723daf8efef";
+    "91eebc27c9b9f08ea4995a8ee75b53e95c815fdf3dbfebac7a269b2ecd67acb3";
 
 // Hard-coded expected bytes (computed independently). These exact-byte asserts
 // are the cross-arch contract: any arch must produce precisely these bytes.
@@ -491,6 +531,22 @@ const uint8_t kExpectStartRunFrame[86] = {
     0x65, 0x6E, 0x67, 0x69, 0x6E, 0x65, 0x2E, 0x64, 0x6C, 0x6C, 0x08, 0x00,
     0x00, 0x00, 0x73, 0x6E, 0x61, 0x70, 0x2E, 0x62, 0x69, 0x6E, 0xDE, 0xAD,
     0xBE, 0xEF};
+
+const uint8_t kExpectCancelRunFrame[32] = {
+    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x01,
+    0x00, 0x09, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00,
+    0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+const uint8_t kExpectCloseSessionFrame[32] = {
+    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x07, 0x00, 0x01,
+    0x00, 0x09, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+const uint8_t kExpectRelayFrame[39] = {
+    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+    0x00, 0x09, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00,
+    0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0xFE,
+    0xFF, 0xFF, 0xFF, 0xAA, 0x00, 0xBB};
 
 // ---------------------------------------------------------------------------
 // vectors suite.
@@ -563,6 +619,47 @@ bool CanonicalCreateSessionFrame(std::string* detail) {
 bool CanonicalStartRunFrame(std::string* detail) {
   return CheckBytes("start-run-frame", VectorStartRunFrame(),
                     kExpectStartRunFrame, sizeof(kExpectStartRunFrame), detail);
+}
+
+bool CanonicalCancelRunFrame(std::string* detail) {
+  return CheckBytes("cancel-run-frame", VectorCancelRunFrame(),
+                    kExpectCancelRunFrame, sizeof(kExpectCancelRunFrame), detail);
+}
+
+bool CanonicalCloseSessionFrame(std::string* detail) {
+  return CheckBytes("close-session-frame", VectorCloseSessionFrame(),
+                    kExpectCloseSessionFrame, sizeof(kExpectCloseSessionFrame),
+                    detail);
+}
+
+bool CanonicalRelayFrame(std::string* detail) {
+  return CheckBytes("relay-frame", VectorRelayFrame(), kExpectRelayFrame,
+                    sizeof(kExpectRelayFrame), detail);
+}
+
+bool RelayPayloadCodec(std::string* detail) {
+  const std::vector<uint8_t> frame = VectorRelayFrame();
+  FrameHeader header;
+  const uint8_t* payload = nullptr;
+  size_t payload_len = 0;
+  if (DecodeAndValidateFrame(frame.data(), frame.size(), &header, &payload,
+                             &payload_len) != DecodeStatus::kOk) {
+    return Fail(detail, "relay frame rejected");
+  }
+  int32_t kind = 0;
+  const uint8_t* body = nullptr;
+  size_t body_len = 0;
+  if (!DecodeRelayPayload(payload, payload_len, &kind, &body, &body_len) ||
+      kind != -2 || body_len != 3 || body[0] != 0xAA || body[1] != 0 ||
+      body[2] != 0xBB) {
+    return Fail(detail, "relay payload mismatch");
+  }
+  if (DecodeRelayPayload(payload, 3, &kind, &body, &body_len) ||
+      DecodeRelayPayload(nullptr, 4, &kind, &body, &body_len) ||
+      DecodeRelayPayload(payload, payload_len, nullptr, &body, &body_len)) {
+    return Fail(detail, "malformed relay payload accepted");
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2157,6 +2254,9 @@ int main(int argc, char** argv) {
       {"vectors", "canonical-error-frame", CanonicalErrorFrame},
       {"vectors", "canonical-create-session-frame", CanonicalCreateSessionFrame},
       {"vectors", "canonical-start-run-frame", CanonicalStartRunFrame},
+      {"vectors", "canonical-cancel-run-frame", CanonicalCancelRunFrame},
+      {"vectors", "canonical-close-session-frame", CanonicalCloseSessionFrame},
+      {"vectors", "canonical-relay-frame", CanonicalRelayFrame},
       {"protocol", "sha256-self-test", Sha256SelfTest},
       {"protocol", "header-round-trip", HeaderRoundTrip},
       {"protocol", "magic-reject", MagicReject},
@@ -2177,6 +2277,7 @@ int main(int argc, char** argv) {
       {"messages", "reject-error-string", MessagesRejectErrorString},
       {"messages", "builders-stamp-type", MessagesBuildersStampType},
       {"messages", "correlation", MessagesCorrelation},
+      {"messages", "relay-payload", RelayPayloadCodec},
       {"session", "round-trip", SessionRoundTrip},
       {"session", "reject-counts", SessionRejectCounts},
       {"session", "reject-lying-count", SessionRejectLyingCount},

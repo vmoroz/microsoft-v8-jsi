@@ -560,6 +560,46 @@ std::vector<uint8_t> BuildStartRunFrame(FrameHeader header,
   return AssembleFrame(header, writer.buffer());
 }
 
+std::vector<uint8_t> BuildCancelRunFrame(FrameHeader header) {
+  header.type = MessageType::CANCEL_RUN;
+  return AssembleFrame(header, {});
+}
+
+std::vector<uint8_t> BuildCloseSessionFrame(FrameHeader header) {
+  header.type = MessageType::CLOSE_SESSION;
+  return AssembleFrame(header, {});
+}
+
+std::vector<uint8_t> BuildRelayFrame(FrameHeader header,
+                                     int32_t kind,
+                                     const uint8_t* data,
+                                     size_t len) {
+  Writer writer;
+  writer.PutU32(static_cast<uint32_t>(kind));
+  if (len != 0)
+    writer.PutBytes(data, len);
+  return AssembleFrame(header, writer.buffer());
+}
+
+bool DecodeRelayPayload(const uint8_t* data,
+                        size_t size,
+                        int32_t* out_kind,
+                        const uint8_t** out_body,
+                        size_t* out_body_len) {
+  if (data == nullptr || size < sizeof(uint32_t) || out_kind == nullptr ||
+      out_body == nullptr || out_body_len == nullptr) {
+    return false;
+  }
+  Reader reader(data, size);
+  uint32_t kind = 0;
+  if (!reader.GetU32(&kind))
+    return false;
+  *out_kind = static_cast<int32_t>(kind);
+  *out_body = data + sizeof(uint32_t);
+  *out_body_len = size - sizeof(uint32_t);
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Version negotiation.
 // ---------------------------------------------------------------------------

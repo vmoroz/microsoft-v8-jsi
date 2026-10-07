@@ -45,6 +45,13 @@ std::atomic<int>& LiveCounter() {
   return counter;
 }
 
+#ifdef V8HOST_DISPATCHER_TESTING
+std::atomic<bool>& FailNextCallbackCopy() {
+  static std::atomic<bool> fail{false};
+  return fail;
+}
+#endif
+
 // RAII holder for a counted SessionDispatch reference. The id-keyed producer API
 // AddRef's the target under `sessions_mutex_` (so the lookup cannot race the
 // object's destruction), then dispatches through this holder, which Releases the
@@ -66,6 +73,12 @@ class SessionRef {
 };
 
 }  // namespace
+
+#ifdef V8HOST_DISPATCHER_TESTING
+void FailNextCallbackCopyForTesting() {
+  FailNextCallbackCopy().store(true, std::memory_order_release);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Dispatcher
@@ -302,6 +315,11 @@ V8HostStatus SessionDispatch::SetCallbacks(const V8HostCallbacks* callbacks) {
   // the known fields are read.
   if (callbacks->struct_size < sizeof(V8HostCallbacks))
     return V8HOST_E_STRUCT_SIZE;
+
+#ifdef V8HOST_DISPATCHER_TESTING
+  if (FailNextCallbackCopy().exchange(false, std::memory_order_acq_rel))
+    return V8HOST_E_NO_MEMORY;
+#endif
 
   V8HostCallbacks copy = {};
   copy.struct_size = sizeof(V8HostCallbacks);

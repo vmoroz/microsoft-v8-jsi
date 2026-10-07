@@ -562,9 +562,8 @@ function compileVersionResources(outDir: string, targetCpu: TargetCpu): void {
 
 interface SandboxBinary {
   file: string;
-  // Every exported symbol name must start with one of these prefixes. An empty
-  // array means the binary must export nothing.
-  allowedExportPrefixes: string[];
+  // Exact export set. An empty array means the binary must export nothing.
+  allowedExports: string[];
   // Optional size ceiling (bytes). Footprint budget — guards against silent
   // bloat. Only binaries with a budget are size-checked; omit to skip.
   maxBytes?: number;
@@ -574,23 +573,31 @@ interface SandboxBinary {
 //   sbox.exe    — the single-image container: exports NOTHING. SBOX_STATIC makes
 //                 the statically-linked sbox_* core resolve at link time rather
 //                 than through the EXE's export table.
-//   v8host.dll  — the engine payload: exports only the single sbox_plugin_main
-//                 plugin-ABI entry the container resolves by name.
+//   v8host.dll  — the engine payload: exports the single plugin-ABI entry plus
+//                 the seven approved Contract C client entry points.
 const sandboxBinaries: SandboxBinary[] = [
   // sbox.exe budget: <= 2 MiB (measured ~1.76 MiB; floor at the Hybrid CRT).
-  { file: "sbox.exe", allowedExportPrefixes: [], maxBytes: 2 * 1024 * 1024 },
+  { file: "sbox.exe", allowedExports: [], maxBytes: 2 * 1024 * 1024 },
   // v8host.dll budget: <= 512 KiB (measured ~0.36 MiB for the real V8/JSI engine
   // persona — the engine DLL itself is LoadLibrary'd at runtime, so this is just
   // the plugin + JSI C++ API glue).
   {
     file: "v8host.dll",
-    allowedExportPrefixes: ["sbox_plugin_main"],
+    allowedExports: [
+      "sbox_plugin_main",
+      "v8host_client_cancel_run",
+      "v8host_client_close_session",
+      "v8host_client_create_session",
+      "v8host_client_initialize",
+      "v8host_client_post_message",
+      "v8host_client_set_callbacks",
+      "v8host_client_start_run",
+    ],
     maxBytes: 512 * 1024,
   },
 ];
 
-// Gate 1: export allowlist. Every export of every sandbox binary must match its
-// allowed prefixes. Returns true if all binaries pass.
+// Gate 1: exact export allowlist. Returns true if all binaries pass.
 function checkSandboxExports(outDir: string): boolean {
   console.log("\n=== Sandbox export allowlist ===\n");
   let ok = true;
@@ -602,22 +609,23 @@ function checkSandboxExports(outDir: string): boolean {
       continue;
     }
     const names = dumpbinExportNames(filePath);
-    const stray = names.filter(
-      (n) => !bin.allowedExportPrefixes.some((p) => n.startsWith(p)),
-    );
+    const expected = new Set(bin.allowedExports);
+    const actual = new Set(names);
+    const stray = names.filter((n) => !expected.has(n));
+    const missing = bin.allowedExports.filter((n) => !actual.has(n));
     const allowed =
-      bin.allowedExportPrefixes.length === 0
+      bin.allowedExports.length === 0
         ? "(none)"
-        : bin.allowedExportPrefixes.map((p) => `${p}*`).join(", ");
-    if (stray.length === 0) {
+        : bin.allowedExports.join(", ");
+    if (stray.length === 0 && missing.length === 0) {
       console.log(
-        `  OK   ${bin.file}: ${names.length} export(s), all match [${allowed}]`,
+        `  OK   ${bin.file}: exact ${names.length}-symbol export set [${allowed}]`,
       );
     } else {
       ok = false;
       console.error(
-        `  FAIL ${bin.file}: ${stray.length} disallowed export(s) ` +
-          `(allowed: [${allowed}]): ${stray.join(", ")}`,
+        `  FAIL ${bin.file}: export set differs (expected: [${allowed}]); ` +
+          `unexpected: [${stray.join(", ")}]; missing: [${missing.join(", ")}]`,
       );
     }
   }

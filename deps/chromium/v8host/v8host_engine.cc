@@ -1,7 +1,7 @@
 // v8host_engine.cc — the REAL V8/JSI engine persona of v8host.dll, driven by the
-// product sbox.exe container over the sbox.h plugin ABI. It implements the plugin
-// vtable (configure/warmup/run/shutdown) behind a single resolved-by-name export,
-// sbox_plugin_main; sbox.exe stays generic and resolves everything by name.
+// product sbox.exe container over the sbox.h plugin ABI. It implements the
+// configure/warmup/run/shutdown callbacks; v8host_plugin.cc composes them with
+// the coordinator callback into the exported plugin vtable.
 //
 // Control inversion: the container (sbox.exe) owns main() and the sandbox
 // lifecycle; this DLL links ONLY sbox.h (never the sandbox core) and reaches the
@@ -30,10 +30,8 @@
 // callback that wires the task runner) stays on the C ABI, because that IS the
 // ABI boundary.
 
-// SBOX_PLUGIN_IMPL (set by the BUILD.gn target) makes sbox.h export this DLL's
-// single sbox_plugin_main entry.
 #include "sbox.h"
-#include "v8host_broker.h"
+#include "v8host_engine.h"
 #include "v8host_spawn_apply.h"  // ApplySpawnConfig + the spawn/worker-profile codec
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -501,8 +499,8 @@ const char* kDemoJs =
 // (DLL load, --jitless, snapshot deserialize, runtime create) happens here.
 // Returns sbox_ok on success, non-zero (fail-closed) otherwise.
 //==========================================================================
-static sbox_status SBOX_CALL Warmup(sbox_worker w,
-                                    const sbox_worker_api* api) {
+sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
+                                         const sbox_worker_api* api) {
   if (!w || !api || api->struct_size < sizeof(sbox_worker_api))
     return sbox_error_args;
   g_worker = w;
@@ -684,8 +682,8 @@ static sbox_status SBOX_CALL Warmup(sbox_worker w,
 // under jitless, safe post-ACG) and own the JS thread in the message loop until
 // the host closes the channel. Returns sbox_ok on clean completion.
 //==========================================================================
-static sbox_status SBOX_CALL Run(sbox_worker worker,
-                                 const sbox_worker_api* api) {
+sbox_status SBOX_CALL V8HostEngineRun(sbox_worker worker,
+                                      const sbox_worker_api* api) {
   if (!worker || !api || api->struct_size < sizeof(sbox_worker_api))
     return sbox_error_args;
   g_worker = worker;
@@ -783,7 +781,7 @@ static sbox_status SBOX_CALL Run(sbox_worker worker,
 // destruction fires TaskRunnerDeleteCb, which touches g_tasks), then free the
 // engine handle.
 //==========================================================================
-static void SBOX_CALL Shutdown(sbox_worker /*w*/) {
+void SBOX_CALL V8HostEngineShutdown(sbox_worker /*w*/) {
   if (g_rt) {
     delete g_rt;
     g_rt = nullptr;
@@ -835,10 +833,10 @@ static void BuildDevSpawnConfig(v8host::V8HostSpawnConfigV1& spawn) {
   spawn.snapshot_path = WideToUtf8(EnvW(L"V8HOST_SNAPSHOT"));
 }
 
-static sbox_status SBOX_CALL Configure(sbox_config cfg,
-                                       const sbox_config_api* api,
-                                       const void* configure_data,
-                                       size_t configure_data_size) {
+sbox_status SBOX_CALL V8HostEngineConfigure(sbox_config cfg,
+                                            const sbox_config_api* api,
+                                            const void* configure_data,
+                                            size_t configure_data_size) {
   if (!cfg || !api || api->struct_size < sizeof(sbox_config_api))
     return sbox_error_args;
   if ((configure_data_size && !configure_data) ||
@@ -866,28 +864,5 @@ static sbox_status SBOX_CALL Configure(sbox_config cfg,
     printf("[v8host] configure: ApplySpawnConfig failed (fail closed)\n");
     return sbox_error;
   }
-  return sbox_ok;
-}
-
-static sbox_status SBOX_CALL BrokerRun(sbox_broker broker,
-                                       const sbox_broker_api* api,
-                                       const sbox_broker_start* start) {
-  return V8HostBrokerRun(broker, api, start);
-}
-
-// The plugin vtable + its single resolved-by-name export. sbox.exe calls
-// sbox_plugin_main(host_abi_version), version-checks, then drives the vtable.
-static const sbox_plugin g_plugin = {sizeof(sbox_plugin), SBOX_ABI_VERSION,
-                                     &Configure,          &BrokerRun,
-                                     &Warmup,             &Run,
-                                     &Shutdown};
-
-extern "C" __declspec(dllexport) sbox_status SBOX_CALL sbox_plugin_main(
-    uint32_t host_abi_version, const sbox_plugin** out) {
-  if (!out)
-    return sbox_error_args;
-  if (host_abi_version != SBOX_ABI_VERSION)
-    return sbox_error_version;
-  *out = &g_plugin;
   return sbox_ok;
 }

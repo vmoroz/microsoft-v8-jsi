@@ -42,6 +42,12 @@
 
 namespace v8host::client {
 
+#ifdef V8HOST_DISPATCHER_TESTING
+// Compiled only into test executables that separately compile the dispatcher.
+// Fails the next callback-table copy at the actual SessionDispatch boundary.
+void FailNextCallbackCopyForTesting();
+#endif
+
 // Fixed, documented cap on the number of callback events buffered per session
 // before the app thread must drain. Reaching it means the consumer stopped
 // pumping its message loop; the session is failed with one terminal

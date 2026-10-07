@@ -19,6 +19,9 @@ Files
   error.bin            valid ERROR frame (ERROR_QUOTA + short message)
   create_session.bin   valid CREATE_SESSION frame (AppContainer, 2 rules, 2 caps)
   start_run.bin        valid START_RUN frame (engine override + snapshot + guest)
+  cancel_run.bin       valid header-only CANCEL_RUN frame
+  close_session.bin    valid header-only CLOSE_SESSION frame
+  relay.bin            valid RELAY_TO_WORKER frame (i32 kind + opaque bytes)
   max_payload.bin      header with payload_length at the ceiling (65528) + body
   truncated.bin        a HELLO frame cut short (incomplete header)
   reserved_flags.bin   a valid HELLO with a reserved flag bit set
