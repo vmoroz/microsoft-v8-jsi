@@ -340,6 +340,12 @@ decltype(&v8_jsi_config_set_startup_snapshot) g_set_snapshot = nullptr;
 std::string g_snapshot_blob;
 bool g_have_snapshot = false;
 
+// Whether ACG must be in force post-lockdown. Stashed in warmup from the bound
+// worker profile's jitless tier: untrusted (jitless) => ACG enforced; trusted
+// (JIT) => ACG off. The post-lockdown probe is gated by this so a trusted worker
+// is not failed for (correctly) being allowed to allocate executable memory.
+bool g_expect_acg = true;
+
 jsi_error_code JSI_CDECL ConfigureRuntime(void* /*cb_data*/, jsi_config cfg) {
   if (g_set_task_runner)
     g_set_task_runner(cfg, g_tasks, &PostTaskCb, &TaskRunnerDeleteCb, nullptr);
@@ -529,6 +535,7 @@ sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
     }
   }
   const bool jitless = prof.jitless != 0;
+  g_expect_acg = jitless;  // untrusted (jitless) => ACG enforced post-lockdown
   std::wstring engine_dll = Utf8ToWide(prof.engine_dll);
   printf("[v8host] tier = %s\n",
          jitless ? "Untrusted (jitless + ACG)" : "Trusted (JIT, ACG off)");
@@ -537,8 +544,10 @@ sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
     return sbox_error;
   }
 
-  // Startup snapshot from the run profile (read NOW, pre-lockdown). A set-but-
-  // unreadable path is a warning, not fatal (falls back to a normal runtime).
+  // Startup snapshot from the run profile (read NOW, pre-lockdown). A bound
+  // profile with a non-empty snapshot_path REQUIRES that snapshot: an unreadable
+  // path is fatal (fail-closed, design §8.6), never a silent normal-runtime
+  // fallback. An empty snapshot_path means no snapshot was requested.
   const std::wstring snapshot_path = Utf8ToWide(prof.snapshot_path);
   if (!snapshot_path.empty()) {
     if (ReadFileBytes(snapshot_path, g_snapshot_blob)) {
@@ -546,8 +555,9 @@ sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
       printf("[v8host] startup snapshot from %ls (%zu bytes)\n",
              snapshot_path.c_str(), g_snapshot_blob.size());
     } else {
-      printf("[v8host] WARNING: snapshot %ls could not be read; creating a "
-             "normal runtime\n", snapshot_path.c_str());
+      printf("[v8host] warmup: bound startup snapshot %ls could not be read; "
+             "failing closed\n", snapshot_path.c_str());
+      return sbox_error;
     }
   }
 
@@ -627,14 +637,13 @@ sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
                    g_snapshot_blob.size());
       if (code != 0) {
         const char* why = p_compat_str ? p_compat_str(code) : "incompatible";
-        printf("[v8host] WARNING: startup snapshot rejected (%s); continuing "
-               "without it\n", why);
-        g_have_snapshot = false;
+        printf("[v8host] warmup: bound startup snapshot rejected (%s); failing "
+               "closed\n", why);
         g_snapshot_blob.clear();
         g_snapshot_blob.shrink_to_fit();
-      } else {
-        printf("[v8host] startup snapshot compatible with engine\n");
+        return sbox_error;
       }
+      printf("[v8host] startup snapshot compatible with engine\n");
     }
   }
 
@@ -696,8 +705,13 @@ sbox_status SBOX_CALL V8HostEngineRun(sbox_worker worker,
                    : "BLOCKED (ACG in force)",
          err);
   PrintAcgStatus();
-  if (exec_post)
-    return sbox_error;  // dynamic code allowed post-lockdown -> ACG failure
+  // Gate by the bound tier (stashed in warmup). Untrusted (jitless) MUST have ACG
+  // in force post-lockdown (executable alloc blocked -> error 1655); trusted (JIT)
+  // MUST be able to allocate executable memory. Either inconsistency fails closed.
+  if (g_expect_acg && exec_post)
+    return sbox_error;  // untrusted but dynamic code allowed -> ACG failure
+  if (!g_expect_acg && !exec_post)
+    return sbox_error;  // trusted but executable alloc blocked -> inconsistent
 
   if (!g_rt) {
     printf("[v8host] run: no runtime (warmup did not complete)\n");
