@@ -30,6 +30,11 @@ group("v8host_protocol_tests") {
   deps = [ "//v8host:v8host_protocol_tests" ]
 }
 
+group("v8host_run_envelope_tests") {
+  testonly = true
+  deps = [ "//v8host:v8host_run_envelope_tests" ]
+}
+
 group("v8host_dispatcher_tests") {
   testonly = true
   deps = [ "//v8host:v8host_dispatcher_tests" ]

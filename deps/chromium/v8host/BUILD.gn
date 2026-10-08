@@ -91,6 +91,23 @@ static_library("spawn_config") {
   public_configs = [ ":spawn_config_config" ]
 }
 
+# The neutral run-envelope codec (Stage 4): multiplexes per-run START/RELAY/CANCEL
+# and RESULT/RUN_ERROR over the worker channel's opaque frames. Neutral like
+# :spawn_config (no pipe/process/policy/auth symbol), so both the engine and the
+# coordinator may link it.
+config("run_envelope_config") {
+  include_dirs = [ "common" ]
+}
+
+static_library("run_envelope") {
+  sources = [
+    "common/v8host_run_envelope.cc",
+    "common/v8host_run_envelope.h",
+  ]
+  public_deps = [ ":protocol" ]
+  public_configs = [ ":run_envelope_config" ]
+}
+
 # The app-thread callback dispatcher (Stage 3): pure client-side threading that
 # marshals session/run/relay/disconnect callbacks onto the captured app thread
 # through a message-only window + bounded per-session queues. Deliberately
@@ -275,6 +292,19 @@ executable("v8host_protocol_tests") {
     "tests/v8host_test_support.h",
   ]
   deps = [ ":protocol" ]
+}
+
+# Deterministic, in-process conformance tests for the neutral run-envelope codec
+# (:run_envelope): round-trips + reject paths over pure byte vectors, no pipes or
+# spawned processes. Mirrors v8host_protocol_tests.
+executable("v8host_run_envelope_tests") {
+  testonly = true
+  sources = [
+    "tests/v8host_run_envelope_tests.cc",
+    "tests/v8host_test_support.cc",
+    "tests/v8host_test_support.h",
+  ]
+  deps = [ ":run_envelope" ]
 }
 
 # Deterministic in-process fuzz harness for //v8host:protocol. Mutates a built-in
