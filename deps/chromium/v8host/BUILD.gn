@@ -215,6 +215,7 @@ source_set("engine_persona") {
   # only through sbox.h's sbox_worker_api.
   deps = [
     "//jsi_cpp",
+    ":run_envelope",
     ":spawn_config",
   ]
   defines = [ "SBOX_PLUGIN_IMPL" ]

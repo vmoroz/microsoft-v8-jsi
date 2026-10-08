@@ -32,6 +32,7 @@
 
 #include "sbox.h"
 #include "v8host_engine.h"
+#include "v8host_run_envelope.h"  // neutral per-run START/RELAY/CANCEL/RESULT codec
 #include "v8host_spawn_apply.h"  // ApplySpawnConfig + the spawn/worker-profile codec
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -46,6 +47,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <string>
@@ -346,6 +348,15 @@ bool g_have_snapshot = false;
 // is not failed for (correctly) being allowed to allocate executable memory.
 bool g_expect_acg = true;
 
+// Per-run dispatch state (mutated only on the JS thread). A coordinator START
+// envelope makes a run active; the dev-ambient path (the `sbox.exe --broker`
+// smoke) keeps this 0 so guest output posts bare and inbound bare frames reach
+// host.onmessage exactly as before. g_run_complete_requested is set by the
+// neutral host.complete() and consumed by the run loop to emit a single
+// RESULT(kCompleted).
+uint32_t g_active_run_id = 0;
+bool g_run_complete_requested = false;
+
 jsi_error_code JSI_CDECL ConfigureRuntime(void* /*cb_data*/, jsi_config cfg) {
   if (g_set_task_runner)
     g_set_task_runner(cfg, g_tasks, &PostTaskCb, &TaskRunnerDeleteCb, nullptr);
@@ -360,6 +371,60 @@ jsi_error_code JSI_CDECL ConfigureRuntime(void* /*cb_data*/, jsi_config cfg) {
     g_set_snapshot(cfg, reinterpret_cast<const uint8_t*>(g_snapshot_blob.data()),
                    g_snapshot_blob.size(), nullptr, nullptr);
   return jsi_no_error;
+}
+
+//==========================================================================
+// Private run-envelope plumbing (design §10). The worker channel carries opaque
+// string/binary frames; a coordinator-driven run multiplexes per-run control
+// through the neutral run-envelope codec that rides those frames. The guest can
+// never set env_type: the engine (trusted) wraps all guest output as RELAY and
+// emits RESULT/RUN_ERROR itself. The dev-ambient path (no active run) stays bare.
+//==========================================================================
+
+// Post an encoded envelope frame on the worker channel. The carrier kind is
+// binary; the coordinator decodes any string/binary frame as an envelope
+// (design §8.3), so the carrier kind is not itself semantic.
+sbox_status PostEnvelope(const v8host::RunEnvelope& env) {
+  const std::vector<uint8_t> frame = v8host::EncodeRunEnvelope(env);
+  return g_api->post_message(g_worker, sbox_msg_binary, frame.data(),
+                             frame.size());
+}
+
+// Route guest output (host.postMessage / postMessageBinary / a host.complete
+// value). During an active run it is wrapped as a RELAY envelope scoped to that
+// run; dev-ambient it is posted bare, preserving the generic smoke.
+sbox_status PostGuestOutput(sbox_msg_kind kind, const void* data, size_t len) {
+  if (g_active_run_id == 0)
+    return g_api->post_message(g_worker, kind, data, len);
+  v8host::RunEnvelope env;
+  env.type = v8host::RunEnvelopeType::kRelay;
+  env.run_id = g_active_run_id;
+  env.relay_kind = static_cast<int32_t>(kind);
+  const auto* p = static_cast<const uint8_t*>(data);
+  env.payload.assign(p, p + len);
+  return PostEnvelope(env);
+}
+
+// Terminal emitters (worker -> broker). RESULT carries only the disposition (no
+// guest bytes, design §4.2); RUN_ERROR carries a status plus a bounded, redacted
+// diagnostic — the specific JS error text is logged host-side only, never on the
+// wire.
+void EmitRunResult(uint32_t run_id, v8host::RunEnvelopeDisposition disposition) {
+  v8host::RunEnvelope env;
+  env.type = v8host::RunEnvelopeType::kResult;
+  env.run_id = run_id;
+  env.disposition = disposition;
+  PostEnvelope(env);
+}
+
+void EmitRunError(uint32_t run_id) {
+  v8host::RunEnvelope env;
+  env.type = v8host::RunEnvelopeType::kRunError;
+  env.run_id = run_id;
+  env.status_code =
+      static_cast<uint32_t>(v8host::protocol::StatusCode::ERROR_INTERNAL);
+  env.message = "guest run failed";  // redacted; detail stays in the host log
+  PostEnvelope(env);
 }
 
 //==========================================================================
@@ -382,8 +447,8 @@ void InstallHostObject(Runtime& rt) {
             MarkFirstPost();
             if (count >= 1 && args[0].isString()) {
               std::string s = args[0].getString(rt).utf8(rt);
-              const sbox_status result = g_api->post_message(
-                  g_worker, sbox_msg_string, s.data(), s.size());
+              const sbox_status result =
+                  PostGuestOutput(sbox_msg_string, s.data(), s.size());
               if (result != sbox_ok) {
                 throw JSError(rt, "host.postMessage failed: result=" +
                                      std::to_string(static_cast<int>(result)));
@@ -403,14 +468,41 @@ void InstallHostObject(Runtime& rt) {
               Object o = args[0].getObject(rt);
               if (o.isArrayBuffer(rt)) {
                 ArrayBuffer ab = o.getArrayBuffer(rt);
-                const sbox_status result = g_api->post_message(
-                    g_worker, sbox_msg_binary, ab.data(rt), ab.size(rt));
+                const sbox_status result =
+                    PostGuestOutput(sbox_msg_binary, ab.data(rt), ab.size(rt));
                 if (result != sbox_ok) {
                   throw JSError(rt, "host.postMessageBinary failed: result=" +
                                        std::to_string(static_cast<int>(result)));
                 }
               }
             }
+            return Value::undefined();
+          }));
+
+  // host.complete(optionalValue): the neutral run-completion signal (design
+  // §10.3). Any provided string/ArrayBuffer rides the ordinary RELAY path first
+  // (RESULT carries no guest bytes); then the run loop emits RESULT(kCompleted).
+  // Dev-ambient (no active run) it just posts any value bare and is otherwise a
+  // no-op, since only a coordinator run has a RESULT channel.
+  host.setProperty(
+      rt, "complete",
+      Function::createFromHostFunction(
+          rt, PropNameID::forAscii(rt, "complete"), 1,
+          [](Runtime& rt, const Value&, const Value* args,
+             size_t count) -> Value {
+            if (count >= 1) {
+              if (args[0].isString()) {
+                std::string s = args[0].getString(rt).utf8(rt);
+                PostGuestOutput(sbox_msg_string, s.data(), s.size());
+              } else if (args[0].isObject()) {
+                Object o = args[0].getObject(rt);
+                if (o.isArrayBuffer(rt)) {
+                  ArrayBuffer ab = o.getArrayBuffer(rt);
+                  PostGuestOutput(sbox_msg_binary, ab.data(rt), ab.size(rt));
+                }
+              }
+            }
+            g_run_complete_requested = true;
             return Value::undefined();
           }));
 
@@ -452,21 +544,45 @@ void DeliverToJs(Runtime& rt, sbox_msg_kind kind, const void* data,
   }
 }
 
-// Drain context: the runtime + counts of what JS received (for the scorecard).
-struct DrainCtx {
-  Runtime* rt;
-  int strings = 0;
+// True iff host.onmessage is currently a callable function. Used to detect a run
+// that completed by top-level return without installing a handler.
+bool HasOnMessageHandler(Runtime& rt) {
+  Value host_v = rt.global().getProperty(rt, "host");
+  if (!host_v.isObject())
+    return false;
+  Object host = host_v.getObject(rt);
+  Value cb_v = host.getProperty(rt, "onmessage");
+  return cb_v.isObject() && cb_v.getObject(rt).isFunction(rt);
+}
+
+// Clear host.onmessage so a prior run's handler cannot leak into the next run
+// started on the same warmed runtime (design §10.3 "reset host handlers").
+void ResetHostHandlers(Runtime& rt) {
+  Value host_v = rt.global().getProperty(rt, "host");
+  if (host_v.isObject())
+    host_v.getObject(rt).setProperty(rt, "onmessage", Value::undefined());
+}
+
+// Run-loop context: the runtime, the dev-ambient scorecard, a fatal-failure
+// flag, and the per-run dispatch state (design §10.3-§10.4). pending_starts is
+// the admitted-but-not-yet-begun START FIFO; the loop begins one run at a time
+// (serialized over the single JS thread). cancel/error are set while servicing
+// the active run and drive its terminal.
+struct RunLoopCtx {
+  Runtime* rt = nullptr;
+  int strings = 0;   // dev-ambient bare frames delivered to host.onmessage
   int binaries = 0;
-  bool failed = false;
+  bool failed = false;  // fatal engine failure (dev-ambient path)
+  std::deque<v8host::RunEnvelope> pending_starts;
+  bool cancel_active = false;  // CANCEL seen for the active run
+  bool run_error = false;      // uncaught JS error in the active run
 };
 
-// Invoked by the container's drain_messages (C code) — exceptions must NOT cross
-// back into C, so catch everything here.
-void SBOX_CALL OnInbound(void* ctx, sbox_msg_kind kind, const void* data,
-                         size_t len) {
-  auto* c = static_cast<DrainCtx*>(ctx);
-  if (c->failed)
-    return;
+// Deliver a bare dev-ambient frame to host.onmessage (string/binary), counting
+// it for the scorecard. Fatal on an invalid kind or a thrown handler, exactly as
+// before the run-dispatch rework.
+void DeliverAmbient(RunLoopCtx* c, sbox_msg_kind kind, const void* data,
+                    size_t len) {
   if (kind == sbox_msg_string)
     ++c->strings;
   else if (kind == sbox_msg_binary)
@@ -484,6 +600,140 @@ void SBOX_CALL OnInbound(void* ctx, sbox_msg_kind kind, const void* data,
   } catch (...) {
     printf("[v8host] onmessage threw (unknown)\n");
     c->failed = true;
+  }
+}
+
+// Invoked by the container's drain_messages (C code) — exceptions must NOT cross
+// back into C, so catch everything here. Branches each frame (design §10.3): a
+// bare frame (no envelope magic) is the dev-ambient path; an envelope is a
+// coordinator-driven START/RELAY/CANCEL.
+void SBOX_CALL OnInbound(void* ctx, sbox_msg_kind kind, const void* data,
+                         size_t len) {
+  auto* c = static_cast<RunLoopCtx*>(ctx);
+  if (c->failed)
+    return;
+  const auto* bytes = static_cast<const uint8_t*>(data);
+
+  if (!v8host::IsRunEnvelope(bytes, len)) {
+    DeliverAmbient(c, kind, data, len);
+    return;
+  }
+
+  v8host::RunEnvelope env;
+  if (!v8host::DecodeRunEnvelope(bytes, len, &env)) {
+    printf("[v8host] dropping malformed run envelope (%zu bytes)\n", len);
+    return;  // fail-closed: never act on an undecodable control frame
+  }
+  switch (env.type) {
+    case v8host::RunEnvelopeType::kStart:
+      // Begun by the loop; JS eval happens off the C drain callback.
+      c->pending_starts.push_back(std::move(env));
+      break;
+    case v8host::RunEnvelopeType::kRelay: {
+      // Deliver only to the active run, and only while it is still servicing (a
+      // pending cancel/complete/error stops servicing, design §10.3). A relay for
+      // a not-yet-active or already-finished run is dropped + logged: the
+      // coordinator holds each run's relays until that run becomes active and
+      // stops relaying once it terminates (design §10.4), so this drop is a
+      // logged defense-in-depth whose discipline is owned + tested in slice (e).
+      const bool servicing = g_active_run_id != 0 &&
+                             env.run_id == g_active_run_id && !c->cancel_active &&
+                             !c->run_error && !g_run_complete_requested;
+      if (!servicing) {
+        printf("[v8host] dropping relay for inactive run id=%u\n", env.run_id);
+        break;
+      }
+      const sbox_msg_kind rk =
+          env.relay_kind == static_cast<int32_t>(sbox_msg_binary)
+              ? sbox_msg_binary
+              : sbox_msg_string;
+      try {
+        DeliverToJs(*c->rt, rk, env.payload.data(), env.payload.size());
+      } catch (const std::exception& e) {
+        printf("[v8host] run onmessage threw: %s\n", e.what());
+        c->run_error = true;
+      } catch (...) {
+        printf("[v8host] run onmessage threw (unknown)\n");
+        c->run_error = true;
+      }
+      break;
+    }
+    case v8host::RunEnvelopeType::kCancel:
+      if (g_active_run_id != 0 && env.run_id == g_active_run_id)
+        c->cancel_active = true;
+      break;
+    case v8host::RunEnvelopeType::kResult:
+    case v8host::RunEnvelopeType::kRunError:
+      // Outbound-only (engine -> broker); a worker never receives these.
+      printf("[v8host] dropping unexpected inbound envelope type=%u\n",
+             static_cast<unsigned>(env.type));
+      break;
+  }
+}
+
+// Reset the per-run flags + active id once a run reaches a terminal, so the loop
+// can dispatch the next pending START.
+void FinishRun(RunLoopCtx* c) {
+  g_active_run_id = 0;
+  g_run_complete_requested = false;
+  c->cancel_active = false;
+  c->run_error = false;
+}
+
+// Emit the active run's terminal if one is due (priority: uncaught error >
+// explicit complete > cancel). No-op in the dev-ambient path (no active run).
+void ServiceActiveRunTerminal(RunLoopCtx* c) {
+  if (g_active_run_id == 0)
+    return;
+  if (c->run_error) {
+    EmitRunError(g_active_run_id);
+    FinishRun(c);
+  } else if (g_run_complete_requested) {
+    EmitRunResult(g_active_run_id, v8host::RunEnvelopeDisposition::kCompleted);
+    FinishRun(c);
+  } else if (c->cancel_active) {
+    EmitRunResult(g_active_run_id, v8host::RunEnvelopeDisposition::kCancelled);
+    FinishRun(c);
+  }
+}
+
+// Begin a coordinator-driven run: reset handlers, evaluate the START guest under
+// the active run id (so its output wraps as RELAY), drain microtasks, then
+// detect immediate completion — host.complete() during eval, a top-level return
+// with no onmessage handler, or an uncaught error (RUN_ERROR). A run that
+// installs a handler stays active for subsequent RELAY/CANCEL.
+void BeginRun(Runtime& rt, const v8host::RunEnvelope& start, RunLoopCtx* c) {
+  g_run_complete_requested = false;
+  c->cancel_active = false;
+  c->run_error = false;
+  g_active_run_id = start.run_id;
+
+  bool completed = false;
+  try {
+    ResetHostHandlers(rt);
+    std::string src(start.payload.begin(), start.payload.end());
+    auto buf = std::make_shared<StringBuffer>(std::move(src));
+    auto prepared = rt.prepareJavaScript(buf, "run.js");
+    rt.evaluatePreparedJavaScript(prepared);
+    rt.drainMicrotasks();
+    completed = g_run_complete_requested || !HasOnMessageHandler(rt);
+  } catch (const JSError& e) {
+    printf("[v8host] run JS error: %s\n", e.getMessage().c_str());
+    c->run_error = true;
+  } catch (const std::exception& e) {
+    printf("[v8host] run exception: %s\n", e.what());
+    c->run_error = true;
+  } catch (...) {
+    printf("[v8host] run exception (unknown)\n");
+    c->run_error = true;
+  }
+
+  if (c->run_error) {
+    EmitRunError(g_active_run_id);
+    FinishRun(c);
+  } else if (completed) {
+    EmitRunResult(g_active_run_id, v8host::RunEnvelopeDisposition::kCompleted);
+    FinishRun(c);
   }
 }
 
@@ -722,7 +972,7 @@ sbox_status SBOX_CALL V8HostEngineRun(sbox_worker worker,
   const LONGLONG t_run_entry = g_perf.now();
   bool js_ok = false;
   bool host_closed = false;
-  DrainCtx dctx{&rt};
+  RunLoopCtx dctx{&rt};
   try {
     auto guest_buf = std::make_shared<StringBuffer>(g_guest_src);
     const char* guest_url = g_use_guest_file ? "guest.js" : "user.js";
@@ -768,6 +1018,19 @@ sbox_status SBOX_CALL V8HostEngineRun(sbox_worker worker,
       if (dctx.failed)
         break;
       rt.drainMicrotasks();
+      // Service the active coordinator run's terminal, then begin the next
+      // admitted START while idle — but not on the closing iteration: the worker
+      // is about to exit and the coordinator treats the frame absence as
+      // WORKER_EXITED (design §10.3), so there is nothing to gain from starting a
+      // run we would immediately abandon. Runs are serialized over the single JS
+      // thread (design §10.4); a run that completes immediately loops on to the
+      // next pending START. No-op for the dev-ambient smoke (no run, no STARTs).
+      ServiceActiveRunTerminal(&dctx);
+      while (!closing && g_active_run_id == 0 && !dctx.pending_starts.empty()) {
+        v8host::RunEnvelope start = std::move(dctx.pending_starts.front());
+        dctx.pending_starts.pop_front();
+        BeginRun(rt, start, &dctx);
+      }
       if (closing) {
         host_closed = true;
         break;
