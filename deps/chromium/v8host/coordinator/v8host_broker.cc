@@ -5,6 +5,7 @@
 #include "v8host_peer_auth.h"
 #include "v8host_protocol.h"
 #include "v8host_protocol_messages.h"
+#include "v8host_router.h"
 
 #include <sddl.h>
 
@@ -18,11 +19,13 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
 
 namespace protocol = v8host::protocol;
+namespace router = v8host::coordinator;
 
 bool IoWithDeadline(HANDLE pipe,
                     bool write,
@@ -138,9 +141,19 @@ class BrokerService {
     if (!security_.Initialize(sid_))
       return sbox_error;
     bool first = true;
+    sbox_status result = sbox_ok;
     auto zero_since = std::chrono::steady_clock::now();
     bool zero_timing = false;
     while (!draining_) {
+      // Reap finished connection tasks without retaining handles until idle.
+      for (auto it = tasks_.begin(); it != tasks_.end();) {
+        if (::WaitForSingleObject(*it, 0) == WAIT_OBJECT_0) {
+          ::CloseHandle(*it);
+          it = tasks_.erase(it);
+        } else {
+          ++it;
+        }
+      }
       if (mode_ == v8host::BrokerMode::kDedicated && owner_seen_)
         break;
       HANDLE pipe = ::CreateNamedPipeW(
@@ -162,11 +175,19 @@ class BrokerService {
         }
         printf("[v8host] pipe creation failed category=%lu first=%d\n",
                pipe_error, first ? 1 : 0);
-        return sbox_error;
+        CancelConnections();
+        result = sbox_error;
+        break;
       }
       first = false;
       OVERLAPPED overlapped = {};
       overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      if (!overlapped.hEvent) {
+        ::CloseHandle(pipe);
+        CancelConnections();
+        result = sbox_error;
+        break;
+      }
       bool connected = false;
       bool pending = false;
       if (::ConnectNamedPipe(pipe, &overlapped)) {
@@ -217,7 +238,9 @@ class BrokerService {
       }
       {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (setup_count_ == 0 && connection_count_ == 0) {
+        // Connection refs cover sessions through cleanup; tasks cover final release.
+        if (setup_count_ == 0 && connection_count_ == 0 &&
+            connections_.empty() && tasks_.empty()) {
           if (!zero_timing) {
             zero_since = std::chrono::steady_clock::now();
             zero_timing = true;
@@ -235,10 +258,16 @@ class BrokerService {
       ::WaitForSingleObject(task, INFINITE);
       ::CloseHandle(task);
     }
-    return sbox_ok;
+    return result;
   }
 
  private:
+  void CancelConnections() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    draining_ = true;
+    for (auto* conn : connections_) conn->Stop();
+  }
+
   struct ConnectionContext {
     BrokerService* service = nullptr;
     HANDLE pipe = INVALID_HANDLE_VALUE;
@@ -291,53 +320,87 @@ class BrokerService {
     policy.install_root = payload_.install_root;
     v8host::HeldProcess peer;
     DWORD error = ERROR_SUCCESS;
-    const bool authenticated =
-        v8host::AuthenticatePipePeer(pipe, policy, &peer, &error);
+    const bool authenticated = v8host::AuthenticatePipePeer(pipe, policy, &peer, &error);
     if (!authenticated)
       printf("[v8host] client authentication failed category=%lu\n", error);
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      --setup_count_;
-      if (authenticated) {
-        ++connection_count_;
-        owner_seen_ = true;
-      }
-    }
+    router::Connection conn;
+    conn.pipe = pipe;
+    conn.peer = std::move(peer);
+    conn.state = authenticated ? router::ConnState::kNegotiating : router::ConnState::kClosing;
+    bool referenced = false;
+    bool negotiated = false;
+    bool preserve_output = false;
     if (authenticated) {
-      // Contract B §8.2: the first post-auth frame must be HELLO with zero
-      // addressing ids and a nonzero request id. Malformed or unexpected input
-      // fails closed — no reply — and falls through to teardown below.
       uint8_t buffer[512] = {};
       DWORD len = 0;
       protocol::FrameHeader hello_header;
-      const uint8_t* payload = nullptr;
+      const uint8_t *payload = nullptr;
       size_t payload_size = 0;
       protocol::HelloPayload hello_payload;
       if (ReadFrameMessage(pipe, buffer, sizeof(buffer), &len, 2000) &&
-          protocol::DecodeAndValidateFrame(buffer, len, &hello_header, &payload,
-                                           &payload_size) ==
+          protocol::DecodeAndValidateFrame(buffer, len, &hello_header, &payload, &payload_size) ==
               protocol::DecodeStatus::kOk &&
-          hello_header.type == protocol::MessageType::HELLO &&
-          hello_header.conn_id == 0 && hello_header.session_id == 0 &&
-          hello_header.run_id == 0 && hello_header.request_id != 0 &&
+          hello_header.type == protocol::MessageType::HELLO && hello_header.conn_id == 0 &&
+          hello_header.session_id == 0 && hello_header.run_id == 0 && hello_header.request_id != 0 &&
           protocol::DecodeHelloPayload(payload, payload_size, &hello_payload)) {
         const uint32_t conn_id = next_conn_id_.fetch_add(1);
-        protocol::BrokerCapabilities caps;
-        caps.endpoint_mode = static_cast<uint32_t>(mode_);
-        protocol::NegotiationResult negotiation =
-            protocol::NegotiateHello(hello_header, hello_payload, caps, conn_id);
-        IoWithDeadline(pipe, true, negotiation.frame.data(),
-                       static_cast<DWORD>(negotiation.frame.size()), 2000);
+        if (conn_id != 0 && conn_id != UINT32_MAX) {
+          protocol::BrokerCapabilities caps;
+          caps.endpoint_mode = static_cast<uint32_t>(mode_);
+          auto negotiation = protocol::NegotiateHello(hello_header, hello_payload, caps, conn_id);
+          if (negotiation.decision == protocol::NegotiationDecision::kAck) {
+            conn.conn_id = conn_id;
+            conn.version_minor = negotiation.selected_minor;
+            negotiated = conn.Enqueue(std::move(negotiation.frame));
+          } else {
+            preserve_output =
+                IoWithDeadline(pipe, true, negotiation.frame.data(), static_cast<DWORD>(negotiation.frame.size()), 2000);
+          }
+        } else {
+          CancelConnections();
+        }
       }
     }
-    ::FlushFileBuffers(pipe);
-    ::DisconnectNamedPipe(pipe);
-    ::CloseHandle(pipe);
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (authenticated)
+      --setup_count_;
+      if (negotiated) {
+        ++connection_count_;
+        connections_.insert(&conn);
+        if (draining_)
+          conn.Stop();
+        referenced = true;
+        owner_seen_ = true;
+        conn.state = router::ConnState::kOpen;
+      }
+    }
+    router::Router service(mode_);
+    if (negotiated && conn.StartWriter()) {
+      std::vector<uint8_t> frame(protocol::kMaxFrameSize);
+      DWORD len = 0;
+      while (conn.ReadFrame(frame.data(), static_cast<DWORD>(frame.size()), &len, INFINITE)) {
+        if (!service.Route(conn, frame.data(), len))
+          break;
+      }
+    }
+    if (conn.state == router::ConnState::kClosing && negotiated)
+      preserve_output = conn.DrainOutput(2000);
+    conn.Stop();
+    conn.JoinWriter();
+    service.Close(conn);
+    conn.retired_sessions.clear();
+    // DisconnectNamedPipe discards unread replies; CloseHandle preserves them.
+    if (!preserve_output)
+      ::DisconnectNamedPipe(pipe);
+    ::CloseHandle(pipe);
+    conn.pipe = INVALID_HANDLE_VALUE;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (referenced) {
+        connections_.erase(&conn);
         --connection_count_;
-      if (authenticated && mode_ == v8host::BrokerMode::kDedicated)
+      }
+      if (mode_ == v8host::BrokerMode::kDedicated)
         draining_ = true;
     }
   }
@@ -350,9 +413,10 @@ class BrokerService {
   PipeSecurity security_;
   std::mutex mutex_;
   std::vector<HANDLE> tasks_;
+  std::unordered_set<router::Connection*> connections_;
   size_t setup_count_ = 0;
   size_t connection_count_ = 0;
-  bool owner_seen_ = false;
+  std::atomic<bool> owner_seen_{false};
   std::atomic<bool> draining_{false};
   // Process-unique, nonzero, monotonic connection id (design §8.3: never reused
   // within this broker process).

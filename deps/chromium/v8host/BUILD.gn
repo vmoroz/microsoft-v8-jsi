@@ -169,11 +169,14 @@ source_set("coordinator_persona") {
   sources = [
     "coordinator/v8host_broker.cc",
     "coordinator/v8host_broker.h",
+    "coordinator/v8host_router.cc",
+    "coordinator/v8host_router.h",
   ]
   public_deps = [
     ":payload_identity",
     ":peer_auth",
     ":protocol",
+    ":run_envelope",
 
     # The coordinator is the Stage 4 producer of V8HostSpawnConfigV1 (it encodes
     # the session envelope + effective worker profile and hands it to configure).
@@ -263,7 +266,10 @@ action("v8host_layering_tests") {
 
 executable("v8host_broker_tests") {
   testonly = true
+  defines = [ "V8HOST_ROUTER_TESTING" ]
   sources = [
+    "coordinator/v8host_router.cc",
+    "coordinator/v8host_router.h",
     "tests/v8host_broker_tests.cc",
     "tests/v8host_test_support.cc",
     "tests/v8host_test_support.h",
@@ -272,6 +278,9 @@ executable("v8host_broker_tests") {
     ":client_persona",
     ":payload_identity",
     ":peer_auth",
+    ":protocol",
+    ":spawn_config",
+    ":run_envelope",
   ]
   public_configs = [ ":v8host_common_config" ]
   data_deps = [
