@@ -41,7 +41,7 @@ extern "C" {
 #define SBOX_EXPORT
 #endif
 
-#define SBOX_ABI_VERSION 3u
+#define SBOX_ABI_VERSION 4u
 
 // Opaque, typed handles (Node-API style — never void*).
 typedef struct sbox_config_s* sbox_config;  // broker: the policy builder
@@ -56,7 +56,15 @@ typedef enum {
   sbox_error_args = 3,
 } sbox_status;
 
-typedef enum { sbox_msg_string = 0, sbox_msg_binary = 1 } sbox_msg_kind;
+// Message kinds on the duplex worker channel. string/binary are the engine's
+// opaque guest frames; sbox_msg_lifecycle is container-emitted, coordinator-
+// consumed, and plugin-FORBIDDEN (the worker-api post_message rejects it), so a
+// readiness marker can never be forged by the engine or a guest.
+typedef enum {
+  sbox_msg_string = 0,
+  sbox_msg_binary = 1,
+  sbox_msg_lifecycle = 2,
+} sbox_msg_kind;
 
 typedef enum {
   sbox_broker_mode_dedicated = 0,

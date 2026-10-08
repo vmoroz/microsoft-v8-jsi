@@ -197,7 +197,9 @@ static_assert(sizeof(sbox_msg_kind) == sizeof(int) &&
                   static_cast<int>(sbox_msg_string) ==
                       static_cast<int>(SBOX_MSG_STRING) &&
                   static_cast<int>(sbox_msg_binary) ==
-                      static_cast<int>(SBOX_MSG_BINARY),
+                      static_cast<int>(SBOX_MSG_BINARY) &&
+                  static_cast<int>(sbox_msg_lifecycle) ==
+                      static_cast<int>(SBOX_MSG_LIFECYCLE),
               "sbox_msg_kind must match SboxMsgKind for the drain cast");
 
 // --- sbox_worker_api: worker services the plugin's warmup()/run() call, bridged
@@ -214,6 +216,11 @@ int SBOX_CALL WkAcgEnabled(sbox_worker w) {
 sbox_status SBOX_CALL WkPostMessage(sbox_worker w, sbox_msg_kind kind,
                                     const void* data, size_t len) {
   if (!w || !w->target)
+    return sbox_error_args;
+  // The engine/guest may post only opaque string/binary frames. sbox_msg_lifecycle
+  // (and any other kind) is container-only, so reject it here — a readiness marker
+  // can never be forged by the plugin or a guest.
+  if (kind != sbox_msg_string && kind != sbox_msg_binary)
     return sbox_error_args;
   return sbox_target_post_message(w->target, static_cast<int>(kind), data,
                                   len) == 0
@@ -402,6 +409,9 @@ int RunWorker(const std::wstring& plugin_name) {
   printf("[sbox] worker: plugin.warmup -> %d\n", warmup_rc);
   if (warmup_rc != sbox_ok)
     return kWarmupFailed;
+  // STARTUP_READY provenance: only the container observes a successful warmup
+  // (pre-lockdown). Emit the neutral lifecycle marker before lowering the token.
+  sbox_target_post_lifecycle(target, SBOX_LIFECYCLE_STARTUP);
 
   const int lowered = sbox_target_lower_token(target);
   if (lowered != 0) {
@@ -412,6 +422,12 @@ int RunWorker(const std::wstring& plugin_name) {
 
   const bool ping_post = sbox_target_test_ipc(target) != 0;
   printf("[sbox] worker: IPC post-lockdown = %s\n", ping_post ? "OK" : "FAIL");
+
+  // SECURITY_READY provenance: the container observed the lowered token (above)
+  // and a working post-lockdown IPC channel. Emit before handing the guest the
+  // runtime so the coordinator can gate the first run on observed lockdown.
+  if (ping_post)
+    sbox_target_post_lifecycle(target, SBOX_LIFECYCLE_SECURITY);
 
   const sbox_status run_rc = plugin->run(&wk, &wapi);
   printf("[sbox] worker: plugin.run -> %d\n", run_rc);
@@ -435,10 +451,18 @@ struct BrokerMsgCtx {
   int replies = 0;
   bool unexpected = false;
   std::string last_reply;  // worker reply text, forwarded to the pipe client
+  int lifecycle_markers = 0;  // container readiness markers observed (expect 2)
 };
 
 void OnBrokerReply(void* ctx, int kind, const void* data, size_t len) {
   auto* c = static_cast<BrokerMsgCtx*>(ctx);
+  // Container lifecycle markers (readiness) ride this channel but the dev smoke
+  // does not consume them: count them as positive emission evidence, then ignore
+  // fully (no reply signal) so they never wake a RoundTrip wait with replies == 0.
+  if (kind == SBOX_MSG_LIFECYCLE) {
+    ++c->lifecycle_markers;
+    return;
+  }
   if (kind == SBOX_MSG_STRING) {
     const std::string text(static_cast<const char*>(data), len);
     printf("[sbox] broker: worker reply = \"%s\"\n", text.c_str());
@@ -544,10 +568,12 @@ int RunBroker(const std::wstring& plugin_name) {
          "  warm-roundtrip avg=%.3f min=%.3f ms (n=%d)\n",
          spawn_ms, first_rtt, warm_avg, warm_min, warm_n);
 
+  // Positive readiness-emission evidence: the container posts exactly two markers
+  // (STARTUP then SECURITY) per worker before the guest runs (design §9).
   const bool ok = got_reply && warm_ok && !mctx.unexpected && rc_close == 0 &&
-                  worker_exit == kOk;
-  printf("[sbox] broker: worker_exit=%d warm_rtts=%d -> %s\n", worker_exit,
-         warm_n, ok ? "PASS" : "FAIL");
+                  worker_exit == kOk && mctx.lifecycle_markers == 2;
+  printf("[sbox] broker: worker_exit=%d warm_rtts=%d lifecycle=%d -> %s\n",
+         worker_exit, warm_n, mctx.lifecycle_markers, ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
 

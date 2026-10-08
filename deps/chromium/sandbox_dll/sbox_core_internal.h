@@ -126,7 +126,11 @@ typedef struct SboxTarget SboxTarget;
 // channel carries opaque byte frames tagged with a kind so a host can post
 // strings or binary; it grants no capability — the host MUST treat target->host
 // messages as untrusted input.
-enum SboxMsgKind { SBOX_MSG_STRING = 0, SBOX_MSG_BINARY = 1 };
+enum SboxMsgKind {
+  SBOX_MSG_STRING = 0,
+  SBOX_MSG_BINARY = 1,
+  SBOX_MSG_LIFECYCLE = 2  // container-emitted readiness marker (see sbox.h)
+};
 
 // Received-message callback. For the broker it is invoked on an internal reader
 // thread; the target drains explicitly (see sbox_target_drain_messages). `data`
@@ -169,6 +173,15 @@ SBOX_API int sbox_broker_wait(SboxSession* session);  // -> target exit code
 // (so the host controls which thread runs the handler — e.g. the JS thread).
 SBOX_API int sbox_target_post_message(SboxTarget* target, int kind,
                                       const void* data, size_t len);
+// Container-only readiness markers posted on the worker->broker ring with kind
+// SBOX_MSG_LIFECYCLE and a u32 phase payload. Emitted by the generic RunWorker at
+// its own observation points; the plugin cannot post this kind (the worker-api
+// post_message rejects any kind other than string/binary).
+enum SboxLifecyclePhase {
+  SBOX_LIFECYCLE_STARTUP = 1,   // plugin warmup returned sbox_ok
+  SBOX_LIFECYCLE_SECURITY = 2,  // token lowered + post-lockdown IPC observed
+};
+SBOX_API int sbox_target_post_lifecycle(SboxTarget* target, uint32_t phase);
 SBOX_API void* sbox_target_inbound_event(SboxTarget* target);  // HANDLE to wait on
 SBOX_API int sbox_target_drain_messages(SboxTarget* target, SboxMessageCb cb,
                                         void* ctx);

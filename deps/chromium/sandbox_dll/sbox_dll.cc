@@ -1321,6 +1321,11 @@ SBOX_API int sbox_target_post_message(SboxTarget* target, int kind,
   return 0;
 }
 
+SBOX_API int sbox_target_post_lifecycle(SboxTarget* target, uint32_t phase) {
+  return sbox_target_post_message(target, SBOX_MSG_LIFECYCLE, &phase,
+                                  sizeof(phase));
+}
+
 SBOX_API void* sbox_target_inbound_event(SboxTarget* target) {
   return target ? target->evt_b2t : nullptr;
 }
