@@ -266,11 +266,16 @@ action("v8host_layering_tests") {
 
 executable("v8host_broker_tests") {
   testonly = true
-  defines = [ "V8HOST_ROUTER_TESTING" ]
+  defines = [ "V8HOST_ROUTER_TESTING", "V8HOST_ENGINE_TESTING" ]
+  include_dirs = [ "//../../src" ]
+  configs -= [ "//build/config/compiler:no_exceptions" ]
+  configs += [ "//build/config/compiler:exceptions" ]
   sources = [
     "coordinator/v8host_router.cc",
     "coordinator/v8host_router.h",
     "tests/v8host_broker_tests.cc",
+    "v8host_engine.cc",
+    "v8host_spawn_apply.cc",
     "tests/v8host_test_support.cc",
     "tests/v8host_test_support.h",
   ]
@@ -281,6 +286,7 @@ executable("v8host_broker_tests") {
     ":protocol",
     ":spawn_config",
     ":run_envelope",
+    "//jsi_cpp",
   ]
   public_configs = [ ":v8host_common_config" ]
   data_deps = [

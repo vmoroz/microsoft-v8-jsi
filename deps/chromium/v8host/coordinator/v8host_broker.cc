@@ -125,11 +125,11 @@ class PipeSecurity {
 
 class BrokerService {
  public:
-  BrokerService(const sbox_broker_start* start,
+  BrokerService(sbox_broker broker, const sbox_broker_api* api, const sbox_broker_start* start,
                 v8host::PayloadIdentity payload,
                 std::vector<uint8_t> sid,
                 LUID session)
-      : start_(start),
+      : broker_(broker), api_(api), start_(start),
         payload_(std::move(payload)),
         sid_(std::move(sid)),
         session_(session),
@@ -204,11 +204,8 @@ class BrokerService {
           pending = false;
         }
       }
-      if (pending) {
-        ::CancelIoEx(pipe, &overlapped);
-        DWORD aborted = 0;
-        ::GetOverlappedResult(pipe, &overlapped, &aborted, TRUE);
-      }
+      if (pending)
+        connected = V8HostBrokerFinishPendingConnect(pipe, &overlapped);
       ::CloseHandle(overlapped.hEvent);
       if (connected) {
         {
@@ -374,7 +371,15 @@ class BrokerService {
         conn.state = router::ConnState::kOpen;
       }
     }
-    router::Router service(mode_);
+    DWORD needed = ::GetFinalPathNameByHandleW(payload_.container.get(), nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    std::wstring container_path(needed, L'\0');
+    DWORD actual = needed ? ::GetFinalPathNameByHandleW(payload_.container.get(), container_path.data(), needed,
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) : 0;
+    if (!actual || actual >= needed)
+      conn.Stop();
+    container_path.resize(actual);
+    router::Router service(mode_, broker_, api_, v8host::ParentPath(container_path), payload_.native_machine);
+    conn.dispatcher = &service;
     if (negotiated && conn.StartWriter()) {
       std::vector<uint8_t> frame(protocol::kMaxFrameSize);
       DWORD len = 0;
@@ -405,6 +410,8 @@ class BrokerService {
     }
   }
 
+  sbox_broker broker_;
+  const sbox_broker_api* api_;
   const sbox_broker_start* start_;
   v8host::PayloadIdentity payload_;
   std::vector<uint8_t> sid_;
@@ -540,5 +547,5 @@ sbox_status V8HostBrokerRun(sbox_broker broker,
          v8host::HexPrefix(endpoint_key, 6).c_str(),
          start->mode == sbox_broker_mode_shared ? "shared" : "dedicated",
          ::GetCurrentProcessId());
-  return BrokerService(start, std::move(payload), std::move(sid), session).Run();
+  return BrokerService(broker, api, start, std::move(payload), std::move(sid), session).Run();
 }

@@ -568,12 +568,21 @@ void ResetHostHandlers(Runtime& rt) {
 // the admitted-but-not-yet-begun START FIFO; the loop begins one run at a time
 // (serialized over the single JS thread). cancel/error are set while servicing
 // the active run and drive its terminal.
+constexpr size_t kMaxActivationBridgeFrames = 256;
+struct PendingStart {
+  v8host::RunEnvelope start;
+  std::deque<std::vector<uint8_t>> frames;
+  size_t bytes = 0;
+  bool overflow = false;
+};
 struct RunLoopCtx {
   Runtime* rt = nullptr;
   int strings = 0;   // dev-ambient bare frames delivered to host.onmessage
   int binaries = 0;
   bool failed = false;  // fatal engine failure (dev-ambient path)
-  std::deque<v8host::RunEnvelope> pending_starts;
+  std::vector<PendingStart> pending_starts;
+  size_t bridge_bytes = 0, bridge_frames = 0;
+  bool replaying = false;
   bool cancel_active = false;  // CANCEL seen for the active run
   bool run_error = false;      // uncaught JS error in the active run
 };
@@ -624,18 +633,40 @@ void SBOX_CALL OnInbound(void* ctx, sbox_msg_kind kind, const void* data,
     printf("[v8host] dropping malformed run envelope (%zu bytes)\n", len);
     return;  // fail-closed: never act on an undecodable control frame
   }
+  if (!c->replaying && env.run_id != g_active_run_id &&
+      (env.type == v8host::RunEnvelopeType::kRelay || env.type == v8host::RunEnvelopeType::kCancel)) {
+    auto pending = std::find_if(c->pending_starts.begin(), c->pending_starts.end(),
+        [&](const PendingStart &entry) { return entry.start.run_id == env.run_id; });
+    if (pending != c->pending_starts.end()) {
+      if (!pending->overflow) {
+        if (len > v8host::protocol::kMaxQueuedRelayBytesPerRun - c->bridge_bytes ||
+            c->bridge_frames == kMaxActivationBridgeFrames) {
+          pending->overflow = true;
+          c->bridge_bytes -= pending->bytes;
+          c->bridge_frames -= pending->frames.size();
+          pending->bytes = 0;
+          pending->frames.clear();
+        } else {
+          pending->frames.emplace_back(bytes, bytes + len);
+          pending->bytes += len;
+          c->bridge_bytes += len;
+          ++c->bridge_frames;
+        }
+      }
+      return;
+    }
+  }
   switch (env.type) {
     case v8host::RunEnvelopeType::kStart:
-      // Begun by the loop; JS eval happens off the C drain callback.
-      c->pending_starts.push_back(std::move(env));
+      if (c->pending_starts.size() >= v8host::protocol::kMaxInFlightRunsPerSession) {
+        c->failed = true;
+      } else if (env.run_id != g_active_run_id && std::none_of(c->pending_starts.begin(), c->pending_starts.end(),
+                 [&](const PendingStart &pending) { return pending.start.run_id == env.run_id; })) {
+        c->pending_starts.push_back({std::move(env)});
+      }
       break;
     case v8host::RunEnvelopeType::kRelay: {
-      // Deliver only to the active run, and only while it is still servicing (a
-      // pending cancel/complete/error stops servicing, design §10.3). A relay for
-      // a not-yet-active or already-finished run is dropped + logged: the
-      // coordinator holds each run's relays until that run becomes active and
-      // stops relaying once it terminates (design §10.4), so this drop is a
-      // logged defense-in-depth whose discipline is owned + tested in slice (e).
+      // Late and unknown relays have no dispatch authority.
       const bool servicing = g_active_run_id != 0 &&
                              env.run_id == g_active_run_id && !c->cancel_active &&
                              !c->run_error && !g_run_complete_requested;
@@ -728,12 +759,30 @@ void BeginRun(Runtime& rt, const v8host::RunEnvelope& start, RunLoopCtx* c) {
     c->run_error = true;
   }
 
-  if (c->run_error) {
-    EmitRunError(g_active_run_id);
-    FinishRun(c);
-  } else if (completed) {
-    EmitRunResult(g_active_run_id, v8host::RunEnvelopeDisposition::kCompleted);
-    FinishRun(c);
+  if (completed)
+    g_run_complete_requested = true;
+}
+
+void ServicePendingStarts(RunLoopCtx *c, bool closing) {
+  if (closing || c->failed) {
+    c->pending_starts.clear();
+    c->bridge_bytes = c->bridge_frames = 0;
+    return;
+  }
+  while (g_active_run_id == 0 && !c->pending_starts.empty()) {
+    PendingStart pending = std::move(c->pending_starts.front());
+    c->pending_starts.erase(c->pending_starts.begin());
+    c->bridge_bytes -= pending.bytes;
+    c->bridge_frames -= pending.frames.size();
+    BeginRun(*c->rt, pending.start, c);
+    if (pending.overflow)
+      c->run_error = true;
+    c->replaying = true;
+    for (auto &frame : pending.frames)
+      OnInbound(c, sbox_msg_binary, frame.data(), frame.size());
+    c->replaying = false;
+    c->rt->drainMicrotasks();
+    ServiceActiveRunTerminal(c);
   }
 }
 
@@ -748,6 +797,28 @@ const char* kDemoJs =
     "};";
 
 }  // namespace
+
+#if defined(V8HOST_ENGINE_TESTING)
+bool V8HostEngineTestBatch(const std::vector<v8host::RunEnvelope> &batch, bool closing,
+                           size_t *peak_bytes, size_t *peak_frames, size_t *remaining) {
+  if (!g_rt)
+    return false;
+  RunLoopCtx context{g_rt};
+  *peak_bytes = *peak_frames = 0;
+  for (const auto &env : batch) {
+    auto bytes = v8host::EncodeRunEnvelope(env);
+    OnInbound(&context, sbox_msg_binary, bytes.data(), bytes.size());
+    *peak_bytes = (std::max)(*peak_bytes, context.bridge_bytes);
+    *peak_frames = (std::max)(*peak_frames, context.bridge_frames);
+  }
+  ServiceActiveRunTerminal(&context);
+  ServicePendingStarts(&context, closing);
+  *remaining = context.bridge_bytes + context.bridge_frames;
+  bool ok = !context.failed;
+  FinishRun(&context);
+  return ok;
+}
+#endif
 
 //==========================================================================
 // PRE-lockdown. Load the engine, create the JSI runtime, install the `host`
@@ -1018,19 +1089,8 @@ sbox_status SBOX_CALL V8HostEngineRun(sbox_worker worker,
       if (dctx.failed)
         break;
       rt.drainMicrotasks();
-      // Service the active coordinator run's terminal, then begin the next
-      // admitted START while idle — but not on the closing iteration: the worker
-      // is about to exit and the coordinator treats the frame absence as
-      // WORKER_EXITED (design §10.3), so there is nothing to gain from starting a
-      // run we would immediately abandon. Runs are serialized over the single JS
-      // thread (design §10.4); a run that completes immediately loops on to the
-      // next pending START. No-op for the dev-ambient smoke (no run, no STARTs).
       ServiceActiveRunTerminal(&dctx);
-      while (!closing && g_active_run_id == 0 && !dctx.pending_starts.empty()) {
-        v8host::RunEnvelope start = std::move(dctx.pending_starts.front());
-        dctx.pending_starts.pop_front();
-        BeginRun(rt, start, &dctx);
-      }
+      ServicePendingStarts(&dctx, closing);
       if (closing) {
         host_closed = true;
         break;

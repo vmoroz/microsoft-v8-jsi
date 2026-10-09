@@ -3,11 +3,13 @@
 #include "v8host_router.h"
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 
 namespace v8host::coordinator {
 Connection::Connection() {
   out_wake = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
   stop = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  worker_wake = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
 }
 Connection::~Connection() {
   Stop();
@@ -16,6 +18,8 @@ Connection::~Connection() {
     ::CloseHandle(out_wake);
   if (stop)
     ::CloseHandle(stop);
+  if (worker_wake)
+    ::CloseHandle(worker_wake);
 }
 void Connection::Stop() {
   if (stop)
@@ -54,8 +58,7 @@ void Connection::CompleteOutput(size_t bytes) {
 }
 bool Connection::DrainOutput(DWORD timeout_ms) {
   std::unique_lock<std::mutex> lock(out_mutex);
-  return out_drained_.wait_for(
-      lock, std::chrono::milliseconds(timeout_ms), [&] { return out_control_requests == 0; });
+  return out_drained_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return out_control_requests == 0; });
 }
 namespace {
 bool Transfer(Connection &conn, bool write, void *data, DWORD capacity, DWORD *transferred, DWORD timeout_ms) {
@@ -71,6 +74,10 @@ bool Transfer(Connection &conn, bool write, void *data, DWORD capacity, DWORD *t
   bool pending = !started && ::GetLastError() == ERROR_IO_PENDING;
   bool ok = false;
   if (started) {
+#if defined(V8HOST_ROUTER_TESTING)
+    if (!write)
+      ++conn.inline_reads;
+#endif
     ok = ::GetOverlappedResult(conn.pipe, &ov, transferred, FALSE) != FALSE;
   } else if (pending) {
 #if defined(V8HOST_ROUTER_TESTING)
@@ -78,10 +85,18 @@ bool Transfer(Connection &conn, bool write, void *data, DWORD capacity, DWORD *t
     if (barrier)
       ::SetEvent(barrier);
 #endif
-    HANDLE waits[] = {conn.stop, ov.hEvent};
-    if (::WaitForMultipleObjects(2, waits, FALSE, timeout_ms) == WAIT_OBJECT_0 + 1) {
-      ok = ::GetOverlappedResult(conn.pipe, &ov, transferred, FALSE) != FALSE;
-      pending = false;
+    HANDLE waits[] = {conn.stop, ov.hEvent, conn.worker_wake};
+    for (;;) {
+      DWORD result = ::WaitForMultipleObjects(write ? 2 : 3, waits, FALSE, timeout_ms);
+      if (result == WAIT_OBJECT_0 + 2 && conn.dispatcher) {
+        conn.dispatcher->Pump(conn);
+        continue;
+      }
+      if (result == WAIT_OBJECT_0 + 1) {
+        ok = ::GetOverlappedResult(conn.pipe, &ov, transferred, FALSE) != FALSE;
+        pending = false;
+      }
+      break;
     }
   }
   if (pending) {
@@ -98,7 +113,10 @@ bool Transfer(Connection &conn, bool write, void *data, DWORD capacity, DWORD *t
 bool Connection::ReadFrame(uint8_t *buffer, DWORD capacity, DWORD *size, DWORD timeout_ms) {
   if (!stop || ::WaitForSingleObject(stop, 0) == WAIT_OBJECT_0)
     return false;
-  return Transfer(*this, false, buffer, capacity, size, timeout_ms);
+  const bool ok = Transfer(*this, false, buffer, capacity, size, timeout_ms);
+  if (ok && dispatcher)
+    dispatcher->Pump(*this);
+  return ok;
 }
 bool Connection::StartWriter() {
   if (writer_ || !stop || !out_wake)
@@ -157,6 +175,8 @@ bool Run::TryTerminal(RunState desired) {
       session->retired_runs.push_back(std::move(it->second));
       session->runs.erase(it);
     }
+    held_relays.clear();
+    queued_relay_bytes = 0;
     if (session->worker) {
       if (session->worker->active_run_id == run_id)
         session->worker->active_run_id = 0;
@@ -181,9 +201,9 @@ bool Run::TryTerminal(RunState desired) {
                                                            : protocol::ResultDisposition::kCancelled;
       conn->Enqueue(protocol::BuildResultFrame(header, result.disposition));
     } else {
-      protocol::ErrorPayload error;
-      error.status_code = protocol::StatusCode::ERROR_INTERNAL;
-      auto frame = protocol::BuildErrorFrame(header, error);
+      protocol::ErrorPayload failure;
+      failure.status_code = error;
+      auto frame = protocol::BuildErrorFrame(header, failure);
       header.type = protocol::MessageType::RUN_ERROR;
       header.payload_length = static_cast<uint32_t>(frame.size()) - protocol::kFrameHeaderSize;
       std::vector<uint8_t> encoded;
@@ -326,10 +346,16 @@ void RetireSessionLocked(Connection &conn, uint32_t id, RunState terminal) {
     std::lock_guard<std::mutex> lock(session->mutex);
     session->state = SessionState::kClosed;
   }
-  conn.retired_sessions.push_back(std::move(session));
+  if (session->worker || !session->retired_runs.empty())
+    conn.retired_sessions.push_back(std::move(session));
 }
 } // namespace
 
+bool EnvelopeFits(v8host::RunEnvelopeType type, size_t size) {
+  const size_t overhead =
+      v8host::kRunEnvelopeHeaderSize + (type == v8host::RunEnvelopeType::kRelay ? sizeof(int32_t) : 0);
+  return size <= protocol::kMaxFramePayload - overhead;
+}
 bool ValidateSessionConfig(const SessionConfig &config, BrokerMode mode) {
   if ((config.broker_mode != 0 && config.broker_mode != 1) || config.broker_mode != static_cast<int32_t>(mode) ||
       (config.tier != kTierUntrusted && config.tier != kTierTrusted) || config.integrity < sbox_integrity_low ||
@@ -445,29 +471,29 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
       h.version_minor != conn.version_minor || h.conn_id != conn.conn_id)
     return false;
   switch (h.type) {
-  case protocol::MessageType::HELLO:
-  case protocol::MessageType::HELLO_ACK:
-  case protocol::MessageType::CREATE_SESSION:
-  case protocol::MessageType::SESSION_READY:
-  case protocol::MessageType::START_RUN:
-  case protocol::MessageType::CANCEL_RUN:
-  case protocol::MessageType::CLOSE_SESSION:
-  case protocol::MessageType::ACK:
-  case protocol::MessageType::ERROR:
-  case protocol::MessageType::WORKER_EXIT:
-  case protocol::MessageType::STARTUP_READY:
-  case protocol::MessageType::SECURITY_READY:
-  case protocol::MessageType::RESULT:
-  case protocol::MessageType::RUN_ERROR:
-  case protocol::MessageType::RELAY_TO_WORKER:
-  case protocol::MessageType::RELAY_FROM_WORKER:
-    break;
-  default:
-    if (!(h.flags & protocol::kFlagMustUnderstand))
-      return true;
-    if (conn.Enqueue(Error(h, protocol::StatusCode::ERROR_UNSUPPORTED_MESSAGE)))
-      conn.state = ConnState::kClosing;
-    return false;
+    case protocol::MessageType::HELLO:
+    case protocol::MessageType::HELLO_ACK:
+    case protocol::MessageType::CREATE_SESSION:
+    case protocol::MessageType::SESSION_READY:
+    case protocol::MessageType::START_RUN:
+    case protocol::MessageType::CANCEL_RUN:
+    case protocol::MessageType::CLOSE_SESSION:
+    case protocol::MessageType::ACK:
+    case protocol::MessageType::ERROR:
+    case protocol::MessageType::WORKER_EXIT:
+    case protocol::MessageType::STARTUP_READY:
+    case protocol::MessageType::SECURITY_READY:
+    case protocol::MessageType::RESULT:
+    case protocol::MessageType::RUN_ERROR:
+    case protocol::MessageType::RELAY_TO_WORKER:
+    case protocol::MessageType::RELAY_FROM_WORKER:
+      break;
+    default:
+      if (!(h.flags & protocol::kFlagMustUnderstand))
+        return true;
+      if (conn.Enqueue(Error(h, protocol::StatusCode::ERROR_UNSUPPORTED_MESSAGE)))
+        conn.state = ConnState::kClosing;
+      return false;
   }
   if (!h.session_id || h.session_id == UINT32_MAX || h.run_id == UINT32_MAX || h.request_id == UINT32_MAX)
     return false;
@@ -483,8 +509,48 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
     int32_t kind = 0;
     const uint8_t *body = nullptr;
     size_t body_size = 0;
-    return protocol::DecodeRelayPayload(payload, payload_size, &kind, &body, &body_size) &&
-        (kind == sbox_msg_string || kind == sbox_msg_binary);
+    if (!protocol::DecodeRelayPayload(payload, payload_size, &kind, &body, &body_size) ||
+        (kind != sbox_msg_string && kind != sbox_msg_binary))
+      return false;
+    Pump(conn);
+    auto sit = conn.sessions.find(h.session_id);
+    if (sit == conn.sessions.end())
+      return true;
+    auto &session = *sit->second;
+    auto rit = session.runs.find(h.run_id);
+    if (rit == session.runs.end())
+      return true;
+    auto &run = *rit->second;
+    v8host::RunEnvelope env;
+    env.type = v8host::RunEnvelopeType::kRelay;
+    env.run_id = h.run_id;
+    env.relay_kind = kind;
+    env.payload.assign(body, body + body_size);
+    auto bytes = v8host::EncodeRunEnvelope(env);
+    if (bytes.size() > protocol::kMaxFramePayload ||
+        bytes.size() > protocol::kMaxQueuedRelayBytesPerRun - run.queued_relay_bytes || run.held_relays.size() >= 256) {
+      run.error = protocol::StatusCode::ERROR_QUOTA;
+      run.TryTerminal(RunState::kFailed);
+      if (session.worker && session.worker->engine_busy_run_id == h.run_id) {
+        env.type = v8host::RunEnvelopeType::kCancel;
+        if (!Post(session, v8host::EncodeRunEnvelope(env)))
+          CloseSession(conn, h.session_id, RunState::kWorkerExited);
+      }
+      return true;
+    }
+    uint64_t held_bytes = 0;
+    for (const auto &[session_id, held_session] : conn.sessions)
+      for (const auto &[run_id, held_run] : held_session->runs)
+        held_bytes += held_run->queued_relay_bytes;
+    if (bytes.size() > protocol::kMaxQueuedRelayBytesPerConnection - held_bytes) {
+      conn.Stop();
+      return false;
+    }
+    run.queued_relay_bytes += static_cast<uint32_t>(bytes.size());
+    run.held_relays.push_back(std::move(bytes));
+    Dispatch(session);
+    Pump(conn);
+    return true;
   }
   protocol::RequestIdentity identity{h.type, h.conn_id, h.session_id, h.run_id, h.request_id, h.flags};
   auto classified = conn.request_cache.Classify(identity, payload, payload_size);
@@ -498,6 +564,9 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
     return conn.Enqueue(Error(h, protocol::StatusCode::ERROR_STALE_REQUEST));
   std::vector<uint8_t> response;
   bool ready = false;
+  Session *admitted_session = nullptr;
+  Run *admitted_run = nullptr;
+  bool needs_spawn = false;
   if (create) {
     SessionConfig config;
     if (!protocol::DecodeCreateSessionPayload(payload, payload_size, &config))
@@ -523,12 +592,52 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
     protocol::StartRunPayload inputs;
     if (!protocol::DecodeStartRunPayload(payload, payload_size, &inputs))
       return false;
-    response = Error(h, protocol::StatusCode::ERROR_BAD_STATE);
-  } else {
-    if (close) {
-      std::lock_guard<std::mutex> lock(conn.mutex);
-      RetireSessionLocked(conn, h.session_id, RunState::kCancelled);
+    auto it = conn.sessions.find(h.session_id);
+    BoundProfile profile;
+    bool prepared =
+        it != conn.sessions.end() && PrepareProfile(it->second->config, inputs, payload_directory_, &profile);
+    if (!prepared && it != conn.sessions.end() && it->second->profile_bound && inputs.tier_override >= 0 &&
+        inputs.tier_override <= kTierTrusted && inputs.tier_override != it->second->profile.effective_tier) {
+      auto normalized = inputs;
+      normalized.tier_override = -1;
+      prepared = PrepareProfile(it->second->config, normalized, payload_directory_, &profile);
+      if (prepared) {
+        profile = it->second->profile;
+        profile.effective_tier = inputs.tier_override;
+      }
     }
+    if (it == conn.sessions.end() || !broker_ || !api_ || h.run_id <= it->second->highest_run_id || !prepared) {
+      response = Error(h, protocol::StatusCode::ERROR_BAD_STATE);
+    } else if (it->second->runs.size() >= protocol::kMaxInFlightRunsPerSession) {
+      response = Error(h, protocol::StatusCode::ERROR_QUOTA);
+    } else {
+      auto &session = *it->second;
+      auto owned = std::make_unique<Run>();
+      owned->session = &session;
+      owned->run_id = h.run_id;
+      owned->guest = std::move(inputs.guest_payload);
+      owned->state = RunState::kStartPending;
+      owned->error = EnvelopeFits(v8host::RunEnvelopeType::kStart, owned->guest.size())
+          ? BindProfile(session, profile)
+          : protocol::StatusCode::ERROR_QUOTA;
+      admitted_run = owned.get();
+      session.runs.emplace(h.run_id, std::move(owned));
+      session.highest_run_id = h.run_id;
+      admitted_session = &session;
+      if (admitted_run->error == protocol::StatusCode::OK) {
+        if (!session.worker) {
+          session.worker = std::make_unique<Worker>();
+          session.worker->session = &session;
+          session.worker->api = api_;
+          needs_spawn = true;
+        }
+        session.worker->pending_run_ids.push_back(h.run_id);
+      }
+      response = protocol::BuildAckFrame(h);
+    }
+  } else {
+    if (close)
+      CloseSession(conn, h.session_id, RunState::kCancelled);
     response = protocol::BuildAckFrame(h);
   }
   conn.request_cache.Record(identity, payload, payload_size, response);
@@ -538,16 +647,304 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
     if (!conn.Enqueue(protocol::BuildSessionReadyFrame(ReplyHeader(conn, h.session_id))))
       return false;
     std::lock_guard<std::mutex> lock(conn.mutex);
-    conn.sessions.at(h.session_id)->state = SessionState::kLogicalReady;
+    auto &session = *conn.sessions.at(h.session_id);
+    std::lock_guard<std::mutex> session_lock(session.mutex);
+    session.state = SessionState::kLogicalReady;
   }
+  if (admitted_run) {
+    if (admitted_run->error != protocol::StatusCode::OK)
+      admitted_run->TryTerminal(RunState::kFailed);
+    else if (needs_spawn && !Spawn(*admitted_session)) {
+      admitted_run->error = protocol::StatusCode::ERROR_INTERNAL;
+      admitted_run->TryTerminal(RunState::kFailed);
+      CloseSession(conn, h.session_id, RunState::kWorkerExited);
+    } else if (::WaitForSingleObject(conn.stop, 0) == WAIT_OBJECT_0) {
+      CloseSession(conn, h.session_id, RunState::kBrokerLost);
+    } else {
+      Pump(conn);
+      auto it = conn.sessions.find(h.session_id);
+      if (it != conn.sessions.end())
+        Dispatch(*it->second);
+    }
+  }
+  if (api_)
+    for (auto &[id, session] : conn.sessions)
+      session->retired_runs.clear();
+  Reclaim(conn, false);
   return true;
+}
+void SBOX_CALL Worker::OnMessage(void *context, sbox_msg_kind kind, const void *data, size_t size) {
+  auto &worker = *static_cast<Worker *>(context);
+  // The owning worker is immutable until callbacks have joined.
+  // Never block: the core reader join has a 5 s bound.
+  Worker *owner = worker.session->worker.get();
+  if (owner != &worker) {
+    if (owner)
+      owner->mailbox_failed.store(true);
+    ::SetEvent(worker.session->conn->worker_wake);
+    return;
+  }
+  if (worker.mailbox_failed.load(std::memory_order_acquire)) {
+    ::SetEvent(worker.session->conn->worker_wake);
+    return;
+  }
+  if (size > protocol::kMaxFramePayload || (size && !data)) {
+    worker.mailbox_failed.store(true);
+    ::SetEvent(worker.session->conn->worker_wake);
+    return;
+  }
+  const size_t tail = worker.mailbox_tail.load(std::memory_order_relaxed);
+  if (tail - worker.mailbox_head.load(std::memory_order_acquire) >= worker.mailbox.size()) {
+    worker.mailbox_failed.store(true);
+  } else {
+    auto &fact = worker.mailbox[tail % worker.mailbox.size()];
+    fact.kind = kind;
+    fact.size = size;
+    if (size)
+      std::memcpy(fact.data.data(), data, size);
+    worker.mailbox_tail.store(tail + 1, std::memory_order_release);
+  }
+  ::SetEvent(worker.session->conn->worker_wake);
+}
+DWORD WINAPI Worker::Reap(void *context) {
+  auto &worker = *static_cast<Worker *>(context);
+  int32_t exit_code = 0;
+  worker.api->wait(worker.handle, &exit_code);
+  worker.handle = nullptr;
+  worker.state = WorkerState::kReaped;
+  ::SetEvent(worker.session->conn->worker_wake);
+  return 0;
+}
+bool Router::Spawn(Session &session) {
+  auto &worker = *session.worker;
+  session.state = SessionState::kStartingWorker;
+  worker.state = WorkerState::kSpawning;
+  DWORD error = 0;
+  int count = ::MultiByteToWideChar(
+      CP_UTF8,
+      MB_ERR_INVALID_CHARS,
+      session.profile.engine_dll.data(),
+      static_cast<int>(session.profile.engine_dll.size()),
+      nullptr,
+      0);
+  if (!count)
+    return false;
+  std::wstring engine(count, L'\0');
+  ::MultiByteToWideChar(
+      CP_UTF8,
+      MB_ERR_INVALID_CHARS,
+      session.profile.engine_dll.data(),
+      static_cast<int>(session.profile.engine_dll.size()),
+      engine.data(),
+      count);
+  std::vector<uint8_t> config;
+  if (!OpenImmutableFile(payload_directory_ + L"\\" + engine, &worker.engine_image, &error) ||
+      worker.engine_image.machine() != machine_ || !TrustAllowed(VerifyTrust(worker.engine_image)) ||
+      !PrepareSpawnConfig(session.config, session.profile, &config))
+    return false;
+  sbox_broker_worker handle = nullptr;
+  if (api_->configure_and_spawn(broker_, config.data(), config.size(), &Worker::OnMessage, &worker, &handle) !=
+          sbox_ok ||
+      !handle)
+    return false;
+  worker.handle = handle;
+  worker.state = WorkerState::kWarming;
+  return true;
+}
+bool Router::Post(Session &session, const std::vector<uint8_t> &bytes) {
+  auto &worker = *session.worker;
+  return bytes.size() <= protocol::kMaxFramePayload && worker.handle && !worker.close_called &&
+      ::WaitForSingleObject(session.conn->stop, 0) != WAIT_OBJECT_0 &&
+      api_->post_message(worker.handle, sbox_msg_binary, bytes.data(), bytes.size()) == sbox_ok;
+}
+void Router::Dispatch(Session &session) {
+  auto &worker = *session.worker;
+  if (!worker.security || worker.close_called || !worker.handle)
+    return;
+  if (!worker.engine_busy_run_id && !worker.pending_run_ids.empty()) {
+    uint32_t id = worker.pending_run_ids.front();
+    worker.pending_run_ids.pop_front();
+    auto it = session.runs.find(id);
+    if (it == session.runs.end())
+      return;
+    v8host::RunEnvelope env;
+    env.run_id = id;
+    env.payload = it->second->guest;
+    if (!Post(session, v8host::EncodeRunEnvelope(env))) {
+      CloseSession(*session.conn, session.session_id, RunState::kWorkerExited);
+      return;
+    }
+    worker.engine_busy_run_id = worker.active_run_id = id;
+    it->second->state = RunState::kActive;
+  }
+  auto it = session.runs.find(worker.engine_busy_run_id);
+  if (it == session.runs.end())
+    return;
+  auto &run = *it->second;
+  while (!run.held_relays.empty()) {
+    if (!Post(session, run.held_relays.front())) {
+      CloseSession(*session.conn, session.session_id, RunState::kWorkerExited);
+      return;
+    }
+    run.queued_relay_bytes -= static_cast<uint32_t>(run.held_relays.front().size());
+    run.held_relays.pop_front();
+  }
+}
+void Router::CloseSession(Connection &conn, uint32_t id, RunState terminal) {
+  std::lock_guard<std::mutex> lock(conn.mutex);
+  auto it = conn.sessions.find(id);
+  if (it == conn.sessions.end())
+    return;
+  Session *session = it->second.get();
+  bool has_worker = session->worker != nullptr;
+  RetireSessionLocked(conn, id, terminal);
+  if (!has_worker)
+    return;
+  auto &worker = *session->worker;
+  worker.engine_busy_run_id = 0;
+  if (worker.handle && !worker.close_called) {
+    worker.close_called = true;
+    worker.state = WorkerState::kCloseRequested;
+    api_->close(worker.handle);
+    worker.wait_called = true;
+    worker.cleanup = ::CreateThread(nullptr, 0, &Worker::Reap, &worker, 0, nullptr);
+    if (!worker.cleanup)
+      Worker::Reap(&worker);
+  }
+}
+void Router::Reclaim(Connection &conn, bool join) {
+  for (auto it = conn.retired_sessions.begin(); it != conn.retired_sessions.end();) {
+    auto &session = **it;
+    auto *worker = session.worker.get();
+    if (worker && worker->cleanup && ::WaitForSingleObject(worker->cleanup, join ? INFINITE : 0) == WAIT_OBJECT_0) {
+      ::CloseHandle(worker->cleanup);
+      worker->cleanup = nullptr;
+      it = conn.retired_sessions.erase(it);
+    } else if (worker && !worker->cleanup && !worker->handle && api_) {
+      // Failed spawn returns only after any unpublished callback reader has joined.
+      it = conn.retired_sessions.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (conn.retired_sessions.size() >= protocol::kMaxSessionsPerConnection)
+    conn.Stop();
+}
+void Router::Pump(Connection &conn) {
+  std::vector<uint32_t> ids;
+  for (auto &[id, session] : conn.sessions)
+    if (session->worker)
+      ids.push_back(id);
+  for (uint32_t id : ids) {
+    auto it = conn.sessions.find(id);
+    if (it == conn.sessions.end())
+      continue;
+    auto &session = *it->second;
+    auto &worker = *session.worker;
+    if (!worker.handle)
+      continue;
+    if (worker.mailbox_failed.load()) {
+      CloseSession(conn, id, RunState::kWorkerExited);
+      continue;
+    }
+    Worker::Fact fact;
+    for (;;) {
+      const size_t head = worker.mailbox_head.load(std::memory_order_relaxed);
+      const size_t tail = worker.mailbox_tail.load(std::memory_order_acquire);
+      if (worker.mailbox_failed.load(std::memory_order_acquire) || head == tail)
+        break;
+      auto &slot = worker.mailbox[head % worker.mailbox.size()];
+      fact.kind = slot.kind;
+      fact.size = slot.size;
+      std::memcpy(fact.data.data(), slot.data.data(), slot.size);
+#if defined(V8HOST_ROUTER_TESTING)
+      if (worker.mailbox_readout)
+        worker.mailbox_readout();
+#endif
+      worker.mailbox_head.store(head + 1, std::memory_order_release);
+      if (worker.mailbox_failed.load(std::memory_order_acquire))
+        break;
+      bool valid = true;
+      if (fact.kind == sbox_msg_lifecycle) {
+        uint32_t phase = 0;
+        if (fact.size == 4)
+          phase = fact.data[0] | (uint32_t(fact.data[1]) << 8) | (uint32_t(fact.data[2]) << 16) |
+              (uint32_t(fact.data[3]) << 24);
+        if (phase == 1) {
+          if (!worker.startup) {
+            worker.startup = true;
+            worker.engine_image = HeldFile();
+            session.state = SessionState::kStartupReady;
+            conn.Enqueue(protocol::BuildStartupReadyFrame(ReplyHeader(conn, id)));
+          }
+        } else if (phase == 2 && worker.startup) {
+          if (!worker.security) {
+            worker.security = true;
+            session.state = SessionState::kOpen;
+            worker.state = WorkerState::kRunning;
+            conn.Enqueue(protocol::BuildSecurityReadyFrame(ReplyHeader(conn, id)));
+          }
+        } else {
+          valid = false;
+        }
+      } else {
+        v8host::RunEnvelope env;
+        valid = fact.kind == sbox_msg_binary && v8host::DecodeRunEnvelope(fact.data.data(), fact.size, &env) &&
+            worker.security && env.run_id != 0 &&
+            (env.type == v8host::RunEnvelopeType::kRelay || env.type == v8host::RunEnvelopeType::kResult ||
+             env.type == v8host::RunEnvelopeType::kRunError) &&
+            (env.type != v8host::RunEnvelopeType::kRelay || env.relay_kind == sbox_msg_string ||
+             env.relay_kind == sbox_msg_binary);
+        if (valid && env.run_id != worker.engine_busy_run_id && env.run_id <= session.highest_run_id)
+          continue;
+        valid = valid && env.run_id == worker.engine_busy_run_id;
+        if (valid) {
+          auto rit = session.runs.find(env.run_id);
+          if (env.type == v8host::RunEnvelopeType::kRelay) {
+            valid = env.relay_kind == sbox_msg_string || env.relay_kind == sbox_msg_binary;
+            if (valid && rit != session.runs.end()) {
+              auto header = ReplyHeader(conn, id, env.run_id);
+              header.type = protocol::MessageType::RELAY_FROM_WORKER;
+              conn.Enqueue(protocol::BuildRelayFrame(header, env.relay_kind, env.payload.data(), env.payload.size()));
+            }
+          } else if (env.type == v8host::RunEnvelopeType::kResult || env.type == v8host::RunEnvelopeType::kRunError) {
+            worker.engine_busy_run_id = 0;
+            if (rit != session.runs.end()) {
+              if (env.type == v8host::RunEnvelopeType::kRunError) {
+                rit->second->error = protocol::StatusCode::ERROR_INTERNAL;
+                rit->second->TryTerminal(RunState::kFailed);
+              } else {
+                rit->second->TryTerminal(
+                    env.disposition == v8host::RunEnvelopeDisposition::kCompleted ? RunState::kCompleted
+                                                                                  : RunState::kCancelled);
+              }
+            }
+          } else {
+            valid = false;
+          }
+        }
+      }
+      if (!valid) {
+        CloseSession(conn, id, RunState::kWorkerExited);
+        break;
+      }
+    }
+    if (conn.sessions.contains(id) && worker.mailbox_failed.load(std::memory_order_acquire))
+      CloseSession(conn, id, RunState::kWorkerExited);
+    if (conn.sessions.contains(id)) {
+      Dispatch(session);
+      // Only the strand borrows production run storage.
+      session.retired_runs.clear();
+    }
+  }
+  Reclaim(conn, false);
 }
 void Router::Close(Connection &conn) {
   conn.Stop();
-  std::lock_guard<std::mutex> lock(conn.mutex);
   conn.state = ConnState::kClosing;
   while (!conn.sessions.empty())
-    RetireSessionLocked(conn, conn.sessions.begin()->first, RunState::kBrokerLost);
+    CloseSession(conn, conn.sessions.begin()->first, RunState::kBrokerLost);
+  Reclaim(conn, true);
   conn.state = ConnState::kClosed;
 }
 } // namespace v8host::coordinator

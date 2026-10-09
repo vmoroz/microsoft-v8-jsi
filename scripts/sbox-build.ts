@@ -578,9 +578,8 @@ interface SandboxBinary {
 const sandboxBinaries: SandboxBinary[] = [
   // sbox.exe budget: <= 2 MiB (measured ~1.76 MiB; floor at the Hybrid CRT).
   { file: "sbox.exe", allowedExports: [], maxBytes: 2 * 1024 * 1024 },
-  // v8host.dll budget: <= 512 KiB (measured ~0.36 MiB for the real V8/JSI engine
-  // persona — the engine DLL itself is LoadLibrary'd at runtime, so this is just
-  // the plugin + JSI C++ API glue).
+  // v8host.dll budget: <= 640 KiB (measured 535,040 bytes): plugin + engine
+  // glue + coordinator router + client; the engine DLL is loaded at runtime.
   {
     file: "v8host.dll",
     allowedExports: [
@@ -593,7 +592,7 @@ const sandboxBinaries: SandboxBinary[] = [
       "v8host_client_set_callbacks",
       "v8host_client_start_run",
     ],
-    maxBytes: 512 * 1024,
+    maxBytes: 640 * 1024,
   },
 ];
 
