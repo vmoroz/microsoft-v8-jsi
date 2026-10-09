@@ -16,6 +16,7 @@ enum class RendezvousStatus {
   kStartTimeout,
   kPeerAuthenticationFailed,
   kIoFailed,
+  kProtocolFailed,
 };
 
 struct HelloResult {
@@ -40,8 +41,12 @@ class BrokerConnection {
   HANDLE pipe() const;
   DWORD broker_pid() const;
   const std::wstring& endpoint() const;
-  RendezvousStatus Handshake(uint32_t request_id, HelloResult* result);
+  RendezvousStatus Handshake(uint32_t request_id, HelloResult* result,
+                             HANDLE stop = nullptr, ULONGLONG deadline = 0);
   void Close();
+#ifdef V8HOST_CLIENT_TESTING
+  void AdoptForTesting(HANDLE pipe);
+#endif
 
  private:
   friend class BrokerRendezvous;
@@ -52,7 +57,8 @@ class BrokerConnection {
 class BrokerRendezvous {
  public:
   BrokerRendezvous(std::wstring payload_directory, BrokerMode mode);
-  RendezvousStatus ConnectOrLaunch(BrokerConnection* connection);
+  RendezvousStatus ConnectOrLaunch(BrokerConnection* connection,
+                                   HANDLE stop = nullptr, ULONGLONG deadline = 0);
 
   const std::wstring& endpoint() const { return endpoint_; }
   const std::array<uint8_t, 32>& endpoint_key() const { return endpoint_key_; }

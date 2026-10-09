@@ -12,6 +12,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -92,6 +93,8 @@ class FakeTransport final : public ClientTransport {
 
   V8HostStatus Start() override {
     started = true;
+    if (inline_failure) delegate_->OnDisconnect(TransportDisconnect::kConnectFailed);
+    delegate_->OnConnected(1, kWireVersionMajor, kWireVersionMinor);
     return start_status;
   }
   V8HostStatus SendFrame(const uint8_t* bytes, size_t len) override {
@@ -121,7 +124,7 @@ class FakeTransport final : public ClientTransport {
   std::mutex mutex;
   std::vector<std::vector<uint8_t>> outbound;
   std::atomic<bool> closed{false};
-  bool started = false;
+  bool started = false, inline_failure = false;
   V8HostStatus start_status = V8HOST_OK;
   V8HostStatus send_status = V8HOST_OK;
 };
@@ -723,7 +726,7 @@ bool RunAndRelayRoundTrip(std::string* detail) {
   int32_t kind; const uint8_t* relay_body; size_t relay_len;
   if (!DecodeFrame(frame, &h, &body, &len) ||
       !DecodeRelayPayload(body, len, &kind, &relay_body, &relay_len) ||
-      kind != -7 || relay_len != 3 ||
+      h.request_id != 0 || kind != -7 || relay_len != 3 ||
       std::memcmp(relay_body, "abc", 3) != 0)
     return Fail(detail, "relay roundtrip/copy");
   if (v8host_client_cancel_run(run) != V8HOST_OK)
@@ -737,9 +740,13 @@ bool RunAndRelayRoundTrip(std::string* detail) {
   FrameHeader empty_header;
   frame = fake->Frame(4);
   if (!DecodeFrame(frame, &empty_header, &body, &len) || len != 4 ||
-      empty_header.request_id <= h.request_id)
+      empty_header.request_id != 0 || h.request_id != 4)
     return Fail(detail, "empty relay/request monotonicity");
   v8host_client_close_session(session);
+  frame = fake->Frame(5);
+  if (!DecodeFrame(frame, &h, &body, &len) ||
+      h.type != MessageType::CLOSE_SESSION || h.request_id != 5)
+    return Fail(detail, "close control order");
   Drain();
   return true;
 }
@@ -1191,12 +1198,8 @@ bool DisconnectNoReplay(std::string* detail) {
       v8host_client_cancel_run(run1) == V8HOST_E_RUN_TERMINAL;
   v8host_client_close_session(session);
   const size_t after_close = fake->FrameCount();
-  FrameHeader close_header;
-  const auto close_frame = fake->Frame(after_close - 1);
-  DecodeAndValidateFrame(close_frame.data(), close_frame.size(), &close_header);
   Drain();
-  return (ok && after_close == before + 1 &&
-          close_header.type == MessageType::CLOSE_SESSION) ||
+  return (ok && after_close == before && fake->closed.load()) ||
          Fail(detail, "disconnect terminalization/replay");
 }
 
@@ -1250,6 +1253,470 @@ bool InboundVsCloseRace(std::string* detail) {
          Fail(detail, "race producer outcome outside OK/INVALID_STATE");
 }
 
+
+
+bool g_inline_start_failure = false;
+ClientTransport* MakeStartFailure(const TransportParams& p, ClientTransportDelegate* d) {
+  auto* fake = static_cast<FakeTransport*>(MakeFake(p, d));
+  fake->start_status = V8HOST_E_CONNECT;
+  fake->inline_failure = g_inline_start_failure;
+  return fake;
+}
+bool StartupRegistrationFailure(std::string* detail) {
+  for (bool inline_failure : {false, true}) {
+    g_inline_start_failure = inline_failure;
+  SetTransportFactoryForTesting(MakeStartFailure);
+  FakeTransport* fake = nullptr;
+  V8HostSession* session = Create(&fake);
+  SetTransportFactoryForTesting(MakeFake);
+  if (!session) return Fail(detail, "create admission");
+  Recorder r; auto callbacks = Callbacks(&r);
+  v8host_client_set_callbacks(session, &callbacks);
+  auto input = BasicRun(); V8HostRun* run = nullptr;
+  if (v8host_client_start_run(session, &input, &run) != V8HOST_OK) return Fail(detail, "prestart run");
+  if (!PumpUntil([&] { return r.total.load() >= 3; }) || r.states.size() != 1 || r.events.size() != 1 ||
+      r.disconnects != 1 || r.state_status[0] != V8HOST_E_CONNECT ||
+      r.events[0] != V8HOST_RUN_EVENT_FAILED || r.event_status[0] != V8HOST_E_CONNECT || !fake->closed)
+    return Fail(detail, "startup outcome after registration");
+  v8host_client_close_session(session); Drain();
+  }
+  return true;
+}
+bool ClientIdExhaustion(std::string* detail) {
+  for (bool request : {false, true}) {
+    FakeTransport* fake = nullptr; V8HostSession* session = Create(&fake);
+    Recorder r; auto callbacks = Callbacks(&r); v8host_client_set_callbacks(session, &callbacks);
+    v8host::client::SetIdsForTesting(session, request ? UINT32_MAX : 2, request ? 1 : UINT32_MAX);
+    auto input = BasicRun(); V8HostRun* run = reinterpret_cast<V8HostRun*>(1);
+    size_t count = fake->FrameCount();
+    if (v8host_client_start_run(session, &input, &run) != V8HOST_E_QUOTA || run ||
+        !PumpUntil([&] { return r.disconnects == 1; }) || r.states.size() != 1 ||
+        r.state_status[0] != V8HOST_E_PROTOCOL || fake->FrameCount() != count)
+      return Fail(detail, "id exhaustion must close without wrap/write");
+    v8host_client_close_session(session); Drain();
+  }
+  return true;
+}
+bool AdmissionRollback(std::string* detail) {
+  FakeTransport* fake = nullptr; V8HostSession* session = Create(&fake);
+  Recorder r; auto callbacks = Callbacks(&r); v8host_client_set_callbacks(session, &callbacks);
+  auto input = BasicRun();
+  fake->send_status = V8HOST_E_QUOTA;
+  for (unsigned i = 0; i < 300; ++i) {
+    V8HostRun* run = reinterpret_cast<V8HostRun*>(1);
+    if (v8host_client_start_run(session, &input, &run) != V8HOST_E_QUOTA || run)
+      return Fail(detail, "enqueue rejection pending/run rollback");
+  }
+  fake->send_status = V8HOST_OK;
+  V8HostRun* run = nullptr;
+  if (v8host_client_start_run(session, &input, &run) != V8HOST_OK || !run)
+    return Fail(detail, "admission after quota rejection");
+  fake->send_status = V8HOST_E_QUOTA;
+  if (v8host_client_post_message(run, 0, nullptr, 0) != V8HOST_E_QUOTA ||
+      v8host_client_cancel_run(run) != V8HOST_E_QUOTA)
+    return Fail(detail, "post/cancel admission status");
+  Drain();
+  if (r.disconnects || !r.events.empty()) return Fail(detail, "quota must not masquerade as connect loss");
+  fake->send_status = V8HOST_OK; v8host_client_close_session(session); Drain();
+  return true;
+}
+
+struct TransportProbe {
+  HANDLE connected = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE disconnected = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE destroyed = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE inbound = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  std::atomic<int> losses{0}, frames{0};
+  TransportDisconnect reason = TransportDisconnect::kConnectFailed;
+  uint32_t conn = 0;
+  uint16_t major = 0, minor = 0;
+  ~TransportProbe() {
+    for (HANDLE h : {connected, disconnected, destroyed, inbound}) ::CloseHandle(h);
+  }
+};
+struct ProbeDelegate : ClientTransportDelegate {
+  explicit ProbeDelegate(TransportProbe* p) : probe(p) {}
+  ~ProbeDelegate() override { ::SetEvent(probe->destroyed); }
+  void OnConnected(uint32_t id, uint16_t major, uint16_t minor) override {
+    probe->conn = id; probe->major = major; probe->minor = minor;
+    ::SetEvent(probe->connected);
+  }
+  void OnInboundFrame(const uint8_t*, size_t) override {
+    ++probe->frames;
+    if (close_on_frame) close_on_frame->Close();
+    ::SetEvent(probe->inbound);
+  }
+  void OnDisconnect(TransportDisconnect reason) override {
+    probe->reason = reason; ++probe->losses; ::SetEvent(probe->disconnected);
+  }
+  ClientTransport* close_on_frame = nullptr;
+  TransportProbe* probe;
+};
+bool Signaled(HANDLE h) { return ::WaitForSingleObject(h, 5000) == WAIT_OBJECT_0; }
+
+struct PumpFixture {
+  TransportProbe probe;
+  HANDLE server = INVALID_HANDLE_VALUE, client = INVALID_HANDLE_VALUE;
+  HANDLE gate = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE entered = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE read_pending = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE write_pending = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  std::shared_ptr<ProbeDelegate> delegate = std::make_shared<ProbeDelegate>(&probe);
+  std::unique_ptr<ClientTransport> transport;
+  std::atomic<int> attempts{0};
+  std::vector<v8host::RendezvousStatus> results;
+  bool started = false;
+  ULONGLONG observed_deadline = 0;
+  bool consistent_deadline = true;
+  static v8host::RendezvousStatus Connect(void* context, v8host::BrokerConnection* conn,
+                                         v8host::HelloResult* hello, HANDLE stop, ULONGLONG deadline) {
+    auto& f = *static_cast<PumpFixture*>(context);
+    int attempt = f.attempts.fetch_add(1);
+    if (!f.observed_deadline) f.observed_deadline = deadline;
+    f.consistent_deadline &= f.observed_deadline == deadline;
+    ::SetEvent(f.entered);
+    HANDLE events[] = {stop, f.gate};
+    ULONGLONG now = ::GetTickCount64();
+    DWORD remaining = now < deadline ? static_cast<DWORD>(deadline - now) : 0;
+    if (::WaitForMultipleObjects(2, events, FALSE, remaining) != WAIT_OBJECT_0 + 1)
+      return v8host::RendezvousStatus::kStartTimeout;
+    auto status = attempt < static_cast<int>(f.results.size()) ? f.results[attempt] : v8host::RendezvousStatus::kOk;
+    if (status != v8host::RendezvousStatus::kOk) return status;
+    conn->AdoptForTesting(f.client); f.client = INVALID_HANDLE_VALUE;
+    hello->conn_id = 37; hello->selected_major = 1; hello->selected_minor = 7;
+    return status;
+  }
+  static void Pending(void* context, bool write) {
+    auto& f = *static_cast<PumpFixture*>(context);
+    ::SetEvent(write ? f.write_pending : f.read_pending);
+  }
+  bool Init(int mode = V8HOST_BROKER_SHARED) {
+    static std::atomic<unsigned> serial{0};
+    std::wstring name = LR"(\\.\pipe\v8host-client-test-)" + std::to_wstring(::GetCurrentProcessId()) +
+        L"-" + std::to_wstring(++serial);
+    server = ::CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 4096, 4096, 0, nullptr);
+    if (server == INVALID_HANDLE_VALUE) return false;
+    OVERLAPPED accept = {}; accept.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    BOOL accepted = ::ConnectNamedPipe(server, &accept);
+    DWORD error = ::GetLastError();
+    client = ::CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                          OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+    DWORD ignored = 0;
+    bool ok = client != INVALID_HANDLE_VALUE &&
+        (accepted || error == ERROR_PIPE_CONNECTED || (error == ERROR_IO_PENDING &&
+          Signaled(accept.hEvent) && ::GetOverlappedResult(server, &accept, &ignored, FALSE)));
+    if (!ok) { ::CancelIoEx(server, &accept); ::GetOverlappedResult(server, &accept, &ignored, TRUE); }
+    ::CloseHandle(accept.hEvent);
+    if (!ok) return false;
+    DWORD readmode = PIPE_READMODE_MESSAGE;
+    if (!::SetNamedPipeHandleState(client, &readmode, nullptr, nullptr)) return false;
+    TransportParams p; p.broker_mode = mode; p.test_context = this;
+    p.test_connect = Connect; p.test_pending = Pending;
+    transport.reset(v8host::client::CreateRealPipeClientTransport(p, delegate.get()));
+    return transport != nullptr;
+  }
+  bool Start() {
+    started = transport->Start(delegate) == V8HOST_OK;
+    return started && Signaled(entered);
+  }
+  bool Finish() {
+    transport->Close(); transport->Close();
+    delegate.reset();
+    return !started || Signaled(probe.destroyed);
+  }
+  ~PumpFixture() {
+    if (transport) Finish();
+    if (server != INVALID_HANDLE_VALUE) ::CloseHandle(server);
+    if (client != INVALID_HANDLE_VALUE) ::CloseHandle(client);
+    for (HANDLE h : {gate, entered, read_pending, write_pending}) ::CloseHandle(h);
+  }
+  bool Io(bool write, std::vector<uint8_t>* bytes) {
+    OVERLAPPED op = {}; op.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    DWORD size = 0;
+    BOOL ok = write ? ::WriteFile(server, bytes->data(), static_cast<DWORD>(bytes->size()), nullptr, &op)
+                    : ::ReadFile(server, bytes->data(), static_cast<DWORD>(bytes->size()), nullptr, &op);
+    if (!ok && ::GetLastError() == ERROR_IO_PENDING)
+      ok = Signaled(op.hEvent) && ::GetOverlappedResult(server, &op, &size, FALSE);
+    else if (ok) ok = ::GetOverlappedResult(server, &op, &size, FALSE);
+    if (!ok) { ::CancelIoEx(server, &op); ::GetOverlappedResult(server, &op, &size, TRUE); }
+    ::CloseHandle(op.hEvent);
+    if (ok && !write) bytes->resize(size);
+    return ok != FALSE;
+  }
+  V8HostStatus Send(const std::vector<uint8_t>& bytes) {
+    return transport->SendFrame(bytes.data(), bytes.size());
+  }
+};
+
+std::vector<uint8_t> SizedTransportFrame(size_t len, bool relay, uint32_t run = 1) {
+  FrameHeader h; h.version_major = 1;
+  h.type = relay ? MessageType::RELAY_TO_WORKER : MessageType::START_RUN;
+  h.session_id = 1; h.run_id = run; h.request_id = relay ? 0 : run + 1;
+  h.payload_length = static_cast<uint32_t>(len - kFrameHeaderSize);
+  std::vector<uint8_t> bytes; EncodeHeader(h, bytes); bytes.resize(len, 0x61);
+  return bytes;
+}
+bool TransportFifo(std::string* detail) {
+  PumpFixture f;
+  if (!f.Init()) return Fail(detail, "pipe pair");
+  FrameHeader header; header.version_major = 1; header.session_id = 1; header.request_id = 2;
+  CreateSessionPayload config; config.broker_mode = 1; config.prohibit_dynamic_code = true;
+  auto create = BuildCreateSessionFrame(header, config);
+  header.request_id = 3; header.run_id = 1;
+  StartRunPayload inputs; inputs.guest_payload = {'x'};
+  auto start = BuildStartRunFrame(header, inputs);
+  header.request_id = 0; header.type = MessageType::RELAY_TO_WORKER;
+  const uint8_t message[] = {'a', 'b'};
+  auto relay = BuildRelayFrame(header, -7, message, sizeof(message));
+  const std::vector<std::vector<uint8_t>> expected = {create, start, relay};
+  const MessageType types[] = {MessageType::CREATE_SESSION, MessageType::START_RUN, MessageType::RELAY_TO_WORKER};
+  if (f.Send(create) || f.Send(start) || f.Send(relay) || !f.Start()) return Fail(detail, "preconnect admission");
+  std::fill(start.begin(), start.end(), 0xFF);
+  DWORD available = 1;
+  if (!::PeekNamedPipe(f.server, nullptr, 0, nullptr, &available, nullptr) || available)
+    return Fail(detail, "application write before ACK");
+  ::SetEvent(f.gate);
+  if (!Signaled(f.probe.connected)) return Fail(detail, "connected publication");
+  for (unsigned i = 0; i < 3; ++i) {
+    std::vector<uint8_t> bytes(kMaxFrameSize);
+    FrameHeader h;
+    if (!f.Io(false, &bytes) || DecodeAndValidateFrame(bytes.data(), bytes.size(), &h) != DecodeStatus::kOk ||
+        h.conn_id != 37 || h.version_major != 1 || h.version_minor != 7 ||
+        h.type != types[i] || h.request_id != (i == 2 ? 0 : i + 2) || bytes.size() != expected[i].size() ||
+        !std::equal(bytes.begin() + kFrameHeaderSize, bytes.end(), expected[i].begin() + kFrameHeaderSize))
+      return Fail(detail, "FIFO/stamping/deep copy");
+  }
+  if (!f.Finish() || f.transport->QueuedBytesForTesting() || f.probe.losses ||
+      f.Send(create) != V8HOST_E_CONNECT || f.transport->Start(f.delegate) != V8HOST_E_CONNECT)
+    return Fail(detail, "closed transport reuse/cleanup");
+  return true;
+}
+
+bool TransportReadWriteStop(std::string* detail) {
+  PumpFixture f;
+  if (!f.Init() || !f.Start()) return Fail(detail, "start");
+  ::SetEvent(f.gate);
+  if (!Signaled(f.read_pending)) return Fail(detail, "genuine pending read");
+  auto bytes = SizedTransportFrame(kMaxFrameSize, true);
+  if (f.Send(bytes) || !Signaled(f.write_pending) || f.transport->QueuedBytesForTesting() != bytes.size())
+    return Fail(detail, "pending write/inflight credit");
+  // Both pending operations must be drained before the delegate lease drops.
+  if (!f.Finish() || f.probe.losses || f.transport->QueuedBytesForTesting())
+    return Fail(detail, "cancel/drain/lease");
+  return true;
+}
+
+
+bool TransportWriteLoss(std::string* detail) {
+  PumpFixture f;
+  if (!f.Init() || !f.Start()) return Fail(detail, "pair/start");
+  ::SetEvent(f.gate);
+  if (!Signaled(f.read_pending)) return Fail(detail, "pending read");
+  auto bytes = SizedTransportFrame(kMaxFrameSize, true);
+  if (f.Send(bytes) || !Signaled(f.write_pending)) return Fail(detail, "pending write");
+  ::CloseHandle(f.server); f.server = INVALID_HANDLE_VALUE;
+  if (!Signaled(f.probe.disconnected) || f.probe.losses != 1 ||
+      f.probe.reason != TransportDisconnect::kBrokerLost || f.attempts != 1 ||
+      f.Send(bytes) != V8HOST_E_CONNECT || !f.Finish() || f.transport->QueuedBytesForTesting())
+    return Fail(detail, "ambiguous write loss must drain, terminalize once, never replay");
+  return true;
+}
+
+bool FillTransport(PumpFixture& f, size_t total, bool relay, uint32_t run) {
+  while (total) {
+    size_t len = (std::min)(total, size_t{kMaxFrameSize});
+    if (total > len && total - len < 36) len -= 36;
+    if (f.Send(SizedTransportFrame(len, relay, run)) != V8HOST_OK) return false;
+    total -= len;
+  }
+  return true;
+}
+bool TransportQueueBoundaries(std::string* detail) {
+  for (size_t offset : {size_t{0}, size_t{1}}) {
+    PumpFixture f;
+    if (!f.Init() || !FillTransport(f, kMaxControlQueueBytes - offset, false, 1) ||
+        f.Send(SizedTransportFrame(32, false)) != V8HOST_E_QUOTA ||
+        f.transport->QueuedBytesForTesting() != kMaxControlQueueBytes - offset)
+      return Fail(detail, "control byte boundary");
+  }
+  {
+    PumpFixture f; if (!f.Init()) return Fail(detail, "pair");
+    for (unsigned i = 0; i < kMaxControlQueueRequests; ++i)
+      if (f.Send(SizedTransportFrame(32, false)) != V8HOST_OK) return Fail(detail, "control count cap");
+    if (f.Send(SizedTransportFrame(32, false)) != V8HOST_E_QUOTA) return Fail(detail, "control count +1");
+  }
+  for (size_t offset : {size_t{0}, size_t{1}}) {
+    PumpFixture f; if (!f.Init()) return Fail(detail, "pair");
+    if (!FillTransport(f, kMaxQueuedRelayBytesPerRun - offset, true, 1) ||
+        f.Send(SizedTransportFrame(36, true, 1)) != V8HOST_E_QUOTA ||
+        f.transport->QueuedBytesForTesting() != kMaxQueuedRelayBytesPerRun - offset)
+      return Fail(detail, "run byte boundary");
+  }
+  PumpFixture f; if (!f.Init()) return Fail(detail, "pair");
+  for (unsigned run = 1; run <= 16; ++run)
+    if (!FillTransport(f, kMaxQueuedRelayBytesPerRun, true, run)) return Fail(detail, "connection cap");
+  if (f.transport->QueuedBytesForTesting() != kMaxQueuedRelayBytesPerConnection ||
+      f.Send(SizedTransportFrame(36, true, 17)) != V8HOST_E_QUOTA || !f.Start())
+    return Fail(detail, "connection +1");
+  if (!f.Finish() || f.transport->QueuedBytesForTesting()) return Fail(detail, "stop queue credit");
+  return true;
+}
+
+bool TransportMalformed(std::string* detail) {
+  for (int variant = 0; variant < 3; ++variant) {
+    PumpFixture f; if (!f.Init() || !f.Start()) return Fail(detail, "pair/start");
+    ::SetEvent(f.gate);
+    if (!Signaled(f.read_pending)) return Fail(detail, "pending read");
+    std::vector<uint8_t> bytes = variant == 0 ? std::vector<uint8_t>{1, 2, 3}
+        : SizedTransportFrame(variant == 1 ? 33 : kMaxFrameSize, false);
+    if (variant == 1) bytes.pop_back();
+    if (variant == 2) bytes.push_back(0);
+    if (!f.Io(true, &bytes) || !Signaled(f.probe.disconnected) || f.probe.losses != 1 ||
+        f.probe.reason != TransportDisconnect::kProtocolError || !f.Finish() || f.attempts != 1)
+      return Fail(detail, "malformed/partial/oversized disconnect");
+  }
+  return true;
+}
+
+bool TransportRetry(std::string* detail) {
+  using Status = v8host::RendezvousStatus;
+  for (auto status : {Status::kIoFailed, Status::kProtocolFailed, Status::kPeerAuthenticationFailed, Status::kStartTimeout}) {
+    for (int mode : {V8HOST_BROKER_SHARED, V8HOST_BROKER_DEDICATED}) {
+      PumpFixture f; f.results = {status};
+      if (!f.Init(mode) || !f.Start()) return Fail(detail, "script start");
+      ::SetEvent(f.gate);
+      bool retry = status == Status::kIoFailed && mode == V8HOST_BROKER_SHARED;
+      if (!Signaled(retry ? f.probe.connected : f.probe.disconnected) ||
+          f.attempts != (retry ? 2 : 1)) return Fail(detail, "preack retry policy");
+      if (retry) {
+        ::CloseHandle(f.server); f.server = INVALID_HANDLE_VALUE;
+        if (!Signaled(f.probe.disconnected) || f.probe.reason != TransportDisconnect::kBrokerLost || f.attempts != 2)
+          return Fail(detail, "postack no reconnect");
+      }
+      if (!f.Finish() || f.probe.losses != 1) return Fail(detail, "sole disconnect");
+    }
+  }
+  PumpFixture expired; expired.results.assign(1000, Status::kIoFailed);
+  if (!expired.Init() || !expired.Start()) return Fail(detail, "deadline start");
+  ::SetEvent(expired.gate);
+  if (::WaitForSingleObject(expired.probe.disconnected, 7000) != WAIT_OBJECT_0 ||
+      expired.attempts < 2 || !expired.consistent_deadline || !expired.Finish() || expired.probe.losses != 1)
+    return Fail(detail, "one overall preack deadline");
+  PumpFixture stopped; if (!stopped.Init() || !stopped.Start() || !stopped.Finish() || stopped.probe.losses)
+    return Fail(detail, "cancelled connect");
+  return true;
+}
+
+
+HANDLE g_first_admitted = nullptr, g_second_attempted = nullptr;
+std::atomic<int> g_submission_before{0}, g_submission_after{0};
+bool g_hold_before_submission = false;
+std::atomic<bool> g_order_barrier_ok{true};
+void BeforeSubmission() {
+  const int count = ++g_submission_before;
+  if (g_hold_before_submission && count == 1) {
+    ::SetEvent(g_first_admitted);
+    if (::WaitForSingleObject(g_second_attempted, 5000) != WAIT_OBJECT_0) g_order_barrier_ok = false;
+  } else if (!g_hold_before_submission && count == 2) {
+    ::SetEvent(g_second_attempted);
+  }
+}
+void AfterSubmission() {
+  if (++g_submission_after == 1 && !g_hold_before_submission) {
+    ::SetEvent(g_first_admitted);
+    if (::WaitForSingleObject(g_second_attempted, 5000) != WAIT_OBJECT_0) g_order_barrier_ok = false;
+  }
+}
+bool ControlIdSendOrder(std::string* detail) {
+  for (bool before : {false, true}) {
+  g_hold_before_submission = before;
+  FakeTransport* fake = nullptr; V8HostSession* session = Create(&fake);
+  Recorder r; auto callbacks = Callbacks(&r); v8host_client_set_callbacks(session, &callbacks);
+  auto input = BasicRun(); V8HostRun* run = nullptr;
+  if (v8host_client_start_run(session, &input, &run) != V8HOST_OK) return Fail(detail, "start");
+  g_first_admitted = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  g_second_attempted = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  g_submission_before = g_submission_after = 0;
+  g_order_barrier_ok = g_first_admitted && g_second_attempted;
+  v8host::client::SetSubmissionHooksForTesting(BeforeSubmission, AfterSubmission);
+  V8HostStatus first = V8HOST_E_INTERNAL, second = V8HOST_E_INTERNAL;
+  std::thread a([&] { first = v8host::client::SubmitCancelForTesting(session, 1); });
+  bool entered = Signaled(g_first_admitted);
+  std::thread b([&] {
+    second = v8host::client::SubmitCancelForTesting(session, 1);
+    if (before) ::SetEvent(g_second_attempted);
+  });
+  a.join(); b.join();
+  v8host::client::SetSubmissionHooksForTesting(nullptr, nullptr);
+  ::CloseHandle(g_first_admitted); ::CloseHandle(g_second_attempted);
+  bool ok = entered && g_order_barrier_ok && first == V8HOST_OK && second == V8HOST_OK && g_submission_before == 2 && g_submission_after == 2;
+  for (unsigned i = 2; i < 4; ++i) {
+    FrameHeader h; auto frame = fake->Frame(i);
+    ok &= DecodeAndValidateFrame(frame.data(), frame.size(), &h) == DecodeStatus::kOk &&
+        h.request_id == i + 2 && h.type == MessageType::CANCEL_RUN;
+    fake->Inbound(AckFor(frame));
+  }
+  Drain(); ok &= r.disconnects == 0;
+  v8host_client_close_session(session); Drain();
+  if (!ok) return Fail(detail, "barrier-controlled allocation/reservation/enqueue order");
+  }
+  return true;
+}
+bool TransportCallbackClose(std::string* detail) {
+  PumpFixture f; if (!f.Init() || !f.Start()) return Fail(detail, "pair/start");
+  f.delegate->close_on_frame = f.transport.get();
+  ::SetEvent(f.gate);
+  if (!Signaled(f.read_pending)) return Fail(detail, "read pending");
+  auto bytes = SizedTransportFrame(32, false);
+  if (!f.Io(true, &bytes) || !Signaled(f.probe.inbound) || !f.Finish() || f.probe.frames != 1 || f.probe.losses ||
+      f.Send(bytes) != V8HOST_E_CONNECT || f.transport->QueuedBytesForTesting())
+    return Fail(detail, "callback close/lease/no replay");
+  return true;
+}
+bool HandshakeRejects(std::string* detail) {
+  for (int variant = 0; variant < 5; ++variant) {
+    PumpFixture f; if (!f.Init()) return Fail(detail, "pair");
+    v8host::BrokerConnection conn; conn.AdoptForTesting(f.client); f.client = INVALID_HANDLE_VALUE;
+    v8host::HelloResult hello;
+    v8host::RendezvousStatus status = v8host::RendezvousStatus::kOk;
+    std::thread handshake([&] { status = conn.Handshake(1, &hello); });
+    std::vector<uint8_t> request(kMaxFrameSize);
+    bool ok = f.Io(false, &request);
+    FrameHeader request_header;
+    ok &= DecodeAndValidateFrame(request.data(), request.size(), &request_header) == DecodeStatus::kOk &&
+        request_header.type == MessageType::HELLO && request_header.request_id == 1 && request_header.conn_id == 0;
+    FrameHeader h; h.version_major = 1; h.conn_id = 37; h.request_id = variant == 1 ? 2 : 1;
+    HelloAckPayload ack; ack.broker_version_major = 1;
+    auto bytes = BuildHelloAckFrame(h, ack);
+    if (variant == 0) bytes[0] = 0;
+    if (variant == 2) { h.version_minor = 1; bytes = BuildHelloAckFrame(h, ack); }
+    if (variant == 3) bytes = BuildErrorFrame(h, ErrorPayload{});
+    if (variant == 4) bytes.resize(513, 0);
+    ok &= f.Io(true, &bytes); handshake.join();
+    auto expected = variant == 3 ? v8host::RendezvousStatus::kPeerAuthenticationFailed
+                                : v8host::RendezvousStatus::kProtocolFailed;
+    if (!ok || status != expected || hello.conn_id != 0) return Fail(detail, "invalid/rejected ACK must not be retryable IO");
+  }
+  return true;
+}
+bool TransportExactCrossing(std::string* detail) {
+  for (bool relay : {false, true}) {
+    PumpFixture f; if (!f.Init()) return Fail(detail, "pair");
+    const size_t cap = relay ? kMaxQueuedRelayBytesPerRun : kMaxControlQueueBytes;
+    if (!FillTransport(f, cap - 35, relay, 1) || f.Send(SizedTransportFrame(36, relay)) != V8HOST_E_QUOTA ||
+        f.transport->QueuedBytesForTesting() != cap - 35) return Fail(detail, "exact cap+1 rejection");
+  }
+  PumpFixture f; if (!f.Init()) return Fail(detail, "pair");
+  for (unsigned run = 1; run < 16; ++run)
+    if (!FillTransport(f, kMaxQueuedRelayBytesPerRun, true, run)) return Fail(detail, "connection fill");
+  if (!FillTransport(f, kMaxQueuedRelayBytesPerRun - 35, true, 16) ||
+      f.Send(SizedTransportFrame(36, true, 17)) != V8HOST_E_QUOTA ||
+      f.transport->QueuedBytesForTesting() != kMaxQueuedRelayBytesPerConnection - 35)
+    return Fail(detail, "connection exact cap+1 rejection");
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1275,6 +1742,19 @@ int main(int argc, char** argv) {
   SetInitializeAfterDispatcherHookForTesting(nullptr);
   racer.join();
   const std::vector<TestCase> tests = {
+      {"transport", "control-id-send-order", ControlIdSendOrder},
+      {"transport", "close-lifetime-no-replay", TransportCallbackClose},
+      {"transport", "handshake-rejects", HandshakeRejects},
+      {"transport", "exact-quota-crossing", TransportExactCrossing},
+      {"transport", "startup-registration-failure", StartupRegistrationFailure},
+      {"transport", "id-exhaustion", ClientIdExhaustion},
+      {"transport", "admission-rollback", AdmissionRollback},
+      {"transport", "preconnect-fifo-version", TransportFifo},
+      {"transport", "read-write-stop", TransportReadWriteStop},
+      {"transport", "write-loss-no-replay", TransportWriteLoss},
+      {"transport", "queue-boundaries", TransportQueueBoundaries},
+      {"transport", "malformed-message", TransportMalformed},
+      {"transport", "preack-retry-policy", TransportRetry},
       {"init", "concurrent-thread-binding-destruction",
        ConcurrentInitializeLifecycle},
       {"validate", "struct-sizes", ValidateStructSizes},

@@ -19,6 +19,7 @@
 #undef ERROR
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -87,6 +88,8 @@ namespace v8host::client {
 namespace {
 
 constexpr UINT kDestroySessionMessage = WM_APP + 0x1E;
+constexpr UINT kStartTransportMessage = WM_APP + 0x1F;
+void StartConnection(ClientConnection* connection);
 
 HINSTANCE ModuleInstance() {
   return reinterpret_cast<HINSTANCE>(&__ImageBase);
@@ -185,6 +188,14 @@ class ClientRuntime {
   }
 
  public:
+  bool ScheduleStart(std::shared_ptr<ClientConnection> connection) {
+    auto* pending = new (std::nothrow) std::shared_ptr<ClientConnection>(std::move(connection));
+    if (!pending) return false;
+    if (::PostMessageW(hwnd_, kStartTransportMessage, reinterpret_cast<WPARAM>(pending), 0)) return true;
+    delete pending;
+    return false;
+  }
+
   bool IsInitialized() const {
     return initialized_.load(std::memory_order_acquire);
   }
@@ -209,6 +220,12 @@ class ClientRuntime {
                                      UINT message,
                                      WPARAM wparam,
                                      LPARAM lparam) {
+    if (message == kStartTransportMessage) {
+      std::unique_ptr<std::shared_ptr<ClientConnection>> pending(
+          reinterpret_cast<std::shared_ptr<ClientConnection>*>(wparam));
+      StartConnection(pending->get());
+      return 0;
+    }
     if (message == kDestroySessionMessage) {
       Instance().last_delete_thread_id_.store(::GetCurrentThreadId(),
                                                std::memory_order_release);
@@ -231,6 +248,7 @@ class ClientRuntime {
 
 #ifdef V8HOST_CLIENT_TESTING
 std::atomic<ClientTransportFactory> g_test_factory{nullptr};
+std::atomic<void (*)()> g_before_submission{nullptr}, g_admitted_submission{nullptr};
 std::atomic<void (*)()> g_initialize_after_dispatcher_hook{nullptr};
 std::atomic<void (*)(V8HostStatus)> g_inbound_status_observer{nullptr};
 #endif
@@ -339,21 +357,81 @@ class ClientConnection final
   V8HostStatus Initialize(int32_t broker_mode) {
     TransportParams params;
     params.broker_mode = broker_mode;
+    std::vector<wchar_t> path(256);
+    for (;;) {
+      const DWORD len = ::GetModuleFileNameW(ModuleInstance(), path.data(),
+                                             static_cast<DWORD>(path.size()));
+      if (!len) return V8HOST_E_CONNECT;
+      if (len < path.size()) {
+        params.payload_directory.assign(path.data(), len);
+        const size_t slash = params.payload_directory.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) return V8HOST_E_CONNECT;
+        params.payload_directory.resize(slash);
+        break;
+      }
+      if (path.size() >= 32768) return V8HOST_E_CONNECT;
+      path.resize((std::min)(path.size() * 2, size_t{32768}));
+    }
     transport_.reset(CreateTransport(params, this));
     if (!transport_)
       return V8HOST_E_NO_MEMORY;
-    // A transport start/send failure is an asynchronous connection outcome.
-    // A complete transport reports start failure through the delegate;
-    // this skeleton fails closed without a delegate notification.
-    transport_->Start();
     return V8HOST_OK;
   }
 
-  uint32_t AllocateSessionId() {
-    return next_session_id_.fetch_add(1, std::memory_order_relaxed);
+  void StartTransport() {
+    if (transport_->Start(shared_from_this()) != V8HOST_OK)
+      OnDisconnect(TransportDisconnect::kConnectFailed);
   }
-  uint32_t AllocateRequestId() {
-    return next_request_id_.fetch_add(1, std::memory_order_relaxed);
+
+  uint32_t AllocateSessionId() { return 1; }
+  void TerminalizeExhaustion() {
+    if (exhausted_.load(std::memory_order_acquire))
+      OnDisconnect(TransportDisconnect::kProtocolError);
+  }
+#ifdef V8HOST_CLIENT_TESTING
+  void SetRequestId(uint32_t id) {
+    std::lock_guard<std::mutex> lock(submission_mutex_);
+    next_request_id_ = id;
+  }
+#endif
+
+  template <typename Builder>
+  V8HostStatus SubmitControl(PendingControl pending, Builder build) {
+#ifdef V8HOST_CLIENT_TESTING
+    if (auto hook = g_before_submission.load(std::memory_order_acquire)) hook();
+#endif
+    // Order: session -> submission -> pending; callbacks never take submission.
+    std::lock_guard<std::mutex> order(submission_mutex_);
+    if (disconnected_.load(std::memory_order_acquire))
+      return V8HOST_E_CONNECT;
+    if (next_request_id_ == UINT32_MAX) {
+      exhausted_.store(true, std::memory_order_release);
+      return V8HOST_E_QUOTA;
+    }
+    const uint32_t id = next_request_id_++;
+    V8HostStatus status = ReservePending(id, pending);
+    if (status != V8HOST_OK)
+      return status;
+    protocol::FrameHeader header;
+    header.version_major = protocol::kWireVersionMajor;
+    header.version_minor = protocol::kWireVersionMinor;
+    header.flags = protocol::kFlagMustUnderstand;
+    header.conn_id = conn_id();
+    header.session_id = pending.session_id;
+    header.run_id = pending.run_id;
+    header.request_id = id;
+#ifdef V8HOST_CLIENT_TESTING
+    if (auto hook = g_admitted_submission.load(std::memory_order_acquire)) hook();
+#endif
+    status = Send(build(header));
+    if (status != V8HOST_OK)
+      RemovePending(id);
+    return status;
+  }
+
+  void OnConnected(uint32_t, uint16_t major, uint16_t minor) override {
+    selected_major_.store(major, std::memory_order_release);
+    selected_minor_.store(minor, std::memory_order_release);
   }
 
   uint32_t conn_id() const {
@@ -401,7 +479,8 @@ class ClientConnection final
     if (protocol::DecodeAndValidateFrame(bytes, len, &header, &payload,
                                          &payload_len) !=
             protocol::DecodeStatus::kOk ||
-        header.version_major != protocol::kWireVersionMajor ||
+        header.version_major != selected_major_.load(std::memory_order_acquire) ||
+        header.version_minor != selected_minor_.load(std::memory_order_acquire) ||
         header.conn_id != conn_id()) {
       OnDisconnect(TransportDisconnect::kProtocolError);
       ObserveInboundStatusForTesting(V8HOST_E_PROTOCOL);
@@ -429,6 +508,7 @@ class ClientConnection final
                                                 std::memory_order_acq_rel)) {
       return;
     }
+    CloseTransport();
     const V8HostStatus status =
         reason == TransportDisconnect::kProtocolError
             ? V8HOST_E_PROTOCOL
@@ -672,12 +752,31 @@ class ClientConnection final
   std::deque<uint32_t> consumed_requests_;
   std::unordered_map<uint32_t, PendingControl> consumed_request_map_;
   std::unique_ptr<ClientTransport> transport_;
-  std::atomic<uint32_t> next_session_id_{1};
-  std::atomic<uint32_t> next_request_id_{1};
+  std::mutex submission_mutex_;
+  uint32_t next_request_id_ = 2;
+  std::atomic<uint16_t> selected_major_{protocol::kWireVersionMajor};
+  std::atomic<uint16_t> selected_minor_{protocol::kWireVersionMinor};
   std::atomic<bool> disconnected_{false};
+  std::atomic<bool> exhausted_{false};
 };
 
+namespace {
+void StartConnection(ClientConnection* connection) { connection->StartTransport(); }
+}
 #ifdef V8HOST_CLIENT_TESTING
+void SetSubmissionHooksForTesting(void (*before)(), void (*admitted)()) {
+  g_before_submission.store(before, std::memory_order_release);
+  g_admitted_submission.store(admitted, std::memory_order_release);
+}
+V8HostStatus SubmitCancelForTesting(V8HostSession* session, uint32_t run) {
+  return session->conn->SubmitControl({PendingType::kCancel, session->session_id, run},
+      [](const auto& header) { return protocol::BuildCancelRunFrame(header); });
+}
+void SetIdsForTesting(V8HostSession* session, uint32_t request, uint32_t run) {
+  std::lock_guard<std::mutex> lock(session->mutex);
+  session->conn->SetRequestId(request);
+  session->next_run_id = run;
+}
 void SetTransportFactoryForTesting(ClientTransportFactory factory) {
   g_test_factory.store(factory, std::memory_order_release);
 }
@@ -865,23 +964,23 @@ V8HostStatus V8HOST_CALL v8host_client_create_session(
   session->dispatch_id = session->dispatch->id();
   connection->RegisterSession(session.get());
 
-  const uint32_t request_id = connection->AllocateRequestId();
-  status = connection->ReservePending(
-      request_id, {v8host::client::PendingType::kCreate, session->session_id, 0});
+  status = connection->SubmitControl(
+      {v8host::client::PendingType::kCreate, session->session_id, 0},
+      [&](const auto& header) {
+        return v8host::protocol::BuildCreateSessionFrame(
+            header, v8host::client::MakeCreatePayload(session->config));
+      });
   if (status != V8HOST_OK) {
     connection->UnregisterSession(session->session_id);
     session->dispatch->CloseAndRelease();
     session->dispatch = nullptr;
     return status;
   }
-  const auto header = v8host::client::MakeHeader(
-      connection.get(), session->session_id, 0, request_id, true);
-  const auto frame = v8host::protocol::BuildCreateSessionFrame(
-      header, v8host::client::MakeCreatePayload(session->config));
-  if (connection->Send(frame) != V8HOST_OK) {
-    connection->RemovePending(request_id);
-    connection->OnDisconnect(
-        v8host::client::TransportDisconnect::kConnectFailed);
+  if (!v8host::client::ClientRuntime::Instance().ScheduleStart(connection)) {
+    connection->UnregisterSession(session->session_id);
+    session->dispatch->CloseAndRelease();
+    session->dispatch = nullptr;
+    return V8HOST_E_CONNECT;
   }
 
   *out_session = session.release();
@@ -967,6 +1066,11 @@ V8HostStatus V8HOST_CALL v8host_client_start_run(
   if (!run)
     return V8HOST_E_NO_MEMORY;
   run->session = session;
+  if (session->next_run_id == UINT32_MAX) {
+    lock.unlock();
+    session->conn->OnDisconnect(v8host::client::TransportDisconnect::kProtocolError);
+    return V8HOST_E_QUOTA;
+  }
   run->run_id = session->next_run_id++;
   V8HostRun* run_handle = run.get();
 
@@ -980,25 +1084,19 @@ V8HostStatus V8HOST_CALL v8host_client_start_run(
     const auto* bytes = static_cast<const uint8_t*>(inputs->payload);
     payload.guest_payload.assign(bytes, bytes + inputs->payload_len);
   }
-  const uint32_t request_id = session->conn->AllocateRequestId();
-  const auto header = v8host::client::MakeHeader(
-      session->conn.get(), session->session_id, run->run_id, request_id, true);
-  const auto frame =
-      v8host::protocol::BuildStartRunFrame(header, payload);
-  status = session->conn->ReservePending(
-      request_id, {v8host::client::PendingType::kStart, session->session_id,
-                   run_handle->run_id});
-  if (status != V8HOST_OK)
-    return status;
   session->runs.emplace(run->run_id, std::move(run));
-  const V8HostStatus send_status = session->conn->Send(frame);
-  *out_run = run_handle;
-  lock.unlock();
-  if (send_status != V8HOST_OK) {
-    session->conn->RemovePending(request_id);
-    session->conn->OnDisconnect(
-        v8host::client::TransportDisconnect::kConnectFailed);
+  status = session->conn->SubmitControl(
+      {v8host::client::PendingType::kStart, session->session_id, run_handle->run_id},
+      [&](const auto& header) {
+        return v8host::protocol::BuildStartRunFrame(header, payload);
+      });
+  if (status != V8HOST_OK) {
+    session->runs.erase(run_handle->run_id);
+    lock.unlock();
+    session->conn->TerminalizeExhaustion();
+    return status;
   }
+  *out_run = run_handle;
   return V8HOST_OK;
 }
 
@@ -1019,19 +1117,13 @@ V8HostStatus V8HOST_CALL v8host_client_post_message(
     return V8HOST_E_INVALID_STATE;
   if (run->terminal_local.load(std::memory_order_acquire))
     return V8HOST_E_RUN_TERMINAL;
-  const uint32_t request_id = session->conn->AllocateRequestId();
   auto header = v8host::client::MakeHeader(
-      session->conn.get(), session->session_id, run->run_id, request_id, false);
+      session->conn.get(), session->session_id, run->run_id, 0, false);
   header.type = v8host::protocol::MessageType::RELAY_TO_WORKER;
   const auto frame = v8host::protocol::BuildRelayFrame(
       header, kind, static_cast<const uint8_t*>(data), len);
   const V8HostStatus send_status = session->conn->Send(frame);
-  lock.unlock();
-  if (send_status != V8HOST_OK) {
-    session->conn->OnDisconnect(
-        v8host::client::TransportDisconnect::kConnectFailed);
-  }
-  return V8HOST_OK;
+  return send_status;
 }
 
 V8HostStatus V8HOST_CALL v8host_client_cancel_run(V8HostRun* run) {
@@ -1045,23 +1137,12 @@ V8HostStatus V8HOST_CALL v8host_client_cancel_run(V8HostRun* run) {
     return V8HOST_E_INVALID_STATE;
   if (run->terminal_local.load(std::memory_order_acquire))
     return V8HOST_E_RUN_TERMINAL;
-  const uint32_t request_id = session->conn->AllocateRequestId();
-  const auto header = v8host::client::MakeHeader(
-      session->conn.get(), session->session_id, run->run_id, request_id, true);
-  const auto frame = v8host::protocol::BuildCancelRunFrame(header);
-  const V8HostStatus reserve_status = session->conn->ReservePending(
-      request_id, {v8host::client::PendingType::kCancel, session->session_id,
-                   run->run_id});
-  if (reserve_status != V8HOST_OK)
-    return reserve_status;
-  const V8HostStatus send_status = session->conn->Send(frame);
+  V8HostStatus status = session->conn->SubmitControl(
+      {v8host::client::PendingType::kCancel, session->session_id, run->run_id},
+      [](const auto& header) { return v8host::protocol::BuildCancelRunFrame(header); });
   lock.unlock();
-  if (send_status != V8HOST_OK) {
-    session->conn->RemovePending(request_id);
-    session->conn->OnDisconnect(
-        v8host::client::TransportDisconnect::kConnectFailed);
-  }
-  return V8HOST_OK;
+  session->conn->TerminalizeExhaustion();
+  return status;
 }
 
 void V8HOST_CALL v8host_client_close_session(V8HostSession* session) {
@@ -1077,17 +1158,9 @@ void V8HOST_CALL v8host_client_close_session(V8HostSession* session) {
   }
   session->conn->UnregisterSession(session->session_id);
   session->dispatch->CloseAndRelease();
-  const uint32_t request_id = session->conn->AllocateRequestId();
-  const auto header = v8host::client::MakeHeader(
-      session->conn.get(), session->session_id, 0, request_id, true);
-  const auto frame = v8host::protocol::BuildCloseSessionFrame(header);
-  if (session->conn->ReservePending(
-          request_id,
-          {v8host::client::PendingType::kClose, session->session_id, 0}) ==
-      V8HOST_OK) {
-    if (session->conn->Send(frame) != V8HOST_OK)
-      session->conn->RemovePending(request_id);
-  }
+  session->conn->SubmitControl(
+      {v8host::client::PendingType::kClose, session->session_id, 0},
+      [](const auto& header) { return v8host::protocol::BuildCloseSessionFrame(header); });
   session->conn->CloseTransport();
   session->Release();
 }

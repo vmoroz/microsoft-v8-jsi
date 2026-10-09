@@ -10,11 +10,24 @@
 namespace v8host {
 namespace {
 
+DWORD Remaining(ULONGLONG deadline, DWORD cap) {
+  const ULONGLONG now = ::GetTickCount64();
+  return now >= deadline ? 0 : static_cast<DWORD>((std::min)(deadline - now, ULONGLONG{cap}));
+}
+bool WaitIo(HANDLE event, HANDLE stop, DWORD timeout) {
+  HANDLE events[] = {stop, event};
+  return stop ? ::WaitForMultipleObjects(2, events, FALSE, timeout) == WAIT_OBJECT_0 + 1
+              : ::WaitForSingleObject(event, timeout) == WAIT_OBJECT_0;
+}
+bool Stopped(HANDLE stop) {
+  return stop && ::WaitForSingleObject(stop, 0) == WAIT_OBJECT_0;
+}
+
 bool IoWithDeadline(HANDLE pipe,
                     bool write,
                     void* buffer,
                     DWORD size,
-                    DWORD timeout_ms) {
+                    DWORD timeout_ms, HANDLE stop = nullptr) {
   OVERLAPPED overlapped = {};
   overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
   if (!overlapped.hEvent)
@@ -28,8 +41,7 @@ bool IoWithDeadline(HANDLE pipe,
   if (started) {
     ok = ::GetOverlappedResult(pipe, &overlapped, &transferred, FALSE) != FALSE;
   } else if (pending &&
-             ::WaitForSingleObject(overlapped.hEvent, timeout_ms) ==
-                 WAIT_OBJECT_0) {
+             WaitIo(overlapped.hEvent, stop, timeout_ms)) {
     ok = ::GetOverlappedResult(pipe, &overlapped, &transferred, FALSE) != FALSE;
     pending = false;
   }
@@ -51,7 +63,7 @@ bool ReadFrameMessage(HANDLE pipe,
                       uint8_t* buf,
                       DWORD buf_size,
                       DWORD* out_len,
-                      DWORD timeout_ms) {
+                      DWORD timeout_ms, HANDLE stop = nullptr) {
   OVERLAPPED overlapped = {};
   overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
   if (!overlapped.hEvent)
@@ -59,15 +71,17 @@ bool ReadFrameMessage(HANDLE pipe,
   DWORD transferred = 0;
   BOOL started = ::ReadFile(pipe, buf, buf_size, nullptr, &overlapped);
   bool pending = !started && ::GetLastError() == ERROR_IO_PENDING;
+  DWORD failure = started ? ERROR_SUCCESS : ::GetLastError();
   bool ok = false;
   if (started) {
     ok = ::GetOverlappedResult(pipe, &overlapped, &transferred, FALSE) != FALSE;
   } else if (pending &&
-             ::WaitForSingleObject(overlapped.hEvent, timeout_ms) ==
-                 WAIT_OBJECT_0) {
+             WaitIo(overlapped.hEvent, stop, timeout_ms)) {
     ok = ::GetOverlappedResult(pipe, &overlapped, &transferred, FALSE) != FALSE;
+    if (!ok) failure = ::GetLastError();
     pending = false;
   }
+  if (!ok && !pending && started) failure = ::GetLastError();
   if (pending) {
     ::CancelIoEx(pipe, &overlapped);
     ::GetOverlappedResult(pipe, &overlapped, &transferred, TRUE);
@@ -75,6 +89,7 @@ bool ReadFrameMessage(HANDLE pipe,
   ::CloseHandle(overlapped.hEvent);
   if (ok)
     *out_len = transferred;
+  if (!ok) ::SetLastError(failure);
   return ok;
 }
 
@@ -132,8 +147,17 @@ void BrokerConnection::Close() {
   }
 }
 
+#ifdef V8HOST_CLIENT_TESTING
+void BrokerConnection::AdoptForTesting(HANDLE pipe) {
+  Close();
+  state_->pipe = pipe;
+}
+#endif
+
 RendezvousStatus BrokerConnection::Handshake(uint32_t request_id,
-                                             HelloResult* result) {
+                                             HelloResult* result, HANDLE stop, ULONGLONG deadline) {
+  if (!deadline) deadline = ::GetTickCount64() + 4000;
+  if (Stopped(stop) || !Remaining(deadline, 1)) return RendezvousStatus::kStartTimeout;
   if (!result || pipe() == INVALID_HANDLE_VALUE || request_id == 0)
     return RendezvousStatus::kInvalidArgument;
 
@@ -148,14 +172,15 @@ RendezvousStatus BrokerConnection::Handshake(uint32_t request_id,
   request_header.request_id = request_id;
   std::vector<uint8_t> frame = protocol::BuildHelloFrame(request_header);
   if (!IoWithDeadline(pipe(), /*write=*/true, frame.data(),
-                      static_cast<DWORD>(frame.size()), 2000)) {
+                      static_cast<DWORD>(frame.size()), Remaining(deadline, 2000), stop)) {
     return RendezvousStatus::kIoFailed;
   }
 
   uint8_t buffer[512] = {};
   DWORD len = 0;
-  if (!ReadFrameMessage(pipe(), buffer, sizeof(buffer), &len, 2000))
-    return RendezvousStatus::kIoFailed;
+  if (!ReadFrameMessage(pipe(), buffer, sizeof(buffer), &len, Remaining(deadline, 2000), stop))
+    return ::GetLastError() == ERROR_MORE_DATA ? RendezvousStatus::kProtocolFailed
+                                             : RendezvousStatus::kIoFailed;
 
   protocol::FrameHeader ack_header;
   const uint8_t* payload = nullptr;
@@ -163,7 +188,7 @@ RendezvousStatus BrokerConnection::Handshake(uint32_t request_id,
   if (protocol::DecodeAndValidateFrame(buffer, len, &ack_header, &payload,
                                        &payload_size) !=
       protocol::DecodeStatus::kOk) {
-    return RendezvousStatus::kIoFailed;
+    return RendezvousStatus::kProtocolFailed;
   }
   if (ack_header.type == protocol::MessageType::ERROR) {
     // A broker reject during negotiation (e.g. a major-version mismatch).
@@ -172,14 +197,17 @@ RendezvousStatus BrokerConnection::Handshake(uint32_t request_id,
     return RendezvousStatus::kPeerAuthenticationFailed;
   }
   if (ack_header.type != protocol::MessageType::HELLO_ACK)
-    return RendezvousStatus::kIoFailed;
+    return RendezvousStatus::kProtocolFailed;
 
   protocol::HelloAckPayload ack_payload;
   if (!protocol::DecodeHelloAckPayload(payload, payload_size, &ack_payload))
-    return RendezvousStatus::kIoFailed;
+    return RendezvousStatus::kProtocolFailed;
   if (ack_header.request_id != request_id || ack_header.conn_id == 0 ||
-      ack_header.version_major != protocol::kWireVersionMajor) {
-    return RendezvousStatus::kIoFailed;
+      ack_header.version_major != protocol::kWireVersionMajor ||
+      ack_header.version_minor > protocol::kWireVersionMinor ||
+      ack_header.session_id != 0 || ack_header.run_id != 0 ||
+      ack_payload.endpoint_mode != static_cast<uint32_t>(state_->mode)) {
+    return RendezvousStatus::kProtocolFailed;
   }
 
   result->conn_id = ack_header.conn_id;
@@ -281,7 +309,9 @@ RendezvousStatus BrokerRendezvous::LaunchCandidate(
 }
 
 RendezvousStatus BrokerRendezvous::ConnectOrLaunch(
-    BrokerConnection* connection) {
+    BrokerConnection* connection, HANDLE stop, ULONGLONG deadline) {
+  if (!deadline) deadline = ::GetTickCount64() + 5000;
+  if (Stopped(stop) || !Remaining(deadline, 1)) return RendezvousStatus::kStartTimeout;
   if (!connection)
     return RendezvousStatus::kInvalidArgument;
   if (!initialized_) {
@@ -289,6 +319,7 @@ RendezvousStatus BrokerRendezvous::ConnectOrLaunch(
     if (status != RendezvousStatus::kOk)
       return status;
   }
+  if (Stopped(stop) || !Remaining(deadline, 1)) return RendezvousStatus::kStartTimeout;
   if (mode_ == BrokerMode::kShared) {
     RendezvousStatus existing = TryConnect(nullptr, connection);
     if (existing == RendezvousStatus::kOk)
@@ -296,14 +327,14 @@ RendezvousStatus BrokerRendezvous::ConnectOrLaunch(
     if (existing == RendezvousStatus::kPeerAuthenticationFailed)
       return existing;
   }
+  if (Stopped(stop) || !Remaining(deadline, 1)) return RendezvousStatus::kStartTimeout;
   PROCESS_INFORMATION candidate = {};
   RendezvousStatus status = LaunchCandidate(&candidate);
   if (status != RendezvousStatus::kOk)
     return status;
   ::CloseHandle(candidate.hThread);
-  const ULONGLONG deadline = ::GetTickCount64() + 5000;
   DWORD delay = 10;
-  while (::GetTickCount64() < deadline) {
+  while (!Stopped(stop) && ::GetTickCount64() < deadline) {
     HANDLE binding = candidate.hProcess;
     DWORD exit_code = STILL_ACTIVE;
     if (::GetExitCodeProcess(candidate.hProcess, &exit_code) &&
@@ -321,18 +352,20 @@ RendezvousStatus BrokerRendezvous::ConnectOrLaunch(
     }
     if (status == RendezvousStatus::kPeerAuthenticationFailed) {
       if (mode_ == BrokerMode::kShared &&
-          ::WaitForSingleObject(candidate.hProcess, 500) == WAIT_OBJECT_0) {
+          WaitIo(candidate.hProcess, stop, Remaining(deadline, 500))) {
         DWORD loser_exit = 1;
         if (::GetExitCodeProcess(candidate.hProcess, &loser_exit) &&
             loser_exit == 0) {
-          ::Sleep(delay);
+          if (stop) ::WaitForSingleObject(stop, Remaining(deadline, delay));
+          else ::Sleep(Remaining(deadline, delay));
           continue;
         }
       }
       ::CloseHandle(candidate.hProcess);
       return status;
     }
-    ::Sleep(delay);
+    if (stop) ::WaitForSingleObject(stop, Remaining(deadline, delay));
+    else ::Sleep(Remaining(deadline, delay));
     delay = (std::min)(delay * 2, static_cast<DWORD>(250));
   }
   ::CloseHandle(candidate.hProcess);

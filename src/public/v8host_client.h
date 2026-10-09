@@ -261,6 +261,7 @@ V8HOST_CLIENT_API V8HostStatus V8HOST_CALL v8host_client_start_run(
 
 // Queue an outbound relay frame to the worker for `run`. `data`/`len` are copied
 // before this call returns. A terminal run rejects with V8HOST_E_RUN_TERMINAL.
+// Transport admission may immediately return V8HOST_E_CONNECT or V8HOST_E_PROTOCOL.
 V8HOST_CLIENT_API V8HostStatus V8HOST_CALL v8host_client_post_message(
     V8HostRun* run,
     int32_t kind,
@@ -269,7 +270,8 @@ V8HOST_CLIENT_API V8HostStatus V8HOST_CALL v8host_client_post_message(
 
 // Request cancellation of `run`. Success means the request was accepted, not
 // that guest code had not already produced effects. A terminal run rejects with
-// V8HOST_E_RUN_TERMINAL.
+// V8HOST_E_RUN_TERMINAL. Transport admission may immediately return
+// V8HOST_E_CONNECT or V8HOST_E_PROTOCOL.
 V8HOST_CLIENT_API V8HostStatus V8HOST_CALL v8host_client_cancel_run(
     V8HostRun* run);
 

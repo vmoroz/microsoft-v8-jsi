@@ -1,6 +1,7 @@
 #include "v8host_test_support.h"
 
 #include "v8host_broker_rendezvous.h"
+#include "v8host_client.h"
 #include "v8host_broker.h"
 #include "v8host_file_identity.h"
 #include "v8host_payload_identity.h"
@@ -12,6 +13,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <array>
@@ -19,6 +21,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <string>
@@ -4261,10 +4264,252 @@ bool HostRejectsBadPluginAbi(std::string* detail) {
   return true;
 }
 
+
+struct ContractCClient {
+  HMODULE module = nullptr;
+  decltype(&v8host_client_initialize) initialize = nullptr;
+  decltype(&v8host_client_create_session) create = nullptr;
+  decltype(&v8host_client_set_callbacks) callbacks = nullptr;
+  decltype(&v8host_client_start_run) start = nullptr;
+  decltype(&v8host_client_post_message) post = nullptr;
+  decltype(&v8host_client_cancel_run) cancel = nullptr;
+  decltype(&v8host_client_close_session) close = nullptr;
+  bool Load() {
+    if (module) return true;
+    const std::wstring path = ExecutableDirectory() + L"/v8host.dll";
+    module = ::LoadLibraryExW(path.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!module) return false;
+#define CLIENT_ENTRY(member, symbol) member = reinterpret_cast<decltype(member)>(::GetProcAddress(module, #symbol)); if (!member) return false
+    CLIENT_ENTRY(initialize, v8host_client_initialize);
+    CLIENT_ENTRY(create, v8host_client_create_session);
+    CLIENT_ENTRY(callbacks, v8host_client_set_callbacks);
+    CLIENT_ENTRY(start, v8host_client_start_run);
+    CLIENT_ENTRY(post, v8host_client_post_message);
+    CLIENT_ENTRY(cancel, v8host_client_cancel_run);
+    CLIENT_ENTRY(close, v8host_client_close_session);
+#undef CLIENT_ENTRY
+    return initialize() == V8HOST_OK;
+  }
+};
+ContractCClient& PublicClient() {
+  // The module owns app-thread windows and stays loaded until process exit.
+  static ContractCClient client;
+  return client;
+}
+struct PublicCapture {
+  ContractCClient* client = nullptr;
+  V8HostSession* session = nullptr;
+  V8HostRun* run = nullptr;
+  DWORD thread = ::GetCurrentThreadId();
+  std::vector<int32_t> states, events, kinds;
+  std::vector<V8HostStatus> statuses;
+  std::vector<std::vector<uint8_t>> messages;
+  int terminal = 0, disconnects = 0;
+  bool valid = true, close_in_terminal = true, closed = false;
+  std::function<bool()> observe_worker;
+  static void V8HOST_CALL State(void* context, V8HostSession* session, int32_t state, V8HostStatus status) {
+    auto& c = *static_cast<PublicCapture*>(context);
+    c.valid &= ::GetCurrentThreadId() == c.thread && session == c.session && status == V8HOST_OK && !c.closed;
+    c.states.push_back(state);
+  }
+  static void V8HOST_CALL Run(void* context, V8HostRun* run, int32_t event, V8HostStatus status) {
+    auto& c = *static_cast<PublicCapture*>(context);
+    c.valid &= ::GetCurrentThreadId() == c.thread && run == c.run && !c.closed;
+    c.events.push_back(event); c.statuses.push_back(status);
+    if (event != V8HOST_RUN_EVENT_STARTED) {
+      ++c.terminal;
+      if (c.close_in_terminal) {
+        c.client->close(c.session); c.closed = true;
+      }
+    }
+  }
+  static void V8HOST_CALL Message(void* context, V8HostRun* run, int32_t kind, const void* data, size_t len) {
+    auto& c = *static_cast<PublicCapture*>(context);
+    c.valid &= ::GetCurrentThreadId() == c.thread && run == c.run && !c.closed &&
+        c.states == std::vector<int32_t>{V8HOST_SESSION_STATE_READY,
+          V8HOST_SESSION_STATE_WORKER_STARTUP_READY, V8HOST_SESSION_STATE_WORKER_SECURITY_READY};
+    c.kinds.push_back(kind);
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    c.messages.emplace_back(bytes, bytes + len);
+    if (c.observe_worker) c.valid &= c.observe_worker();
+  }
+  static void V8HOST_CALL Disconnect(void* context) {
+    auto& c = *static_cast<PublicCapture*>(context);
+    c.valid &= ::GetCurrentThreadId() == c.thread && !c.closed; ++c.disconnects;
+  }
+  V8HostCallbacks Table() {
+    V8HostCallbacks t = {}; t.struct_size = sizeof(t); t.context = this;
+    t.on_session_state = State; t.on_run_event = Run; t.on_relay_message = Message;
+    t.on_broker_disconnect = Disconnect; return t;
+  }
+  ~PublicCapture() { if (session && !closed) client->close(session); }
+};
+template <class Predicate>
+bool PumpPublic(Predicate done) {
+  ULONGLONG deadline = ::GetTickCount64() + 10000;
+  while (!done()) {
+    if (::GetTickCount64() >= deadline) return false;
+    MSG msg;
+    if (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) ::DispatchMessageW(&msg);
+    else ::MsgWaitForMultipleObjectsEx(0, nullptr, 10, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+  }
+  return true;
+}
+// Observe the production-launched dedicated tree before terminal callback close.
+struct PublicDedicatedProcesses {
+  HANDLE broker = nullptr, worker = nullptr;
+  std::wstring shared_endpoint;
+  bool Prepare() {
+    v8host::PayloadIdentity payload;
+    std::vector<uint8_t> sid;
+    LUID session;
+    DWORD error;
+    std::array<uint8_t, 32> key;
+    return v8host::ResolvePayloadIdentity(ExecutableDirectory(), L"sbox.exe", L"v8host.dll", &payload, &error) &&
+        v8host::QueryCurrentSidAndSession(&sid, &session, &error) &&
+        v8host::DeriveEndpoint(sid, payload.plugin_set_id, BrokerMode::kShared, nullptr, &shared_endpoint, &key);
+  }
+  ~PublicDedicatedProcesses() {
+    for (HANDLE process : {worker, broker}) {
+      if (!process) continue;
+      if (::WaitForSingleObject(process, 10000) != WAIT_OBJECT_0) {
+        ::TerminateProcess(process, 1);
+        ::WaitForSingleObject(process, 5000);
+      }
+      ::CloseHandle(process);
+    }
+  }
+  bool Observe() {
+    // A dedicated session must not publish the deterministic shared endpoint.
+    if (::WaitNamedPipeW(shared_endpoint.c_str(), 0) || ::GetLastError() != ERROR_FILE_NOT_FOUND)
+      return false;
+    HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+    std::vector<PROCESSENTRY32W> entries;
+    PROCESSENTRY32W entry = {}; entry.dwSize = sizeof(entry);
+    if (::Process32FirstW(snapshot, &entry)) {
+      do {
+        if (::_wcsicmp(entry.szExeFile, L"sbox.exe") == 0) entries.push_back(entry);
+      } while (::Process32NextW(snapshot, &entry));
+    }
+    ::CloseHandle(snapshot);
+    DWORD broker_pid = 0, worker_pid = 0;
+    for (const auto& e : entries) {
+      if (e.th32ParentProcessID == ::GetCurrentProcessId()) {
+        if (broker_pid) return false;
+        broker_pid = e.th32ProcessID;
+      }
+    }
+    for (const auto& e : entries) {
+      if (e.th32ParentProcessID == broker_pid) {
+        if (worker_pid) return false;
+        worker_pid = e.th32ProcessID;
+      }
+    }
+    if (!broker_pid || !worker_pid) return false;
+    if (broker || worker) {
+      return broker && worker && ::GetProcessId(broker) == broker_pid &&
+          ::GetProcessId(worker) == worker_pid &&
+          ::WaitForSingleObject(broker, 0) == WAIT_TIMEOUT &&
+          ::WaitForSingleObject(worker, 0) == WAIT_TIMEOUT;
+    }
+    broker = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, broker_pid);
+    worker = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, worker_pid);
+    if (!broker || !worker) return false;
+    std::printf("[public dedicated] broker=%lu worker=%lu\n", broker_pid, worker_pid);
+    return true;
+  }
+  bool Reaped() {
+    return broker && worker && ::WaitForSingleObject(worker, 10000) == WAIT_OBJECT_0 &&
+        ::WaitForSingleObject(broker, 10000) == WAIT_OBJECT_0;
+  }
+};
+bool PublicRealJsMode(int32_t mode, std::string* detail) {
+  CapturedBroker broker;
+  PublicDedicatedProcesses dedicated;
+  if (mode == V8HOST_BROKER_SHARED && !broker.Launch(detail)) return false;
+  auto& client = PublicClient();
+  if (!client.Load()) { *detail = "production DLL client load/initialize failed"; return false; }
+  PublicCapture capture; capture.client = &client; capture.close_in_terminal = false;
+  if (mode == V8HOST_BROKER_DEDICATED) {
+    if (!dedicated.Prepare()) { *detail = "dedicated shared-endpoint identity"; return false; }
+    capture.observe_worker = [&] { return dedicated.Observe(); };
+  }
+  V8HostSessionConfig config = {}; config.struct_size = sizeof(config);
+  config.broker_mode = mode; config.tier = V8HOST_TIER_UNTRUSTED;
+  config.prohibit_dynamic_code = 1; config.initial_token = sbox_token_restricted_same_access;
+  config.delayed_integrity = sbox_integrity_untrusted;
+  if (client.create(&config, &capture.session) != V8HOST_OK || !capture.session) {
+    *detail = "public create"; return false;
+  }
+  auto callbacks = capture.Table();
+  if (client.callbacks(capture.session, &callbacks) != V8HOST_OK) {
+    *detail = "public callbacks"; return false;
+  }
+  for (int round = 0; round != 2; ++round) {
+    capture.close_in_terminal = round == 1;
+    std::string guest = "var n=0;host.onmessage=function(m){if(typeof m==='string'){"
+        "host.postMessage('js echo: '+m);}else{var a=new Uint8Array(m);a[0]=0x42;"
+        "host.postMessageBinary(m);}if(++n===2)host.complete();};";
+    V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = -1;
+    input.payload = guest.data(); input.payload_len = guest.size();
+    char text[6] = {}; std::memcpy(text, round ? "bravo" : "alpha", 5);
+    uint8_t binary[] = {0, static_cast<uint8_t>(1 + round * 2), static_cast<uint8_t>(2 + round * 2)};
+    V8HostRun* previous = capture.run;
+    if (client.start(capture.session, &input, &capture.run) != V8HOST_OK || !capture.run ||
+        capture.run == previous) {
+      *detail = "public same-session start round=" + std::to_string(round + 1); return false;
+    }
+    std::fill(guest.begin(), guest.end(), ' ');
+    if (client.post(capture.run, sbox_msg_string, text, 5) != V8HOST_OK ||
+        client.post(capture.run, sbox_msg_binary, binary, 3) != V8HOST_OK) {
+      *detail = "public relay admission"; return false;
+    }
+    std::memset(text, 'x', 5); std::memset(binary, 0xFF, 3);
+    if (!PumpPublic([&] { return capture.terminal >= round + 1 || capture.disconnects; })) {
+      *detail = "public callbacks timed out round=" + std::to_string(round + 1); return false;
+    }
+    const std::vector<int32_t> events = round == 0
+        ? std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED}
+        : std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED,
+                              V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED};
+    const size_t count = static_cast<size_t>(round + 1) * 2;
+    if (!capture.valid || capture.terminal != round + 1 || capture.disconnects ||
+        capture.states != std::vector<int32_t>{V8HOST_SESSION_STATE_READY,
+            V8HOST_SESSION_STATE_WORKER_STARTUP_READY, V8HOST_SESSION_STATE_WORKER_SECURITY_READY} ||
+        capture.events != events || capture.statuses != std::vector<V8HostStatus>(count, V8HOST_OK) ||
+        capture.kinds.size() != count || capture.messages.size() != count ||
+        capture.kinds[count - 2] != sbox_msg_string || capture.kinds[count - 1] != sbox_msg_binary ||
+        std::string(capture.messages[count - 2].begin(), capture.messages[count - 2].end()) !=
+            (round ? "js echo: bravo" : "js echo: alpha") ||
+        capture.messages[count - 1] != std::vector<uint8_t>{0x42, static_cast<uint8_t>(1 + round * 2),
+            static_cast<uint8_t>(2 + round * 2)} || capture.closed != (round == 1)) {
+      *detail = "public readiness/copy/FIFO/sole terminal invariant round=" + std::to_string(round + 1);
+      return false;
+    }
+  }
+  if (!(mode == V8HOST_BROKER_SHARED ? broker.Reaped(1) : dedicated.Reaped())) {
+    *detail = "public held broker/worker reaping"; return false;
+  }
+  MSG msg; while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) ::DispatchMessageW(&msg);
+  *detail = "production DLL: seven client exports; two same-session runs; distinct copied string+binary "
+      "JS transforms; readiness/FIFO; one COMPLETED/OK per run; callback close; one worker reaped";
+  return capture.valid && capture.terminal == 2 && capture.disconnects == 0;
+}
+bool PublicRealJs(std::string* detail) {
+  return PublicRealJsMode(V8HOST_BROKER_SHARED, detail);
+}
+bool PublicRealDedicatedJs(std::string* detail) {
+  return PublicRealJsMode(V8HOST_BROKER_DEDICATED, detail);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   const std::vector<v8host::test::TestCase> tests = {
+      {"client", "real-js", PublicRealJs},
+      {"client", "real-dedicated-js", PublicRealDedicatedJs},
       {"router", "discard-intake-ordering", DiscardIntakeOrdering},
       {"cancel", "terminal-before-fallback", TerminalBeforeFallback},
       {"router", "bookkeeping-callback-overlap", BookkeepingCallbackOverlap},

@@ -361,13 +361,15 @@ executable("v8host_client_tests") {
   testonly = true
   sources = [
     "client/v8host_client.cc",
+    "client/v8host_client_pipe_transport.cc",
+    "client/v8host_broker_rendezvous.cc",
     "client/v8host_dispatcher.cc",
     "client/v8host_dispatcher.h",
     "tests/v8host_client_tests.cc",
     "tests/v8host_test_support.cc",
     "tests/v8host_test_support.h",
   ]
-  deps = [ ":protocol" ]
+  deps = [ ":protocol", ":payload_identity", ":peer_auth" ]
   include_dirs = [
     "client",
     "//../../src/public",
