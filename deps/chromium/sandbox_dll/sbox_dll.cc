@@ -26,6 +26,10 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#if defined(SBOX_LIFECYCLE_TESTING)
+#include "sbox_lifecycle_test.h"
+#include <vector>
+#endif
 
 #include "base/at_exit.h"
 #include "base/command_line.h"
@@ -90,6 +94,10 @@ struct SboxSession {
   SboxMessageCb on_message = nullptr;
   void* on_message_ctx = nullptr;
 };
+
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
+uint32_t g_sbox_lifecycle_test_failure = 0;
+#endif
 
 namespace {
 
@@ -534,7 +542,25 @@ bool CreateMsgChannel(SboxSession* s) {
   return s->evt_t2b && s->evt_b2t && s->evt_close && s->reader_stop;
 }
 
-void DiscardFrame(void*, int, const void*, size_t) {}
+void ForwardWorkerFrame(void* context, int kind, const void* data, size_t size) {
+  auto* session = static_cast<SboxSession*>(context);
+  if (kind == SBOX_MSG_LIFECYCLE) {
+    if (size != 4 || !data)
+      return;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    const uint32_t phase = bytes[0] | (uint32_t(bytes[1]) << 8) |
+        (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+    if (phase != SBOX_LIFECYCLE_STARTUP && phase != SBOX_LIFECYCLE_SECURITY)
+      return;
+  }
+  if (session->on_message)
+    session->on_message(session->on_message_ctx, kind, data, size);
+}
+void DrainWorkerFrames(SboxSession* session) {
+  auto* header = sbox_msg::Header(session->msg_map);
+  sbox_msg::Drain(&header->t2b, sbox_msg::T2BRing(session->msg_map),
+                  &ForwardWorkerFrame, session);
+}
 
 // Deliver incoming frames and report process exit. The host still owns wait
 // and session cleanup.
@@ -563,7 +589,11 @@ DWORD WINAPI BrokerReaderThread(void* param) {
         BrokerLog("[broker] target exit query failed: pid=%lu error=%lu\n",
                   pid, ::GetLastError());
       }
-      // Report exit once, but keep the original message/stop behavior.
+      // Preserve queued output before the broker-origin exit fact.
+      DrainWorkerFrames(s);
+      const uint8_t phase[] = {SBOX_LIFECYCLE_EXIT, 0, 0, 0};
+      if (s->on_message)
+        s->on_message(s->on_message_ctx, SBOX_MSG_LIFECYCLE, phase, sizeof(phase));
       wait_count = 2;
       continue;
     }
@@ -574,10 +604,7 @@ DWORD WINAPI BrokerReaderThread(void* param) {
     }
     if (w != WAIT_OBJECT_0)
       break;  // stop event or error
-    sbox_msg::ChannelHeader* h = sbox_msg::Header(s->msg_map);
-    sbox_msg::FrameCb cb = s->on_message ? s->on_message : &DiscardFrame;
-    sbox_msg::Drain(&h->t2b, sbox_msg::T2BRing(s->msg_map), cb,
-                    s->on_message_ctx);
+    DrainWorkerFrames(s);
   }
   return 0;
 }
@@ -838,6 +865,17 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
     ::memcpy(seed.plugin_data, policy->plugin_data, plugin_data_len);
   seed.plugin_data_len = static_cast<uint32_t>(plugin_data_len);
 
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
+  wchar_t failure_text[2] = {};
+  uint32_t failure = 0;
+  if (::GetEnvironmentVariableW(L"SBOX_TEST_LIFECYCLE_FAILURE", failure_text, 2) == 1 &&
+      failure_text[0] >= L'1' && failure_text[0] <= L'3')
+    failure = failure_text[0] - L'0';
+  if (!SeedWorkerVar(proc, worker_base, my_base, &g_sbox_lifecycle_test_failure,
+                     &failure, sizeof(failure)))
+    return nullptr;
+#endif
+
   // All seed writes land while the worker is suspended, before ResumeThread.
   const bool seeded =
       SeedWorkerVar(proc, worker_base, my_base, &sandbox::g_shared_section,
@@ -901,6 +939,17 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
            reserved ? 0 : ::GetLastError());
   }
 
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
+  if (failure) {
+    wchar_t event_name[256] = {};
+    if (::GetEnvironmentVariableW(L"SBOX_TEST_LIFECYCLE_HELD_EVENT", event_name, 256)) {
+      HANDLE held = ::OpenEventW(SYNCHRONIZE, FALSE, event_name);
+      const bool ready = held && ::WaitForSingleObject(held, 5000) == WAIT_OBJECT_0;
+      if (held) ::CloseHandle(held);
+      if (!ready) return nullptr;
+    }
+  }
+#endif
   // Start the broker reader thread, then let the target run.
   s->reader_thread = ::CreateThread(nullptr, 0, &BrokerReaderThread, s, 0, nullptr);
   if (!s->reader_thread) {
@@ -1322,8 +1371,10 @@ SBOX_API int sbox_target_post_message(SboxTarget* target, int kind,
 }
 
 SBOX_API int sbox_target_post_lifecycle(SboxTarget* target, uint32_t phase) {
-  return sbox_target_post_message(target, SBOX_MSG_LIFECYCLE, &phase,
-                                  sizeof(phase));
+  if (phase != SBOX_LIFECYCLE_STARTUP && phase != SBOX_LIFECYCLE_SECURITY)
+    return -1;
+  const uint8_t bytes[] = {static_cast<uint8_t>(phase), 0, 0, 0};
+  return sbox_target_post_message(target, SBOX_MSG_LIFECYCLE, bytes, sizeof(bytes));
 }
 
 SBOX_API void* sbox_target_inbound_event(SboxTarget* target) {
@@ -1341,3 +1392,107 @@ SBOX_API int sbox_target_drain_messages(SboxTarget* target, SboxMessageCb cb,
   sbox_msg::ChannelHeader* h = sbox_msg::Header(target->msg_map);
   return sbox_msg::Drain(&h->b2t, sbox_msg::B2TRing(target->msg_map), cb, ctx);
 }
+
+#if defined(SBOX_LIFECYCLE_TESTING)
+bool SboxTestReader(bool final_drain, bool suppress_exit, const std::wstring& exe) {
+  struct Observation {
+    HANDLE result_seen;
+    HANDLE exit_seen;
+    HANDLE barrier_seen;
+    std::vector<std::pair<int, std::vector<uint8_t>>> frames;
+    static void Message(void* context, int kind, const void* data, size_t size) {
+      auto& o = *static_cast<Observation*>(context);
+      const auto* bytes = static_cast<const uint8_t*>(data);
+      o.frames.emplace_back(kind, std::vector<uint8_t>(bytes, bytes + size));
+      if (kind == SBOX_MSG_LIFECYCLE && size == 4 && bytes[0] == SBOX_LIFECYCLE_EXIT)
+        ::SetEvent(o.exit_seen);
+      if (kind == SBOX_MSG_BINARY && size == 1 && bytes[0] == 9)
+        ::SetEvent(o.result_seen);
+      if (kind == SBOX_MSG_BINARY && size == 1 && bytes[0] == 10)
+        ::SetEvent(o.barrier_seen);
+    }
+  };
+  SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+  HANDLE child_exit = ::CreateEventW(&sa, TRUE, FALSE, nullptr);
+  Observation observation{::CreateEventW(nullptr, FALSE, FALSE, nullptr),
+                          ::CreateEventW(nullptr, FALSE, FALSE, nullptr),
+                          ::CreateEventW(nullptr, FALSE, FALSE, nullptr), {}};
+  std::wstring command = L"\"" + exe + L"\" --reader-child=" +
+      std::to_wstring(reinterpret_cast<uintptr_t>(child_exit));
+  STARTUPINFOW startup = {};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION child = {};
+  if (!child_exit || !observation.result_seen || !observation.exit_seen ||
+      !observation.barrier_seen || !::CreateProcessW(exe.c_str(), command.data(),
+      nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &child)) {
+    if (child_exit) ::CloseHandle(child_exit);
+    for (HANDLE event : {observation.result_seen, observation.exit_seen,
+                         observation.barrier_seen})
+      if (event) ::CloseHandle(event);
+    return false;
+  }
+  SboxSession session;
+  session.proc = child.hProcess;
+  session.evt_t2b = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  session.reader_stop = ::CreateEventW(nullptr, TRUE, suppress_exit, nullptr);
+  std::vector<uint8_t> mapping(sbox_msg::kSectionSize);
+  session.msg_map = mapping.data();
+  session.on_message = &Observation::Message;
+  session.on_message_ctx = &observation;
+  sbox_msg::InitHeader(session.msg_map);
+  auto* h = sbox_msg::Header(session.msg_map);
+  auto post = [&](int kind, const uint8_t* data, size_t size) {
+    return sbox_msg::Post(&h->t2b, sbox_msg::T2BRing(session.msg_map), kind, data, size);
+  };
+  bool ok = session.evt_t2b && session.reader_stop;
+  for (uint8_t phase : {uint8_t(3), uint8_t(0), uint8_t(4), uint8_t(255)}) {
+    const uint8_t bytes[] = {phase, 0, 0, 0};
+    ok = post(SBOX_MSG_LIFECYCLE, bytes, 4) && ok;
+  }
+  const uint8_t high_byte[] = {1, 1, 0, 0};
+  ok = post(SBOX_MSG_LIFECYCLE, high_byte, 4) && ok;
+  const uint8_t malformed[] = {1, 0, 0, 0, 0};
+  ok = post(SBOX_MSG_LIFECYCLE, malformed, 3) && post(SBOX_MSG_LIFECYCLE, malformed, 5) && ok;
+  for (uint8_t phase : {uint8_t(1), uint8_t(2)}) {
+    const uint8_t bytes[] = {phase, 0, 0, 0};
+    ok = post(SBOX_MSG_LIFECYCLE, bytes, 4) && ok;
+  }
+  const uint8_t result[] = {9};
+  ok = post(SBOX_MSG_BINARY, result, 1) && ok;
+  if (final_drain || suppress_exit) {
+    ::SetEvent(child_exit);
+    ok = ::WaitForSingleObject(child.hProcess, 5000) == WAIT_OBJECT_0 && ok;
+  }
+  HANDLE reader = ::CreateThread(nullptr, 0, &BrokerReaderThread, &session, 0, nullptr);
+  ok = reader && ok;
+  if (!suppress_exit && reader) {
+    if (!final_drain) {
+      ::SetEvent(session.evt_t2b);
+      ok = ::WaitForSingleObject(observation.result_seen, 5000) == WAIT_OBJECT_0 && ok;
+      ::SetEvent(child_exit);
+    }
+    ok = ::WaitForSingleObject(observation.exit_seen, 5000) == WAIT_OBJECT_0 && ok;
+    // The still-signaled process cannot displace a subsequent ring barrier.
+    const uint8_t barrier[] = {10};
+    ok = post(SBOX_MSG_BINARY, barrier, 1) && ok;
+    ::SetEvent(session.evt_t2b);
+    ok = ::WaitForSingleObject(observation.barrier_seen, 5000) == WAIT_OBJECT_0 && ok;
+  }
+  ::SetEvent(session.reader_stop);
+  if (reader) {
+    ok = ::WaitForSingleObject(reader, 5000) == WAIT_OBJECT_0 && ok;
+    ::CloseHandle(reader);
+  }
+  ::SetEvent(child_exit);
+  ok = ::WaitForSingleObject(child.hProcess, 5000) == WAIT_OBJECT_0 && ok;
+  const std::vector<std::pair<int, std::vector<uint8_t>>> expected = {
+      {SBOX_MSG_LIFECYCLE, {1,0,0,0}}, {SBOX_MSG_LIFECYCLE, {2,0,0,0}},
+      {SBOX_MSG_BINARY, {9}}, {SBOX_MSG_LIFECYCLE, {3,0,0,0}}, {SBOX_MSG_BINARY, {10}}};
+  ok = (suppress_exit ? observation.frames.empty() : observation.frames == expected) && ok;
+  for (HANDLE handle : {child_exit, observation.result_seen, observation.exit_seen,
+                       observation.barrier_seen, child.hProcess, child.hThread,
+                       session.evt_t2b, session.reader_stop})
+    if (handle) ::CloseHandle(handle);
+  return ok;
+}
+#endif

@@ -292,7 +292,9 @@ executable("v8host_broker_tests") {
   data_deps = [
     ":v8host",
     ":v8host_fake_plugin",
+    ":v8host_abi4_plugin",
     "//sandbox_dll:sbox",
+    "//sandbox_dll:sbox_lifecycle_tests",
   ]
 }
 
@@ -427,4 +429,12 @@ shared_library("v8host_fake_plugin") {
   testonly = true
   sources = [ "tests/v8host_fake_plugin.cc" ]
   public_configs = [ ":v8host_common_config" ]
+}
+
+# A complete old-version plugin, used only for mixed-ABI rejection tests.
+shared_library("v8host_abi4_plugin") {
+  testonly = true
+  sources = [ "tests/v8host_fake_plugin.cc" ]
+  include_dirs = [ "//sandbox_dll" ]
+  defines = [ "V8HOST_ABI4_FIXTURE" ]
 }

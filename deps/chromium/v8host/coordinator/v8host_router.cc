@@ -638,6 +638,23 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
   } else {
     if (close)
       CloseSession(conn, h.session_id, RunState::kCancelled);
+    if (cancel) {
+      Pump(conn);
+      auto sit = conn.sessions.find(h.session_id);
+      if (sit != conn.sessions.end() && sit->second->worker) {
+        auto& session = *sit->second;
+        auto rit = session.runs.find(h.run_id);
+        if (rit != session.runs.end() && session.worker->engine_busy_run_id == h.run_id &&
+            rit->second->state != RunState::kCancelRequested) {
+          rit->second->state = RunState::kCancelRequested;
+          v8host::RunEnvelope env;
+          env.type = v8host::RunEnvelopeType::kCancel;
+          env.run_id = h.run_id;
+          if (!Post(session, v8host::EncodeRunEnvelope(env)))
+            CloseSession(conn, h.session_id, RunState::kWorkerExited);
+        }
+      }
+    }
     response = protocol::BuildAckFrame(h);
   }
   conn.request_cache.Record(identity, payload, payload_size, response);
@@ -709,6 +726,7 @@ void SBOX_CALL Worker::OnMessage(void *context, sbox_msg_kind kind, const void *
 DWORD WINAPI Worker::Reap(void *context) {
   auto &worker = *static_cast<Worker *>(context);
   int32_t exit_code = 0;
+  worker.api->close(worker.handle);
   worker.api->wait(worker.handle, &exit_code);
   worker.handle = nullptr;
   worker.state = WorkerState::kReaped;
@@ -798,6 +816,8 @@ void Router::CloseSession(Connection &conn, uint32_t id, RunState terminal) {
   Session *session = it->second.get();
   bool has_worker = session->worker != nullptr;
   RetireSessionLocked(conn, id, terminal);
+  if (terminal == RunState::kWorkerExited)
+    conn.Enqueue(protocol::BuildWorkerExitFrame(ReplyHeader(conn, id)));
   if (!has_worker)
     return;
   auto &worker = *session->worker;
@@ -805,17 +825,18 @@ void Router::CloseSession(Connection &conn, uint32_t id, RunState terminal) {
   if (worker.handle && !worker.close_called) {
     worker.close_called = true;
     worker.state = WorkerState::kCloseRequested;
-    api_->close(worker.handle);
     worker.wait_called = true;
     worker.cleanup = ::CreateThread(nullptr, 0, &Worker::Reap, &worker, 0, nullptr);
     if (!worker.cleanup)
-      Worker::Reap(&worker);
+      conn.Stop();
   }
 }
 void Router::Reclaim(Connection &conn, bool join) {
   for (auto it = conn.retired_sessions.begin(); it != conn.retired_sessions.end();) {
     auto &session = **it;
     auto *worker = session.worker.get();
+    if (join && worker && worker->wait_called && !worker->cleanup && worker->handle)
+      Worker::Reap(worker);
     if (worker && worker->cleanup && ::WaitForSingleObject(worker->cleanup, join ? INFINITE : 0) == WAIT_OBJECT_0) {
       ::CloseHandle(worker->cleanup);
       worker->cleanup = nullptr;
@@ -870,20 +891,23 @@ void Router::Pump(Connection &conn) {
         if (fact.size == 4)
           phase = fact.data[0] | (uint32_t(fact.data[1]) << 8) | (uint32_t(fact.data[2]) << 16) |
               (uint32_t(fact.data[3]) << 24);
-        if (phase == 1) {
+        if (phase == SBOX_LIFECYCLE_STARTUP) {
           if (!worker.startup) {
             worker.startup = true;
             worker.engine_image = HeldFile();
             session.state = SessionState::kStartupReady;
             conn.Enqueue(protocol::BuildStartupReadyFrame(ReplyHeader(conn, id)));
           }
-        } else if (phase == 2 && worker.startup) {
+        } else if (phase == SBOX_LIFECYCLE_SECURITY && worker.startup) {
           if (!worker.security) {
             worker.security = true;
             session.state = SessionState::kOpen;
             worker.state = WorkerState::kRunning;
             conn.Enqueue(protocol::BuildSecurityReadyFrame(ReplyHeader(conn, id)));
           }
+        } else if (phase == SBOX_LIFECYCLE_EXIT) {
+          CloseSession(conn, id, RunState::kWorkerExited);
+          break;
         } else {
           valid = false;
         }

@@ -95,6 +95,7 @@ struct Worker {
   static DWORD WINAPI Reap(void *);
   sbox_broker_worker handle = nullptr;
   std::atomic<WorkerState> state{WorkerState::kNone};
+  // The strand reserves one cleanup task; that task closes and waits off-reader.
   bool close_called = false;
   bool wait_called = false;
   HeldFile engine_image;

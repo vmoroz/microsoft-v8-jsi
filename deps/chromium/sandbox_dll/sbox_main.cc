@@ -397,8 +397,10 @@ int RunWorker(const std::wstring& plugin_name) {
   HMODULE plugin_mod = nullptr;
   const sbox_plugin* plugin = nullptr;
   if (!LoadPlugin(plugin_name, /*verify=*/false, "worker-plugin", &plugin_mod,
-                  &plugin, nullptr))
+                  &plugin, nullptr)) {
+    sbox_target_end(target);
     return kDllResolveFailed;
+  }
 
   sbox_worker_s wk;
   wk.target = target;
@@ -407,27 +409,56 @@ int RunWorker(const std::wstring& plugin_name) {
   // warmup (PRE-lockdown) -> lower_token -> run (POST-lockdown) -> shutdown.
   const sbox_status warmup_rc = plugin->warmup(&wk, &wapi);
   printf("[sbox] worker: plugin.warmup -> %d\n", warmup_rc);
-  if (warmup_rc != sbox_ok)
+  if (warmup_rc != sbox_ok) {
+    plugin->shutdown(&wk);
+    sbox_target_end(target);
     return kWarmupFailed;
-  // STARTUP_READY provenance: only the container observes a successful warmup
-  // (pre-lockdown). Emit the neutral lifecycle marker before lowering the token.
-  sbox_target_post_lifecycle(target, SBOX_LIFECYCLE_STARTUP);
+  }
+  // Readiness posts must succeed before advancing the lifecycle.
+  unsigned lower_calls = 0;
+  auto finish = [&](int result) {
+    plugin->shutdown(&wk);
+    sbox_target_end(target);
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
+    if (g_sbox_lifecycle_test_failure)
+      printf("[sbox-test] failure=%u lower=%u run=0 shutdown=1 end=1\n",
+             g_sbox_lifecycle_test_failure,
+             lower_calls);
+#endif
+    return result;
+  };
+  auto post_lifecycle = [&](uint32_t phase) {
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
+    if (g_sbox_lifecycle_test_failure == phase)
+      return -2;
+#endif
+    return sbox_target_post_lifecycle(target, phase);
+  };
+  if (post_lifecycle(SBOX_LIFECYCLE_STARTUP) != 0)
+    return finish(kWarmupFailed);
 
+  ++lower_calls;
   const int lowered = sbox_target_lower_token(target);
   if (lowered != 0) {
     printf("[sbox] worker: sbox_target_lower_token failed (%d)\n", lowered);
-    return kLowerTokenFailed;
+    return finish(kLowerTokenFailed);
   }
   printf("[sbox] worker: LowerToken survived\n");
 
-  const bool ping_post = sbox_target_test_ipc(target) != 0;
+  bool ping_post = sbox_target_test_ipc(target) != 0;
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
+  if (g_sbox_lifecycle_test_failure == 3)
+    ping_post = false;
+#endif
   printf("[sbox] worker: IPC post-lockdown = %s\n", ping_post ? "OK" : "FAIL");
 
   // SECURITY_READY provenance: the container observed the lowered token (above)
   // and a working post-lockdown IPC channel. Emit before handing the guest the
   // runtime so the coordinator can gate the first run on observed lockdown.
-  if (ping_post)
-    sbox_target_post_lifecycle(target, SBOX_LIFECYCLE_SECURITY);
+  if (!ping_post)
+    return finish(kPingPostFailed);
+  if (post_lifecycle(SBOX_LIFECYCLE_SECURITY) != 0)
+    return finish(kRunFailed);
 
   const sbox_status run_rc = plugin->run(&wk, &wapi);
   printf("[sbox] worker: plugin.run -> %d\n", run_rc);
@@ -437,8 +468,6 @@ int RunWorker(const std::wstring& plugin_name) {
 
   if (!ping_pre)
     return kPingPreFailed;
-  if (!ping_post)
-    return kPingPostFailed;
   if (run_rc != sbox_ok)
     return kRunFailed;
   return kOk;
@@ -456,11 +485,15 @@ struct BrokerMsgCtx {
 
 void OnBrokerReply(void* ctx, int kind, const void* data, size_t len) {
   auto* c = static_cast<BrokerMsgCtx*>(ctx);
-  // Container lifecycle markers (readiness) ride this channel but the dev smoke
-  // does not consume them: count them as positive emission evidence, then ignore
-  // fully (no reply signal) so they never wake a RoundTrip wait with replies == 0.
+  // Count only readiness; lifecycle facts must not wake a reply wait.
   if (kind == SBOX_MSG_LIFECYCLE) {
-    ++c->lifecycle_markers;
+    if (len == 4 && data) {
+      const auto* bytes = static_cast<const uint8_t*>(data);
+      const uint32_t phase = bytes[0] | (uint32_t(bytes[1]) << 8) |
+          (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+      if (phase == SBOX_LIFECYCLE_STARTUP || phase == SBOX_LIFECYCLE_SECURITY)
+        ++c->lifecycle_markers;
+    }
     return;
   }
   if (kind == SBOX_MSG_STRING) {
@@ -842,6 +875,7 @@ Role ParseRole(int argc, char** argv) {
 
 }  // namespace
 
+#if !defined(SBOX_LIFECYCLE_TESTING)
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   const Role role = ParseRole(argc, argv);
@@ -871,3 +905,33 @@ int main(int argc, char** argv) {
       return 2;
   }
 }
+
+#endif
+
+#if defined(SBOX_LIFECYCLE_TESTING)
+bool SboxTestSmokeLifecycle() {
+  BrokerMsgCtx context;
+  context.reply_event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!context.reply_event)
+    return false;
+  for (uint8_t phase : {uint8_t(1), uint8_t(2), uint8_t(3), uint8_t(4)}) {
+    const uint8_t bytes[] = {phase,0,0,0};
+    OnBrokerReply(&context, SBOX_MSG_LIFECYCLE, bytes, 4);
+  }
+  const uint8_t bytes[] = {1,0,0,0,0};
+  OnBrokerReply(&context, SBOX_MSG_LIFECYCLE, bytes, 3);
+  OnBrokerReply(&context, SBOX_MSG_LIFECYCLE, bytes, 5);
+  bool ok = context.lifecycle_markers == 2 && context.replies == 0 &&
+      ::WaitForSingleObject(context.reply_event, 0) == WAIT_TIMEOUT;
+  ::CloseHandle(context.reply_event);
+  return ok;
+}
+bool SboxTestWorkerKindGuard() {
+  sbox_worker_s worker;
+  worker.target = reinterpret_cast<SboxTarget*>(1);
+  const auto api = MakeWorkerApi();
+  const uint8_t bytes[] = {1,0,0,0};
+  return api.post_message(&worker, sbox_msg_lifecycle, bytes, 4) == sbox_error_args &&
+      api.post_message(&worker, static_cast<sbox_msg_kind>(99), bytes, 4) == sbox_error_args;
+}
+#endif

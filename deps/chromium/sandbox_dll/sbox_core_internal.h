@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "sbox.h"
 
 #if defined(SBOX_STATIC)
 // The broker/target core is linked directly into an executable (the product
@@ -177,10 +178,10 @@ SBOX_API int sbox_target_post_message(SboxTarget* target, int kind,
 // SBOX_MSG_LIFECYCLE and a u32 phase payload. Emitted by the generic RunWorker at
 // its own observation points; the plugin cannot post this kind (the worker-api
 // post_message rejects any kind other than string/binary).
-enum SboxLifecyclePhase {
-  SBOX_LIFECYCLE_STARTUP = 1,   // plugin warmup returned sbox_ok
-  SBOX_LIFECYCLE_SECURITY = 2,  // token lowered + post-lockdown IPC observed
-};
+using SboxLifecyclePhase = sbox_lifecycle_phase;
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
+extern uint32_t g_sbox_lifecycle_test_failure;
+#endif
 SBOX_API int sbox_target_post_lifecycle(SboxTarget* target, uint32_t phase);
 SBOX_API void* sbox_target_inbound_event(SboxTarget* target);  // HANDLE to wait on
 SBOX_API int sbox_target_drain_messages(SboxTarget* target, SboxMessageCb cb,

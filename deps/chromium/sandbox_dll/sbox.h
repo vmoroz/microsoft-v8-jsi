@@ -14,6 +14,7 @@
 //                                   -> sbox lowers the token   (ACG armed here)
 //                                   -> run(w, worker_api)      (POST-lockdown)
 //                                   -> shutdown(w)
+// shutdown is called once after any warmup attempt and must tolerate failure.
 // Any codegen/patching the plugin needs MUST happen in warmup; run is post-ACG.
 #ifndef SANDBOX_DLL_SBOX_H_
 #define SANDBOX_DLL_SBOX_H_
@@ -41,7 +42,7 @@ extern "C" {
 #define SBOX_EXPORT
 #endif
 
-#define SBOX_ABI_VERSION 4u
+#define SBOX_ABI_VERSION 5u
 
 // Opaque, typed handles (Node-API style — never void*).
 typedef struct sbox_config_s* sbox_config;  // broker: the policy builder
@@ -57,14 +58,23 @@ typedef enum {
 } sbox_status;
 
 // Message kinds on the duplex worker channel. string/binary are the engine's
-// opaque guest frames; sbox_msg_lifecycle is container-emitted, coordinator-
-// consumed, and plugin-FORBIDDEN (the worker-api post_message rejects it), so a
+// opaque guest frames; sbox_msg_lifecycle is container- or host-emitted and
+// plugin-FORBIDDEN (the worker-api post_message rejects it), so a
 // readiness marker can never be forged by the engine or a guest.
 typedef enum {
   sbox_msg_string = 0,
   sbox_msg_binary = 1,
   sbox_msg_lifecycle = 2,
 } sbox_msg_kind;
+
+// Lifecycle payload: exactly four bytes, a little-endian u32 phase.
+// STARTUP/SECURITY are container observations; EXIT is broker-origin only.
+// Unknown phases are never delivered.
+typedef enum sbox_lifecycle_phase {
+  SBOX_LIFECYCLE_STARTUP = 1,
+  SBOX_LIFECYCLE_SECURITY = 2,
+  SBOX_LIFECYCLE_EXIT = 3,
+} sbox_lifecycle_phase;
 
 typedef enum {
   sbox_broker_mode_dedicated = 0,
@@ -114,7 +124,11 @@ typedef struct sbox_broker_start {
 // buffers are borrowed only for callback duration. After a successful spawn,
 // the plugin owns the worker: close is called at most once and wait exactly
 // once. wait is destructive and invalidates the handle; callbacks have stopped
-// when it returns. The host owns this table and every opaque host token.
+// when it returns. EXIT arrives at most once, after all queued worker output,
+// but may be absent once close/wait starts. It carries no exit code, does not
+// replace the single wait, and is not permission to free handles or context.
+// The callback must not call close/wait.
+// The host owns this table and every opaque host token.
 typedef struct sbox_broker_api {
   uint32_t struct_size;
   sbox_status(SBOX_CALL* configure_and_spawn)(

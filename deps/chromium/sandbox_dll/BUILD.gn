@@ -86,3 +86,20 @@ if (current_cpu == "x64") {
     ldflags = [ "/DEPENDENTLOADFLAG:0xA00" ]
   }
 }
+
+# Compile the production reader and host consumers into a test-only fixture.
+executable("sbox_lifecycle_tests") {
+  testonly = true
+  sources = [
+    "sbox_dll.cc",
+    "sbox_main.cc",
+    "sbox_lifecycle_test.h",
+    "sbox_lifecycle_tests.cc",
+    "//v8host/tests/v8host_test_support.cc",
+  ]
+  include_dirs = [ ".", "//v8host/tests" ]
+  defines = [ "SBOX_STATIC", "SBOX_LIFECYCLE_TESTING" ]
+  deps = [ ":sbox_config", "//base", "//sandbox/win:sandbox", "//v8host:file_identity" ]
+  libs = [ "advapi32.lib", "bcrypt.lib", "wintrust.lib" ]
+  ldflags = [ "/DEPENDENTLOADFLAG:0xA00" ]
+}

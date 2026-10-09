@@ -632,6 +632,7 @@ struct RouterFixture {
   static sbox_status SBOX_CALL Close(sbox_broker_worker handle) {
     auto &f = *reinterpret_cast<RouterFixture *>(handle);
     ++f.closes;
+    std::lock_guard<std::mutex> lock(f.conn.mutex);
     if (!f.worker || f.conn.sessions.contains(f.worker->session->session_id) || !f.worker->session->runs.empty())
       ++f.close_before_removal;
     return sbox_ok;
@@ -676,6 +677,129 @@ struct RouterFixture {
     service->Pump(conn);
   }
 };
+bool PopWorkerExit(router::Connection& conn, uint32_t session_id = 1) {
+  protocol::FrameHeader h;
+  return PopFrame(conn, &h) && h.type == protocol::MessageType::WORKER_EXIT &&
+      h.session_id == session_id && h.run_id == 0 && h.request_id == 0 && conn.out_queue.empty();
+}
+bool LifecycleAbi5(std::string* detail) {
+  bool ok = SBOX_ABI_VERSION == 5u;
+  for (const auto* dll : {L"v8host.dll", L"v8host_abi4_plugin.dll"}) {
+    HMODULE module = ::LoadLibraryExW((ExecutableDirectory() + L"\\" + dll).c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
+    if (!module)
+      return false;
+    auto entry = reinterpret_cast<sbox_plugin_main_fn>(::GetProcAddress(module, SBOX_PLUGIN_ENTRY));
+    const bool old = std::wstring(dll) == L"v8host_abi4_plugin.dll";
+    const sbox_plugin* plugin = nullptr;
+    ok = entry && entry(old ? 4u : 5u, &plugin) == sbox_ok && plugin &&
+        plugin->abi_version == (old ? 4u : 5u) && plugin->configure && plugin->broker_run &&
+        plugin->warmup && plugin->run && plugin->shutdown && ok;
+    plugin = nullptr;
+    ok = entry && entry(old ? 5u : 4u, &plugin) == sbox_error_version && !plugin && ok;
+    ::FreeLibrary(module);
+  }
+  DWORD code = 0;
+  const std::wstring command = L"\"" + ExecutableDirectory() +
+      L"\\sbox.exe\" --broker --plugin v8host_abi4_plugin.dll";
+  ok = v8host::test::RunProcess(command, &code) && code == 3 && ok;
+  if (!ok) *detail = "matching ABI/4-5 rejection";
+  return ok;
+}
+bool CoreLifecycleCase(const wchar_t* args, std::string* detail) {
+  DWORD code = 1;
+  const std::wstring command = L"\"" + ExecutableDirectory() +
+      L"\\sbox_lifecycle_tests.exe\" " + args;
+  if (!v8host::test::RunProcess(command, &code) || code) {
+    *detail = "production core fixture failed";
+    return false;
+  }
+  return true;
+}
+bool ExitFinalDrain(std::string* detail) {
+  if (!CoreLifecycleCase(L"--suite=reader --case=final-drain", detail))
+    return false;
+  RouterFixture f;
+  f.early = true;
+  if (!f.Create() || !f.Start(1) || !f.Start(2))
+    return false;
+  DrainLocal(f.conn);
+  v8host::RunEnvelope env;
+  env.type = v8host::RunEnvelopeType::kResult;
+  env.run_id = 1;
+  const auto bytes = v8host::EncodeRunEnvelope(env);
+  router::Worker::OnMessage(f.worker, sbox_msg_binary, bytes.data(), bytes.size());
+  const uint8_t exit[] = {SBOX_LIFECYCLE_EXIT,0,0,0};
+  router::Worker::OnMessage(f.worker, sbox_msg_lifecycle, exit, 4);
+  f.service->Pump(f.conn);
+  protocol::FrameHeader h;
+  const bool ordered = PopFrame(f.conn, &h) && h.type == protocol::MessageType::RESULT && h.run_id == 1 &&
+      PopWorkerExit(f.conn) && f.conn.sessions.empty() && f.posts.size() == 1;
+  f.service->Close(f.conn);
+  return ordered && f.closes == 1 && f.waits == 1 && !f.close_before_removal && !f.post_after_close &&
+      f.conn.retired_sessions.empty();
+}
+bool SmokeLifecycleTwo(std::string* d) { return CoreLifecycleCase(L"--suite=smoke --case=lifecycle-two", d); }
+bool WorkerKindGuard(std::string* d) { return CoreLifecycleCase(L"--suite=worker --case=post-kind-guard", d); }
+bool ExitFactOrigin(std::string *detail) {
+  if (!CoreLifecycleCase(L"--suite=reader --case=origin", detail))
+    return false;
+  RouterFixture f;
+  f.wait_entered = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  f.wait_release = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!f.Create() || !f.Start(1))
+    return false;
+  f.Phase(SBOX_LIFECYCLE_STARTUP);
+  f.Phase(SBOX_LIFECYCLE_EXIT);
+  if (!f.conn.sessions.empty() || ::WaitForSingleObject(f.wait_entered, 5000) != WAIT_OBJECT_0 ||
+      f.closes != 1 || f.close_before_removal || f.waits != 1) {
+    *detail = "exit ids/cleanup handoff";
+    return false;
+  }
+  f.Phase(SBOX_LIFECYCLE_EXIT);
+  protocol::FrameHeader h;
+  unsigned exits = 0, terminals = 0;
+  while (PopFrame(f.conn, &h)) {
+    exits += h.type == protocol::MessageType::WORKER_EXIT;
+    terminals += h.type == protocol::MessageType::RESULT || h.type == protocol::MessageType::RUN_ERROR;
+  }
+  return exits == 1 && terminals == 0 && f.waits == 1 && !f.post_after_close;
+}
+bool ExitCleanupOrderings(std::string* detail) {
+  if (!CoreLifecycleCase(L"--suite=reader --case=stop-suppresses-exit", detail))
+    return false;
+  for (int order = 0; order != 3; ++order) {
+    RouterFixture f;
+    f.wait_entered = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    f.wait_release = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    f.early = true;
+    if (!f.Create() || !f.Start(1) || f.closes || f.waits || f.worker->wait_called)
+      return false;
+    DrainLocal(f.conn);
+    auto* worker = f.worker;
+    if (order == 0)
+      f.Phase(SBOX_LIFECYCLE_EXIT);
+    if (!LocalRoute(*f.service, f.conn, protocol::BuildCloseSessionFrame(ControlHeader(9))))
+      return false;
+    if (::WaitForSingleObject(f.wait_entered, 5000) != WAIT_OBJECT_0)
+      return false;
+    if (order == 1)
+      f.Phase(SBOX_LIFECYCLE_EXIT);
+    protocol::FrameHeader h;
+    // The session or explicit-close terminal precedes the ACK.
+    bool terminal = PopFrame(f.conn, &h) && h.type == (order == 0
+        ? protocol::MessageType::WORKER_EXIT : protocol::MessageType::RESULT);
+    if (!terminal || !PopFrame(f.conn, &h) || h.type != protocol::MessageType::ACK || !f.conn.out_queue.empty() ||
+        !f.conn.sessions.empty() || !worker->session->runs.empty() || f.closes != 1 || f.waits != 1 ||
+        f.close_before_removal || f.post_after_close)
+      return false;
+    ::SetEvent(f.wait_release);
+    f.service->Close(f.conn);
+    if (!f.conn.retired_sessions.empty() || f.closes != 1 || f.waits != 1)
+      return false;
+  }
+  return true;
+}
 bool CoordinatorTerminalHoldsNext(std::string *detail) {
   RouterFixture f;
   if (!f.Create() || !f.Start(1))
@@ -811,7 +935,7 @@ bool LifecycleWrongWorker(std::string *detail) {
     f.service->Pump(f.conn);
     if (::WaitForSingleObject(f.wait_entered, 3000) != WAIT_OBJECT_0 ||
         !f.conn.sessions.empty() || !owner->mailbox_failed || stale->mailbox_tail.load() - stale->mailbox_head.load() ||
-        f.closes != 1 || f.waits != 1 || f.posts.size() != posts || !f.conn.out_queue.empty() ||
+        f.closes != 1 || f.waits != 1 || f.posts.size() != posts || !PopWorkerExit(f.conn) ||
         owner->startup != ready || owner->security != ready || bool(owner->engine_image) == ready) {
       *detail = "wrong-worker lifecycle did not fail closed before/after readiness";
       return false;
@@ -824,7 +948,7 @@ bool LifecycleWrongWorker(std::string *detail) {
   return true;
 }
 bool LifecycleOrder(std::string *detail) {
-  for (auto [phase, size] : std::vector<std::pair<uint8_t, size_t>>{{2,4},{0,4},{3,4},{1,3},{1,5}}) {
+  for (auto [phase, size] : std::vector<std::pair<uint8_t, size_t>>{{2,4},{0,4},{4,4},{1,3},{1,5}}) {
     RouterFixture f;
     f.wait_entered = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     f.wait_release = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -834,7 +958,7 @@ bool LifecycleOrder(std::string *detail) {
     auto *worker = f.worker;
     f.Phase(phase, size);
     if (::WaitForSingleObject(f.wait_entered, 3000) != WAIT_OBJECT_0 || !f.conn.sessions.empty() ||
-        !worker->engine_image || f.closes != 1 || !f.posts.empty() || !f.conn.out_queue.empty()) {
+        !worker->engine_image || f.closes != 1 || !f.posts.empty() || !PopWorkerExit(f.conn)) {
       *detail = "invalid lifecycle accepted or image released before cleanup";
       return false;
     }
@@ -858,10 +982,10 @@ bool WorkerOutputZeroId(std::string *detail) {
       auto bytes = v8host::EncodeRunEnvelope(env);
       router::Worker::OnMessage(f.worker, sbox_msg_binary, bytes.data(), bytes.size());
       f.service->Pump(f.conn);
-      const bool rejected = f.conn.sessions.empty() && f.closes == 1;
+      const bool rejected = f.conn.sessions.empty();
       f.service->Close(f.conn);
       if (!rejected || !f.conn.sessions.empty() || !f.conn.retired_sessions.empty() || f.closes != 1 || f.waits != 1 ||
-          f.close_before_removal || f.post_after_close || !f.conn.out_queue.empty()) {
+          f.close_before_removal || f.post_after_close || !PopWorkerExit(f.conn)) {
         *detail = "zero-id worker output was accepted while idle/busy";
         return false;
       }
@@ -996,6 +1120,14 @@ bool DefinitePostFailure(std::string *detail) {
   f.Phase(1);
   f.fail_post = true;
   f.Phase(2);
+  protocol::FrameHeader h;
+  if (!PopFrame(f.conn, &h) || h.type != protocol::MessageType::ACK ||
+      !PopFrame(f.conn, &h) || h.type != protocol::MessageType::SESSION_READY ||
+      !PopFrame(f.conn, &h) || h.type != protocol::MessageType::ACK ||
+      !PopFrame(f.conn, &h) || h.type != protocol::MessageType::STARTUP_READY ||
+      !PopFrame(f.conn, &h) || h.type != protocol::MessageType::SECURITY_READY ||
+      !PopWorkerExit(f.conn))
+    return false;
   f.service->Close(f.conn);
   if (!f.conn.sessions.empty() || !f.conn.retired_sessions.empty() || f.closes != 1 || f.waits != 1 ||
       f.post_after_close || !f.posts.empty()) {
@@ -1028,7 +1160,7 @@ bool SpawnFailure(std::string *detail) {
       if (!PopFrame(f.conn, &h) || h.type != protocol::MessageType::ACK || !PopFrame(f.conn, &h, &code) ||
           h.type != protocol::MessageType::RUN_ERROR || code != protocol::StatusCode::ERROR_INTERNAL ||
           !f.conn.sessions.empty() || !f.conn.retired_sessions.empty() || f.closes || f.waits || !f.posts.empty() ||
-          !f.conn.out_queue.empty() || ::WaitForSingleObject(f.conn.stop, 0) == WAIT_OBJECT_0 ||
+          !PopWorkerExit(f.conn, id) || ::WaitForSingleObject(f.conn.stop, 0) == WAIT_OBJECT_0 ||
           f.spawns != (missing_image ? 0 : id) || (mode == 2 && !f.before_publication)) {
         *detail = "failed spawn retained storage or exhausted connection at " + std::to_string(id);
         return false;
@@ -1166,7 +1298,7 @@ bool MailboxFailureSticky(std::string *detail) {
       }
     };
     f.service->Pump(f.conn);
-    const bool closed_in_pump = f.conn.sessions.empty() && f.closes == 1;
+    const bool closed_in_pump = f.conn.sessions.empty() && f.worker->close_called;
     if (!closed_in_pump || ::WaitForSingleObject(f.wait_entered, 3000) != WAIT_OBJECT_0) {
       *detail = "mailbox drop did not fail closed in the same Pump";
       return false;
@@ -1177,7 +1309,7 @@ bool MailboxFailureSticky(std::string *detail) {
     const bool rejected = worker->mailbox_failed && worker->mailbox_tail == published && tail == published &&
         worker->mailbox_tail - worker->mailbox_head < worker->mailbox.size() && readouts == 1 &&
         run->state == router::RunState::kWorkerExited && worker->session->runs.empty() &&
-        f.conn.out_queue.empty() && f.posts.size() == 1;
+        PopWorkerExit(f.conn) && f.posts.size() == 1;
     worker->mailbox_readout = {};
     ::SetEvent(f.wait_release);
     f.service->Close(f.conn);
@@ -1213,9 +1345,9 @@ bool MailboxBoundary(std::string *detail) {
           f.worker->mailbox_failed || f.conn.out_queue.size() != 1 || f.closes)
         return false;
     } else {
-      const bool rejected = f.conn.sessions.empty() && f.closes == 1;
+      const bool rejected = f.conn.sessions.empty();
       f.service->Close(f.conn);
-      if (!rejected || !f.conn.sessions.empty() || !f.conn.retired_sessions.empty() || !f.conn.out_queue.empty() ||
+      if (!rejected || !f.conn.sessions.empty() || !f.conn.retired_sessions.empty() || !PopWorkerExit(f.conn) ||
           f.closes != 1 || f.waits != 1 || f.post_after_close) {
         *detail = "mailbox full intake did not close and join";
         return false;
@@ -1322,6 +1454,10 @@ struct CapturedBroker {
   std::mutex mutex;
   std::vector<HANDLE> workers;
   bool failed = false;
+  std::string lifecycle_failure;
+  unsigned lifecycle_evidence = 0;
+  std::string failure_selector;
+  HANDLE lifecycle_held = nullptr;
   ~CapturedBroker() {
     if (process) {
       if (::WaitForSingleObject(process, 10000) != WAIT_OBJECT_0) {
@@ -1334,6 +1470,8 @@ struct CapturedBroker {
       reader.join();
     if (output)
       ::CloseHandle(output);
+    if (lifecycle_held)
+      ::CloseHandle(lifecycle_held);
     for (HANDLE worker : workers)
       ::CloseHandle(worker);
   }
@@ -1361,8 +1499,31 @@ struct CapturedBroker {
     std::wstring exe = ExecutableDirectory() + L"\\sbox.exe";
     std::wstring command = L"\"" + exe + L"\" --broker --mode=shared --pipe=\"" + endpoint + L"\" --plugin v8host.dll";
     PROCESS_INFORMATION pi = {};
+    const DWORD previous_size = ::GetEnvironmentVariableA("SBOX_TEST_LIFECYCLE_FAILURE", nullptr, 0);
+    std::string previous(previous_size, '\0');
+    if (previous_size)
+      ::GetEnvironmentVariableA("SBOX_TEST_LIFECYCLE_FAILURE", previous.data(), previous_size);
+    const DWORD event_previous_size = ::GetEnvironmentVariableA("SBOX_TEST_LIFECYCLE_HELD_EVENT", nullptr, 0);
+    std::string event_previous(event_previous_size, '\0');
+    if (event_previous_size)
+      ::GetEnvironmentVariableA("SBOX_TEST_LIFECYCLE_HELD_EVENT", event_previous.data(), event_previous_size);
+    if (!failure_selector.empty()) {
+      const std::string name = "Local\\sbox-lifecycle-held-" + std::to_string(::GetCurrentProcessId()) +
+          "-" + failure_selector;
+      lifecycle_held = ::CreateEventA(nullptr, TRUE, FALSE, name.c_str());
+      if (!lifecycle_held) {
+        ::CloseHandle(write);
+        return false;
+      }
+      ::SetEnvironmentVariableA("SBOX_TEST_LIFECYCLE_HELD_EVENT", name.c_str());
+      ::SetEnvironmentVariableA("SBOX_TEST_LIFECYCLE_FAILURE", failure_selector.c_str());
+    }
     bool ok = ::CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE, 0, nullptr,
         ExecutableDirectory().c_str(), &startup, &pi) != FALSE;
+    if (!failure_selector.empty()) {
+      ::SetEnvironmentVariableA("SBOX_TEST_LIFECYCLE_FAILURE", previous_size ? previous.c_str() : nullptr);
+      ::SetEnvironmentVariableA("SBOX_TEST_LIFECYCLE_HELD_EVENT", event_previous_size ? event_previous.c_str() : nullptr);
+    }
     ::CloseHandle(write);
     if (!ok) {
       *detail = "captured broker launch failed";
@@ -1377,6 +1538,8 @@ struct CapturedBroker {
       while (::ReadFile(output, chunk, sizeof(chunk), &size, nullptr) && size) {
         for (DWORD i = 0; i < size; ++i) {
           if (chunk[i] == '\n') {
+            while (!line.empty() && line.back() == '\r')
+              line.pop_back();
             unsigned long pid = 0;
             if (std::sscanf(line.c_str(), "[broker] target created: pid=%lu", &pid) == 1) {
               HANDLE held = ::OpenProcess(SYNCHRONIZE, FALSE, pid);
@@ -1387,9 +1550,15 @@ struct CapturedBroker {
                   ::CloseHandle(held);
               } else {
                 workers.push_back(held);
+                if (lifecycle_held)
+                  ::SetEvent(lifecycle_held);
                 std::printf("[captured] target created: pid=%lu\n", pid);
                 std::fflush(stdout);
               }
+            }
+            if (line.rfind("[sbox-test] failure=", 0) == 0) {
+              lifecycle_failure = line;
+              ++lifecycle_evidence;
             }
             line.clear();
           } else if (line.size() < 4096) {
@@ -1463,6 +1632,63 @@ bool ExpectResult(WireHarness &h, uint32_t id, protocol::ResultDisposition dispo
       header.request_id == 0 && protocol::DecodeResultPayload(bytes.data() + protocol::kFrameHeaderSize,
           bytes.size() - protocol::kFrameHeaderSize, &result) && result.disposition == disposition;
 }
+bool LifecycleFailure(unsigned failure, std::string *detail) {
+  CapturedBroker broker;
+  broker.failure_selector = std::to_string(failure);
+  WireHarness h;
+  if (!OpenCaptured(broker, h, detail) ||
+      !h.Send(protocol::BuildStartRunFrame(h.Header(2, 1, 1), Script("host.postMessage('unexpected-run');"))) ||
+      !h.Expect(protocol::MessageType::ACK, 2, 1, 1) ||
+      (failure != 1 && !h.Expect(protocol::MessageType::STARTUP_READY, 0, 1)) ||
+      !h.Expect(protocol::MessageType::WORKER_EXIT, 0, 1)) {
+    *detail = "failed child readiness/EXIT ordering";
+    return false;
+  }
+  // A live control barrier proves there was no synthetic result/security/second EXIT.
+  if (!h.Send(protocol::BuildCancelRunFrame(h.Header(3, 1, 1))) ||
+      !h.Expect(protocol::MessageType::ACK, 3, 1, 1))
+    return false;
+  h.connection.Close();
+  const std::string expected = "[sbox-test] failure=" + std::to_string(failure) +
+      " lower=" + (failure == 1 ? "0" : "1") + " run=0 shutdown=1 end=1";
+  if (!broker.Reaped(1) || broker.lifecycle_evidence != 1 || broker.lifecycle_failure != expected) {
+    *detail = "selected worker branch/resource cleanup not observed (count=" + std::to_string(broker.lifecycle_evidence) + ",size=" + std::to_string(broker.lifecycle_failure.size()) + "): " + broker.lifecycle_failure;
+    return false;
+  }
+  return true;
+}
+bool LifecycleFailStartup(std::string *d) { return LifecycleFailure(1, d); }
+bool LifecycleFailSecurity(std::string *d) { return LifecycleFailure(2, d); }
+bool PingPostFail(std::string *d) { return LifecycleFailure(3, d); }
+bool RealCancelOrdering(bool cancel_first, std::string *detail) {
+  CapturedBroker broker;
+  WireHarness h;
+  if (!OpenCaptured(broker, h, detail) ||
+      !h.Send(protocol::BuildStartRunFrame(h.Header(2, 1, 1), Script(
+          "host.onmessage=function(m){host.complete();};host.postMessage('armed');"))) ||
+      !h.Expect(protocol::MessageType::ACK, 2, 1, 1) || !h.Expect(protocol::MessageType::STARTUP_READY, 0, 1) ||
+      !h.Expect(protocol::MessageType::SECURITY_READY, 0, 1) || !ExpectString(h, 1, "armed"))
+    return false;
+  if (!cancel_first && (!SendString(h, 1, "complete") ||
+      !ExpectResult(h, 1, protocol::ResultDisposition::kCompleted)))
+    return false;
+  if (!h.Send(protocol::BuildStartRunFrame(h.Header(3, 1, 2), Script(
+          "host.onmessage=function(m){host.postMessage('next:'+m);host.complete();};"))) ||
+      !h.Expect(protocol::MessageType::ACK, 3, 1, 2) || !SendString(h, 2, "held") ||
+      !h.Send(protocol::BuildCancelRunFrame(h.Header(4, 1, 1))) ||
+      !h.Expect(protocol::MessageType::ACK, 4, 1, 1) ||
+      (cancel_first && !ExpectResult(h, 1, protocol::ResultDisposition::kCancelled)) ||
+      !ExpectString(h, 2, "next:held") || !ExpectResult(h, 2, protocol::ResultDisposition::kCompleted) ||
+      !SendString(h, 1, "late") || !h.Send(protocol::BuildCancelRunFrame(h.Header(5, 1, 1))) ||
+      !h.Expect(protocol::MessageType::ACK, 5, 1, 1)) {
+    *detail = "cancel terminal/successor FIFO/late-output barrier";
+    return false;
+  }
+  h.connection.Close();
+  return broker.Reaped(1);
+}
+bool CancelsFirst(std::string *d) { return RealCancelOrdering(true, d); }
+bool CompletesFirst(std::string *d) { return RealCancelOrdering(false, d); }
 bool RealTwoRunReuse(std::string *detail) {
   CapturedBroker broker;
   WireHarness h;
@@ -2954,6 +3180,18 @@ int main(int argc, char** argv) {
       {"router", "id-retirement", IdRetirement},
       {"router", "control-budget", ControlBudget},
       {"router", "start-admission-validation", StartAdmissionValidation},
+      {"cancel", "cancels-first", CancelsFirst},
+      {"cancel", "completes-first", CompletesFirst},
+      {"run", "lifecycle-abi5", LifecycleAbi5},
+      {"run", "exit-fact-origin", ExitFactOrigin},
+      {"run", "exit-fact-final-drain", ExitFinalDrain},
+      {"run", "smoke-lifecycle-two", SmokeLifecycleTwo},
+      {"run", "worker-post-kind-guard", WorkerKindGuard},
+      {"run", "lifecycle-post-fail-startup", LifecycleFailStartup},
+      {"run", "lifecycle-post-fail-security", LifecycleFailSecurity},
+      {"run", "post-lockdown-ping-fail", PingPostFail},
+      {"lifetime", "early-worker-exit", LifecycleFailSecurity},
+      {"lifetime", "exit-cleanup-orderings", ExitCleanupOrderings},
       {"run", "start-spawn", StartSpawn},
       {"run", "real-two-run-reuse", RealTwoRunReuse},
       {"lifetime", "close-live-worker", CloseLiveWorker},
