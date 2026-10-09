@@ -989,6 +989,58 @@ bool UnknownRequestIdDisconnects(std::string* detail) {
   return true;
 }
 
+bool RelayQuotaError(std::string* detail) {
+  for (int path = 0; path < 12; ++path) {
+    FakeTransport* fake = nullptr; V8HostSession* session = Create(&fake);
+    if (!session) return Fail(detail, "quota session");
+    Recorder r; auto cb = Callbacks(&r); v8host_client_set_callbacks(session, &cb);
+    auto input = BasicRun(); V8HostRun *first = nullptr, *second = nullptr;
+    if (v8host_client_start_run(session, &input, &first) != V8HOST_OK ||
+        v8host_client_start_run(session, &input, &second) != V8HOST_OK) return Fail(detail, "quota runs");
+    FrameHeader h; auto request = fake->Frame(1); DecodeAndValidateFrame(request.data(), request.size(), &h);
+    fake->Inbound(AckFor(fake->Frame(0)));
+    h.request_id = 0;
+    if (path == 2) fake->Inbound(ResultFrame(h.session_id, h.run_id));
+    if (path == 3) v8host_client_close_session(session);
+    if (path == 4) ++h.session_id;
+    if (path == 5) h.run_id += 10;
+    if (path == 8) h.request_id = 10000;
+    if (path == 9) ++h.conn_id;
+    if (path == 11) h.run_id = 0;
+    ErrorPayload error; error.status_code = path == 6 ? StatusCode::ERROR_BAD_STATE : StatusCode::ERROR_QUOTA;
+    auto frame = path == 7 ? BuildAckFrame(h) : BuildErrorFrame(h, error);
+    if (path == 10) frame.pop_back();
+    fake->Inbound(frame);
+    if (path < 3) {
+      fake->Inbound(frame);
+      Drain();
+      if (r.events.size() != 1 || r.disconnects ||
+          r.events[0] != (path == 2 ? V8HOST_RUN_EVENT_COMPLETED : V8HOST_RUN_EVENT_FAILED) ||
+          r.event_status[0] != (path == 2 ? V8HOST_OK : V8HOST_E_QUOTA) ||
+          v8host_client_cancel_run(first) != V8HOST_E_RUN_TERMINAL ||
+          v8host_client_post_message(second, 0, nullptr, 0) != V8HOST_OK)
+        return Fail(detail, "quota addressing/duplicate/winner/other-run containment");
+      if (path == 0) fake->Inbound(ResultFrame(h.session_id, h.run_id + 1));
+      else fake->Disconnect();
+      fake->Inbound(frame); Drain();
+      if (r.events.size() != 2 || r.event_status[1] != (path == 0 ? V8HOST_OK : V8HOST_E_BROKER_LOST) ||
+          r.events[1] != (path == 0 ? V8HOST_RUN_EVENT_COMPLETED : V8HOST_RUN_EVENT_BROKER_LOST) ||
+          r.disconnects != (path == 0 ? 0 : 1)) return Fail(detail, "quota then completion/EOF once");
+    } else if (path == 3) {
+      Drain();
+      if (r.total.load() != 0) return Fail(detail, "callbacks after close and late quota");
+    } else {
+      Drain();
+      if (r.events.size() != 2 || r.event_status != std::vector<V8HostStatus>(2, V8HOST_E_PROTOCOL) ||
+          r.disconnects != 1 || r.state_status != std::vector<V8HostStatus>{V8HOST_E_PROTOCOL})
+        return Fail(detail, "invalid unsolicited quota must fail protocol");
+    }
+    if (path != 3) v8host_client_close_session(session);
+    Drain();
+  }
+  return true;
+}
+
 bool PendingCapacityAndDuplicateAck(std::string* detail) {
   FakeTransport* fake = nullptr;
   V8HostSession* session = Create(&fake);
@@ -1449,6 +1501,59 @@ struct PumpFixture {
   }
 };
 
+PumpFixture* g_client_pipe = nullptr;
+ClientTransport* MakeClientPipe(const TransportParams& params, ClientTransportDelegate* delegate) {
+  auto p = params; p.test_context = g_client_pipe;
+  p.test_connect = PumpFixture::Connect; p.test_pending = PumpFixture::Pending;
+  return v8host::client::CreateRealPipeClientTransport(p, delegate);
+}
+bool RealClientFailurePaths(std::string* detail) {
+  for (int path = 0; path < 4; ++path) {
+    PumpFixture f; if (!f.Init()) return Fail(detail, "client pipe pair");
+    g_client_pipe = &f; SetTransportFactoryForTesting(&MakeClientPipe);
+    struct ResetFactory { ~ResetFactory() { SetTransportFactoryForTesting(&MakeFake); g_client_pipe = nullptr; } } reset;
+    if (path == 0) f.results = {v8host::RendezvousStatus::kProtocolFailed};
+    V8HostSession* session = Create();
+    if (!session) return Fail(detail, "real transport client create");
+    struct CloseSession { V8HostSession* session; ~CloseSession() { if (session) v8host_client_close_session(session); } } cleanup{session};
+    Recorder r; auto callbacks = Callbacks(&r); v8host_client_set_callbacks(session, &callbacks);
+    auto input = BasicRun(); V8HostRun* run = nullptr;
+    if (v8host_client_start_run(session, &input, &run) != V8HOST_OK) return Fail(detail, "real transport client start");
+    ::SetEvent(f.gate);
+    if (!PumpUntil([&] { return ::WaitForSingleObject(f.entered, 0) == WAIT_OBJECT_0; }))
+      return Fail(detail, "real client scheduled startup");
+    if (path != 0) {
+      std::vector<uint8_t> frame(kMaxFrameSize);
+      FrameHeader h;
+      for (int n = 0; n < 2; ++n) {
+        frame.resize(kMaxFrameSize);
+        if (!f.Io(false, &frame) || !DecodeFrame(frame, &h, nullptr, nullptr) ||
+            h.conn_id != 37 || h.version_minor != 7 || h.request_id != static_cast<uint32_t>(n + 2))
+          return Fail(detail, "real client negotiated CREATE/START FIFO");
+      }
+      if (!Signaled(f.read_pending)) return Fail(detail, "real client pending read");
+      if (path == 1) { ::CloseHandle(f.server); f.server = INVALID_HANDLE_VALUE; }
+      else {
+        h.request_id = 0; h.version_minor = path == 3 ? 6 : 7;
+        frame = BuildResultFrame(h, ResultDisposition::kCompleted);
+        if (path == 2) frame.pop_back();
+        if (!f.Io(true, &frame)) return Fail(detail, "real client invalid inbound write");
+      }
+    }
+    if (!PumpUntil([&] { return r.disconnects == 1; })) return Fail(detail, "real client failure callbacks");
+    Drain();
+    const V8HostStatus expected = path == 0 ? V8HOST_E_CONNECT : path == 1 ? V8HOST_E_BROKER_LOST : V8HOST_E_PROTOCOL;
+    if (r.events.size() != 1 || r.event_status != std::vector<V8HostStatus>{expected} ||
+        r.events[0] != (path == 1 ? V8HOST_RUN_EVENT_BROKER_LOST : V8HOST_RUN_EVENT_FAILED) ||
+        r.state_status != std::vector<V8HostStatus>{expected} || r.states != std::vector<int32_t>{V8HOST_SESSION_STATE_CLOSED} ||
+        r.run_thread != ::GetCurrentThreadId() || r.disconnect_thread != ::GetCurrentThreadId() ||
+        f.attempts != 1 || v8host_client_cancel_run(run) != V8HOST_E_RUN_TERMINAL)
+      return Fail(detail, "real client failure once/app-thread/no replay");
+    v8host_client_close_session(session); cleanup.session = nullptr; Drain();
+  }
+  return true;
+}
+
 std::vector<uint8_t> SizedTransportFrame(size_t len, bool relay, uint32_t run = 1) {
   FrameHeader h; h.version_major = 1;
   h.type = relay ? MessageType::RELAY_TO_WORKER : MessageType::START_RUN;
@@ -1745,6 +1850,7 @@ int main(int argc, char** argv) {
       {"transport", "control-id-send-order", ControlIdSendOrder},
       {"transport", "close-lifetime-no-replay", TransportCallbackClose},
       {"transport", "handshake-rejects", HandshakeRejects},
+      {"transport", "real-client-failure-paths", RealClientFailurePaths},
       {"transport", "exact-quota-crossing", TransportExactCrossing},
       {"transport", "startup-registration-failure", StartupRegistrationFailure},
       {"transport", "id-exhaustion", ClientIdExhaustion},
@@ -1772,6 +1878,7 @@ int main(int argc, char** argv) {
       {"protocol", "wrong-conn-session-run-correlation",
        CorrelationMismatchDisconnects},
       {"protocol", "wrong-request-id-ack-error", UnknownRequestIdDisconnects},
+      {"protocol", "relay-quota-error", RelayQuotaError},
       {"protocol", "pending-capacity-and-duplicate-ack",
        PendingCapacityAndDuplicateAck},
       {"protocol", "malformed-frame-disconnect", MalformedFrameDisconnects},

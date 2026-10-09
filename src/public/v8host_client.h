@@ -81,7 +81,7 @@ extern "C" {
 
 // Stable result codes. 0 is success; errors are grouped into stable bands by
 // failure class so new codes can be added to a band without renumbering:
-//   0x1000 - caller/argument contract (validated synchronously, fail-closed)
+//   0x1000 - caller/argument contract and quotas (fail-closed)
 //   0x2000 - lifecycle/state and local resources
 //   0x3000 - broker transport / connection
 //   0x4000 - asynchronous session/run terminal conditions
@@ -91,7 +91,7 @@ extern "C" {
 typedef enum V8HostStatus {
   V8HOST_OK = 0,  // success; for async calls, inputs were validated and accepted
 
-  // 0x1000 - caller/argument contract (synchronous, fail-closed).
+  // 0x1000 - caller/argument contract and quotas (fail-closed).
   V8HOST_E_INVALID_ARG = 0x1001,  // NULL/invalid pointer, enum, or count/pair
   V8HOST_E_STRUCT_SIZE = 0x1002,  // struct_size < required v1 size
   V8HOST_E_VERSION     = 0x1003,  // client API / loaded-DLL ABI incompatible
@@ -199,6 +199,9 @@ typedef void(V8HOST_CALL* V8HostSessionStateCb)(void* context,
 // terminal event carries the run's final `status`: V8HOST_OK on clean
 // completion, else a V8HOST_E_* code (e.g. V8HOST_E_RUN_TERMINAL on a
 // post-terminal outcome, V8HOST_E_BROKER_LOST on disconnect).
+// A broker relay-cap overflow may end a run with FAILED / V8HOST_E_QUOTA.
+// A per-connection overflow also closes the connection; its other live runs
+// then end with BROKER_LOST / V8HOST_E_BROKER_LOST.
 typedef void(V8HOST_CALL* V8HostRunEventCb)(void* context,
                                             V8HostRun* run,
                                             int32_t event,
@@ -261,7 +264,8 @@ V8HOST_CLIENT_API V8HostStatus V8HOST_CALL v8host_client_start_run(
 
 // Queue an outbound relay frame to the worker for `run`. `data`/`len` are copied
 // before this call returns. A terminal run rejects with V8HOST_E_RUN_TERMINAL.
-// Transport admission may immediately return V8HOST_E_CONNECT or V8HOST_E_PROTOCOL.
+// Transport admission may immediately return V8HOST_E_CONNECT, V8HOST_E_PROTOCOL,
+// or V8HOST_E_QUOTA (nothing queued; the run continues).
 V8HOST_CLIENT_API V8HostStatus V8HOST_CALL v8host_client_post_message(
     V8HostRun* run,
     int32_t kind,
@@ -271,7 +275,7 @@ V8HOST_CLIENT_API V8HostStatus V8HOST_CALL v8host_client_post_message(
 // Request cancellation of `run`. Success means the request was accepted, not
 // that guest code had not already produced effects. A terminal run rejects with
 // V8HOST_E_RUN_TERMINAL. Transport admission may immediately return
-// V8HOST_E_CONNECT or V8HOST_E_PROTOCOL.
+// V8HOST_E_CONNECT, V8HOST_E_PROTOCOL, or V8HOST_E_QUOTA (nothing queued).
 V8HOST_CLIENT_API V8HostStatus V8HOST_CALL v8host_client_cancel_run(
     V8HostRun* run);
 

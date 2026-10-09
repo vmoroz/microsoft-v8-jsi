@@ -489,7 +489,10 @@ class ClientConnection final
 
     if (header.type == protocol::MessageType::ACK ||
         header.type == protocol::MessageType::ERROR) {
-      RouteControl(header, payload, payload_len);
+      if (header.type == protocol::MessageType::ERROR && header.request_id == 0)
+        RouteRelayQuota(header, payload, payload_len);
+      else
+        RouteControl(header, payload, payload_len);
       return;
     }
 
@@ -578,6 +581,27 @@ class ClientConnection final
     }
     Dispatcher::Instance().PostRunEvent(session->dispatch_id, run, &run->arbiter,
                                         true, event, status);
+  }
+
+  void RouteRelayQuota(const protocol::FrameHeader& header,
+                       const uint8_t* payload, size_t payload_len) {
+    protocol::ErrorPayload error;
+    if (!header.session_id || !header.run_id ||
+        !protocol::DecodeErrorPayload(payload, payload_len, &error) ||
+        error.status_code != protocol::StatusCode::ERROR_QUOTA) {
+      OnDisconnect(TransportDisconnect::kProtocolError);
+      return;
+    }
+    V8HostSession* session = AcquireSession(header.session_id);
+    if (!session) {
+      OnDisconnect(TransportDisconnect::kProtocolError);
+      return;
+    }
+    V8HostRun* run = FindRun(session, header.run_id);
+    if (run)
+      MarkAndPostTerminal(session, run, V8HOST_RUN_EVENT_FAILED, V8HOST_E_QUOTA);
+    session->Release();
+    if (!run) OnDisconnect(TransportDisconnect::kProtocolError);
   }
 
   void RouteControl(const protocol::FrameHeader& header,

@@ -673,7 +673,8 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
       return true;
     }
     if (bytes.size() > protocol::kMaxQueuedRelayBytesPerConnection - conn.in_relay_bytes) {
-      conn.Stop();
+      if (conn.Enqueue(Error(h, protocol::StatusCode::ERROR_QUOTA)))
+        conn.state = ConnState::kClosing;
       return false;
     }
     conn.in_relay_bytes += bytes.size();

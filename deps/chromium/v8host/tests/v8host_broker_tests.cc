@@ -2023,8 +2023,22 @@ bool RelayConnectionBoundary(std::string *detail) {
     }
     const bool accepted = outbound ? FillOutbound(f, workers[16], 100 + delta) : FillInbound(f, 17, 100 + delta);
     const size_t charged = outbound ? f.conn.out_relay_bytes.load() : f.conn.in_relay_bytes;
+    if (!outbound && delta > 0) {
+      std::vector<uint8_t> frame; protocol::FrameHeader h;
+      const uint8_t *body; size_t size; protocol::ErrorPayload error;
+      if (!f.conn.TakeOutput(&frame)) { *detail = "aggregate rejection missing ERROR_QUOTA"; return false; }
+      f.conn.CompleteOutput(frame.size());
+      if (protocol::DecodeAndValidateFrame(frame.data(), frame.size(), &h, &body, &size) != protocol::DecodeStatus::kOk ||
+          h.type != protocol::MessageType::ERROR || h.conn_id != f.conn.conn_id ||
+          h.session_id != 17 || h.run_id != 1 || h.request_id != 0 ||
+          !protocol::DecodeErrorPayload(body, size, &error) || error.status_code != protocol::StatusCode::ERROR_QUOTA ||
+          f.conn.in_relay_bytes != protocol::kMaxQueuedRelayBytesPerConnection - 100) {
+        *detail = "aggregate rejection must enqueue addressed ERROR_QUOTA without input credit"; return false;
+      }
+    }
     if ((!outbound && accepted != (delta <= 0)) ||
-        (::WaitForSingleObject(f.conn.stop, 0) == WAIT_OBJECT_0) != (delta > 0) ||
+        (::WaitForSingleObject(f.conn.stop, 0) == WAIT_OBJECT_0) != (outbound && delta > 0) ||
+        (!outbound && (f.conn.state == router::ConnState::kClosing) != (delta > 0)) ||
         charged > protocol::kMaxQueuedRelayBytesPerConnection ||
         (delta <= 0 && charged != protocol::kMaxQueuedRelayBytesPerConnection + delta)) {
       *detail = "connection quota boundary did not contain entire connection"; return false;
@@ -2032,6 +2046,70 @@ bool RelayConnectionBoundary(std::string *detail) {
     f.service->Close(f.conn); f.conn.ClearOutput();
     if (!f.conn.CompleteZero() || f.closes != 17 || f.waits != 17 || f.post_after_close || f.close_before_removal)
       return false;
+  }
+  return true;
+}
+bool InboundErrorDrain(std::string *detail) {
+  for (int path = 0; path < 4; ++path) {
+    RouterFixture f; PressurePipe pipe;
+    uint32_t request = 0;
+    for (uint32_t id = 1; id <= 17; ++id) {
+      if (!LocalRoute(*f.service, f.conn, protocol::BuildCreateSessionFrame(ControlHeader(++request, id), LogicalConfig()))) return false;
+      protocol::StartRunPayload start; start.tier_override = -1; start.guest_payload = {'x'};
+      if (!LocalRoute(*f.service, f.conn, protocol::BuildStartRunFrame(ControlHeader(++request, id, 1), start))) return false;
+    }
+    DrainLocal(f.conn);
+    for (uint32_t id = 1; id <= 16; ++id)
+      if (!FillInbound(f, id, protocol::kMaxQueuedRelayBytesPerRun - (id == 16 ? 100 : 0))) return false;
+    if (!pipe.Open(true)) return false;
+    HANDLE release = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE pending = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!release || !pending) return false;
+    f.conn.pipe = pipe.server; f.conn.writer_release = release; f.conn.write_pending = pending;
+    bool passed = f.conn.StartWriter();
+    // Hold the sole writer until the rejection and preceding output are queued.
+    if (path == 1) passed &= f.conn.Enqueue(std::vector<uint8_t>(protocol::kMaxFrameSize, 0));
+    else if (path == 3) {
+      for (size_t n = 0; n < protocol::kMaxControlQueueRequests; ++n)
+        passed &= f.conn.Enqueue(protocol::BuildAckFrame(ControlHeader(1)));
+    } else passed &= f.conn.Enqueue(protocol::BuildAckFrame(ControlHeader(1)));
+    passed &= !FillInbound(f, 17, 101) && f.conn.in_relay_bytes == protocol::kMaxQueuedRelayBytesPerConnection - 100;
+    passed &= path == 3 ? ::WaitForSingleObject(f.conn.stop, 0) == WAIT_OBJECT_0 :
+        f.conn.state == router::ConnState::kClosing && ::WaitForSingleObject(f.conn.stop, 0) == WAIT_TIMEOUT;
+    if (path == 2) { ::CloseHandle(pipe.client); pipe.client = INVALID_HANDLE_VALUE; }
+    ::SetEvent(release);
+    if (path == 0) {
+      std::array<uint8_t, protocol::kMaxFrameSize> frame;
+      for (int n = 0; n < 2; ++n) {
+        DWORD count = 0; protocol::FrameHeader h; const uint8_t *body; size_t size; protocol::ErrorPayload error;
+        passed &= PressureTransfer(pipe.client, false, frame.data(), static_cast<DWORD>(frame.size()), &count) &&
+            protocol::DecodeAndValidateFrame(frame.data(), count, &h, &body, &size) == protocol::DecodeStatus::kOk;
+        if (n == 0) passed &= h.type == protocol::MessageType::ACK;
+        else passed &= h.type == protocol::MessageType::ERROR && h.conn_id == 1 && h.session_id == 17 &&
+            h.run_id == 1 && h.request_id == 0 && protocol::DecodeErrorPayload(body, size, &error) &&
+            error.status_code == protocol::StatusCode::ERROR_QUOTA;
+      }
+      passed &= f.conn.DrainOutput(2000);
+    } else if (path == 1) {
+      passed &= ::WaitForSingleObject(pending, 5000) == WAIT_OBJECT_0 && !f.conn.DrainOutput(30);
+    } else if (path == 2) passed &= ::WaitForSingleObject(f.conn.stop, 5000) == WAIT_OBJECT_0;
+    const ULONGLONG begin = ::GetTickCount64();
+    f.conn.Stop(); f.conn.JoinWriter(); f.service->Close(f.conn); f.conn.ClearOutput();
+    passed &= ::GetTickCount64() - begin < 5000;
+    ::CloseHandle(pipe.server); pipe.server = INVALID_HANDLE_VALUE; f.conn.pipe = INVALID_HANDLE_VALUE;
+    if (path == 0) {
+      uint8_t byte; DWORD count;
+      passed &= !PressureTransfer(pipe.client, false, &byte, 1, &count);
+      passed &= !::PeekNamedPipe(pipe.client, nullptr, 0, nullptr, nullptr, nullptr) &&
+          ::GetLastError() == ERROR_BROKEN_PIPE;
+    }
+    f.conn.writer_release = f.conn.write_pending = nullptr;
+    ::CloseHandle(release); ::CloseHandle(pending);
+    if (!passed || !f.conn.CompleteZero() || f.closes != 17 || f.waits != 17 || !f.posts.empty() || f.spawns != 17 ||
+        f.conn.active_io || f.conn.writers_started != 1 || f.conn.writers_joined != 1 ||
+        f.post_after_close || f.close_before_removal) {
+      *detail = "aggregate error drain/failed enqueue/broken or nonreading peer path=" + std::to_string(path); return false;
+    }
   }
   return true;
 }
@@ -2601,7 +2679,7 @@ struct CapturedBroker {
               line.pop_back();
             unsigned long pid = 0;
             if (std::sscanf(line.c_str(), "[broker] target created: pid=%lu", &pid) == 1) {
-              HANDLE held = ::OpenProcess(SYNCHRONIZE, FALSE, pid);
+              HANDLE held = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
               std::lock_guard<std::mutex> lock(mutex);
               if (!held || workers.size() >= 32) {
                 failed = true;
@@ -4497,6 +4575,63 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
       "JS transforms; readiness/FIFO; one COMPLETED/OK per run; callback close; one worker reaped";
   return capture.valid && capture.terminal == 2 && capture.disconnects == 0;
 }
+bool PublicRealCancelAndProfile(std::string* detail) {
+  CapturedBroker broker;
+  if (!broker.Launch(detail)) return false;
+  auto& client = PublicClient();
+  if (!client.Load()) { *detail = "public client load"; return false; }
+  PublicCapture c; c.client = &client; c.close_in_terminal = false;
+  V8HostSessionConfig config = {}; config.struct_size = sizeof(config);
+  config.broker_mode = V8HOST_BROKER_SHARED; config.tier = V8HOST_TIER_TRUSTED;
+  config.initial_token = sbox_token_restricted_same_access; config.delayed_integrity = sbox_integrity_untrusted;
+  if (client.create(&config, &c.session) != V8HOST_OK) return false;
+  auto callbacks = c.Table(); if (client.callbacks(c.session, &callbacks) != V8HOST_OK) return false;
+  DWORD worker_pid = 0;
+  auto same_worker = [&] {
+    std::lock_guard<std::mutex> lock(broker.mutex);
+    if (broker.failed || broker.workers.size() != 1 || ::WaitForSingleObject(broker.workers[0], 0) != WAIT_TIMEOUT) return false;
+    const DWORD pid = ::GetProcessId(broker.workers[0]);
+    if (!worker_pid) worker_pid = pid;
+    return pid && pid == worker_pid;
+  };
+  for (int round = 0; round < 4; ++round) {
+    std::string guest = round == 0 ? "host.onmessage=function(m){};host.postMessage('armed');" :
+        "host.postMessage('done');host.complete();";
+    V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = round == 2 ? V8HOST_TIER_UNTRUSTED : -1;
+    input.payload = guest.data(); input.payload_len = guest.size();
+    input.engine_dll_override = round == 2 ? L"missing-profile-engine.dll" : L"v8jsisb.dll";
+    if (client.start(c.session, &input, &c.run) != V8HOST_OK || !c.run) { *detail = "public negative start"; return false; }
+    if (round == 0) {
+      if (!PumpPublic([&] { return !c.messages.empty() || c.disconnects; }) || c.messages.empty() ||
+          std::string(c.messages[0].begin(), c.messages[0].end()) != "armed" ||
+          !PumpPublic(same_worker) || client.cancel(c.run) != V8HOST_OK) {
+        *detail = "public armed/cancel/worker observation messages=" + std::to_string(c.messages.size()) +
+            " terminals=" + std::to_string(c.terminal) + " disconnects=" + std::to_string(c.disconnects) +
+            " status=" + std::to_string(c.statuses.empty() ? -1 : c.statuses.back()); return false;
+      }
+    }
+    if (!PumpPublic([&] { return c.terminal >= round + 1 || c.disconnects; })) { *detail = "public negative terminal timeout"; return false; }
+    const int32_t expected_event = round == 0 ? V8HOST_RUN_EVENT_CANCELLED : round == 2 ? V8HOST_RUN_EVENT_FAILED : V8HOST_RUN_EVENT_COMPLETED;
+    const V8HostStatus expected_status = round == 2 ? V8HOST_E_PROFILE_ALREADY_BOUND : V8HOST_OK;
+    const std::vector<int32_t> expected_events = round == 0 ? std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_CANCELLED} :
+        round == 1 ? std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_CANCELLED, V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED} :
+        round == 2 ? std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_CANCELLED, V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED, V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_FAILED} :
+        std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_CANCELLED, V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED, V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_FAILED, V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED};
+    if (!c.valid || c.disconnects || c.terminal != round + 1 || c.events != expected_events ||
+        c.events.back() != expected_event || c.statuses.back() != expected_status || !same_worker() ||
+        client.cancel(c.run) != V8HOST_E_RUN_TERMINAL || client.post(c.run, sbox_msg_string, "late", 4) != V8HOST_E_RUN_TERMINAL) {
+      *detail = "public cancel/profile/terminal/reuse round=" + std::to_string(round); return false;
+    }
+  }
+  if (c.messages != std::vector<std::vector<uint8_t>>{{'a','r','m','e','d'}, {'d','o','n','e'}, {'d','o','n','e'}} ||
+      c.statuses != std::vector<V8HostStatus>{V8HOST_OK,V8HOST_OK,V8HOST_OK,V8HOST_OK,V8HOST_OK,V8HOST_E_PROFILE_ALREADY_BOUND,V8HOST_OK,V8HOST_OK}) {
+    *detail = "profile failure ran guest or wrong terminal status"; return false;
+  }
+  client.close(c.session); c.closed = true;
+  if (!broker.Reaped(1)) { *detail = "public negative worker reaping"; return false; }
+  MSG msg; while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) ::DispatchMessageW(&msg);
+  return c.valid && c.terminal == 4 && c.disconnects == 0;
+}
 bool PublicRealJs(std::string* detail) {
   return PublicRealJsMode(V8HOST_BROKER_SHARED, detail);
 }
@@ -4510,6 +4645,7 @@ int main(int argc, char** argv) {
   const std::vector<v8host::test::TestCase> tests = {
       {"client", "real-js", PublicRealJs},
       {"client", "real-dedicated-js", PublicRealDedicatedJs},
+      {"client", "real-cancel-and-profile", PublicRealCancelAndProfile},
       {"router", "discard-intake-ordering", DiscardIntakeOrdering},
       {"cancel", "terminal-before-fallback", TerminalBeforeFallback},
       {"router", "bookkeeping-callback-overlap", BookkeepingCallbackOverlap},
@@ -4530,6 +4666,7 @@ int main(int argc, char** argv) {
       {"router", "id-exhaustion", IdExhaustion},
       {"quota", "relay-run-boundary", RelayRunBoundary},
       {"quota", "relay-connection-boundary", RelayConnectionBoundary},
+      {"quota", "inbound-error-drain", InboundErrorDrain},
       {"quota", "control-boundary", ControlBoundary},
       {"router", "worker-ring-retry-exhaustion", RetryExhaustion},
       {"router", "worker-ring-full", RetryFifoCredits},
