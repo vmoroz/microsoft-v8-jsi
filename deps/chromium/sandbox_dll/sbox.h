@@ -14,7 +14,8 @@
 //                                   -> sbox lowers the token   (ACG armed here)
 //                                   -> run(w, worker_api)      (POST-lockdown)
 //                                   -> shutdown(w)
-// shutdown is called once after any warmup attempt and must tolerate failure.
+// shutdown is called once after any warmup attempt, even without run,
+// and must tolerate warmup failure.
 // Any codegen/patching the plugin needs MUST happen in warmup; run is post-ACG.
 #ifndef SANDBOX_DLL_SBOX_H_
 #define SANDBOX_DLL_SBOX_H_
@@ -127,7 +128,9 @@ typedef struct sbox_broker_start {
 // when it returns. EXIT arrives at most once, after all queued worker output,
 // but may be absent once close/wait starts. It carries no exit code, does not
 // replace the single wait, and is not permission to free handles or context.
-// The callback must not call close/wait.
+// Callbacks must return promptly and never block or call close/wait;
+// wait gives the reader 5 s to join; a callback still running after that
+// budget is unsupported.
 // The host owns this table and every opaque host token.
 typedef struct sbox_broker_api {
   uint32_t struct_size;

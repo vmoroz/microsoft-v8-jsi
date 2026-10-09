@@ -343,8 +343,8 @@ class ClientConnection final
     if (!transport_)
       return V8HOST_E_NO_MEMORY;
     // A transport start/send failure is an asynchronous connection outcome.
-    // The Stage-3 real skeleton fails closed here but API input acceptance still
-    // succeeds; Stage 4 reports the failure through the delegate.
+    // A complete transport reports start failure through the delegate;
+    // this skeleton fails closed without a delegate notification.
     transport_->Start();
     return V8HOST_OK;
   }

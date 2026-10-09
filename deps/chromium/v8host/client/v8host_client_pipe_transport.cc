@@ -9,10 +9,8 @@
 namespace v8host::client {
 namespace {
 
-// Stage-4 fill-in boundary: Start will run BrokerRendezvous connect/launch and
-// handshake on a background thread, then own the overlapped read loop.
-// SendFrame will queue/write frames, and Close will cancel I/O and arrange the
-// join off the caller's thread. Stage 3 deliberately performs no pipe I/O.
+// Transport skeleton: fail closed without pipe I/O until background
+// rendezvous, reads, writes, cancellation and joined teardown are implemented.
 class PipeClientTransport final : public ClientTransport {
  public:
   PipeClientTransport(TransportParams params, ClientTransportDelegate* delegate)

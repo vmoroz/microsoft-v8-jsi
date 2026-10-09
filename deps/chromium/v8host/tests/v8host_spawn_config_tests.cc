@@ -1,14 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Deterministic, in-process conformance tests for Stage 3 slice (f):
+// Deterministic, in-process conformance tests for spawn configuration:
 //   * the neutral spawn/worker-profile codec (:spawn_config) —
 //     V8HostWorkerProfileV1 and V8HostSpawnConfigV1 round-trips, canonical
 //     exact-byte vectors (so the encodings are pinned cross-arch), and the
 //     fail-closed decode rejections; and
 //   * the engine's real configure() lowering (ApplySpawnConfig, compiled in) —
 //     driven onto the real MakeConfigApi builder + MarshalSboxConfig gate
-//     (slice (b)) so a spawn config lowers 1:1 to the policy and a
+//     so a spawn config lowers 1:1 to the policy and a
 //     trusted-under-ACG / jitless<->ACG mismatch is rejected.
 // No pipes, no spawned worker: the `codec` suites are pure byte vectors and the
 // `apply` suite drives the builder directly.

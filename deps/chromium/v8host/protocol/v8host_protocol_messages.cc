@@ -190,7 +190,7 @@ bool ReadVariablePayloadHeader(Reader& reader,
 
 // True iff `name` is a bare payload-directory filename: non-empty, no path
 // separator or drive colon, not ".", and with no ".." substring. Full
-// canonicalization under the payload dir is the coordinator's Stage-4 job; this
+// canonicalization under the payload dir is the coordinator's job; this
 // is only the wire-format guard that an override can never be an arbitrary path
 // or traverse out of the payload dir. The predicate is uniform with the client
 // and the spawn/config layers.
@@ -500,7 +500,7 @@ bool DecodeStartRunPayload(const uint8_t* data,
 
   // Structural field-format rules (design §8.6), fail-closed. Full
   // canonicalization under the payload directory, held-file signature
-  // verification, and opening the snapshot are the coordinator's Stage-4 job —
+  // verification, and opening the snapshot are the coordinator's job —
   // this codec never touches the filesystem.
   if (p.has_engine_override) {
     if (!IsBareFilename(p.engine_filename))

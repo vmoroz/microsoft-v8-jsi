@@ -145,15 +145,7 @@ class BrokerService {
     auto zero_since = std::chrono::steady_clock::now();
     bool zero_timing = false;
     while (!draining_) {
-      // Reap finished connection tasks without retaining handles until idle.
-      for (auto it = tasks_.begin(); it != tasks_.end();) {
-        if (::WaitForSingleObject(*it, 0) == WAIT_OBJECT_0) {
-          ::CloseHandle(*it);
-          it = tasks_.erase(it);
-        } else {
-          ++it;
-        }
-      }
+      ReapConnectionTasks();
       if (mode_ == v8host::BrokerMode::kDedicated && owner_seen_)
         break;
       HANDLE pipe = ::CreateNamedPipeW(
@@ -196,12 +188,21 @@ class BrokerService {
         connected = true;
       } else if (::GetLastError() == ERROR_IO_PENDING) {
         pending = true;
-        if (::WaitForSingleObject(overlapped.hEvent, 100) == WAIT_OBJECT_0) {
-          DWORD transferred = 0;
-          connected =
-              ::GetOverlappedResult(pipe, &overlapped, &transferred, FALSE) !=
-              FALSE;
+      }
+      while (pending && !draining_) {
+        const auto status = V8HostBrokerPollConnect(pipe, &overlapped, 100);
+        if (status != V8HostBrokerAcceptStatus::kPending) {
+          connected = status == V8HostBrokerAcceptStatus::kConnected;
           pending = false;
+        } else {
+          ReapConnectionTasks();
+          if (IdleExpired(&zero_since, &zero_timing)) {
+            connected = V8HostBrokerFinishPendingConnect(pipe, &overlapped);
+            pending = false;
+            // A completed accept wins over idle shutdown and resets the grace.
+            if (!connected)
+              draining_ = true;
+          }
         }
       }
       if (pending)
@@ -233,32 +234,45 @@ class BrokerService {
       } else {
         ::CloseHandle(pipe);
       }
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        // Connection refs cover sessions through cleanup; tasks cover final release.
-        if (setup_count_ == 0 && connection_count_ == 0 &&
-            connections_.empty() && tasks_.empty()) {
-          if (!zero_timing) {
-            zero_since = std::chrono::steady_clock::now();
-            zero_timing = true;
-          } else if (mode_ == v8host::BrokerMode::kShared &&
-                     std::chrono::steady_clock::now() - zero_since >=
-                         std::chrono::seconds(5)) {
-            draining_ = true;
-          }
-        } else {
-          zero_timing = false;
-        }
-      }
     }
     for (HANDLE task : tasks_) {
       ::WaitForSingleObject(task, INFINITE);
       ::CloseHandle(task);
     }
-    return result;
+    tasks_.clear();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (setup_count_ || connection_count_ || !connections_.empty()) drain_failed_ = true;
+    return drain_failed_ ? sbox_error : result;
   }
 
  private:
+  void ReapConnectionTasks() {
+    for (auto it = tasks_.begin(); it != tasks_.end();) {
+      if (::WaitForSingleObject(*it, 0) == WAIT_OBJECT_0) {
+        ::CloseHandle(*it);
+        it = tasks_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  bool IdleExpired(std::chrono::steady_clock::time_point *zero_since,
+                   bool *zero_timing) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Connection refs cover sessions through cleanup; tasks cover final release.
+    if (setup_count_ || connection_count_ || !connections_.empty() || !tasks_.empty()) {
+      *zero_timing = false;
+      return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!*zero_timing) {
+      *zero_since = now;
+      *zero_timing = true;
+    }
+    return mode_ == v8host::BrokerMode::kShared && now - *zero_since >= std::chrono::seconds(5);
+  }
+
   void CancelConnections() {
     std::lock_guard<std::mutex> lock(mutex_);
     draining_ = true;
@@ -340,7 +354,7 @@ class BrokerService {
           hello_header.type == protocol::MessageType::HELLO && hello_header.conn_id == 0 &&
           hello_header.session_id == 0 && hello_header.run_id == 0 && hello_header.request_id != 0 &&
           protocol::DecodeHelloPayload(payload, payload_size, &hello_payload)) {
-        const uint32_t conn_id = next_conn_id_.fetch_add(1);
+        const uint32_t conn_id = router::AllocateId(next_conn_id_);
         if (conn_id != 0 && conn_id != UINT32_MAX) {
           protocol::BrokerCapabilities caps;
           caps.endpoint_mode = static_cast<uint32_t>(mode_);
@@ -393,7 +407,8 @@ class BrokerService {
     conn.Stop();
     conn.JoinWriter();
     service.Close(conn);
-    conn.retired_sessions.clear();
+    conn.ClearOutput();
+    if (!conn.CompleteZero()) drain_failed_ = true;
     // DisconnectNamedPipe discards unread replies; CloseHandle preserves them.
     if (!preserve_output)
       ::DisconnectNamedPipe(pipe);
@@ -423,6 +438,7 @@ class BrokerService {
   std::unordered_set<router::Connection*> connections_;
   size_t setup_count_ = 0;
   size_t connection_count_ = 0;
+  std::atomic<bool> drain_failed_{false};
   std::atomic<bool> owner_seen_{false};
   std::atomic<bool> draining_{false};
   // Process-unique, nonzero, monotonic connection id (design §8.3: never reused

@@ -73,8 +73,8 @@ static_library("protocol") {
 
 # The neutral spawn/worker-profile codec: the two bounded little-endian encodings
 # (V8HostSpawnConfigV1 = the configure_data; V8HostWorkerProfileV1 = the
-# broker->worker plugin_data) shared only between the coordinator (producer,
-# Stage 4) and the engine/configure code (consumer). It reuses the Contract B
+# broker->worker plugin_data) shared only between the coordinator (producer)
+# and the engine/configure code (consumer). It reuses the Contract B
 # Writer/Reader (:protocol) and references no client/coordinator/engine symbol,
 # so the layering stays clean. Dependency-light: only common/ is on the include
 # path (for v8host_spawn_config.h).
@@ -91,7 +91,7 @@ static_library("spawn_config") {
   public_configs = [ ":spawn_config_config" ]
 }
 
-# The neutral run-envelope codec (Stage 4): multiplexes per-run START/RELAY/CANCEL
+# The neutral run-envelope codec: multiplexes per-run START/RELAY/CANCEL
 # and RESULT/RUN_ERROR over the worker channel's opaque frames. Neutral like
 # :spawn_config (no pipe/process/policy/auth symbol), so both the engine and the
 # coordinator may link it.
@@ -108,13 +108,13 @@ static_library("run_envelope") {
   public_configs = [ ":run_envelope_config" ]
 }
 
-# The app-thread callback dispatcher (Stage 3): pure client-side threading that
+# The app-thread callback dispatcher: pure client-side threading that
 # marshals session/run/relay/disconnect callbacks onto the captured app thread
 # through a message-only window + bounded per-session queues. Deliberately
 # dependency-light — it needs only the public Contract C client header and
 # user32 (message window), NOT the sandbox core, protocol lib, or coordinator —
-# so the dispatcher can be built and unit-tested in isolation (slice (c) before
-# the client persona wires real events into it). client/ is on the include path
+# so the dispatcher can be built and unit-tested independently of the client
+# persona that wires real events into it. client/ is on the include path
 # for the dispatcher header; //../../src/public resolves the public header.
 config("dispatcher_config") {
   include_dirs = [
@@ -178,7 +178,7 @@ source_set("coordinator_persona") {
     ":protocol",
     ":run_envelope",
 
-    # The coordinator is the Stage 4 producer of V8HostSpawnConfigV1 (it encodes
+    # The coordinator is the producer of V8HostSpawnConfigV1 (it encodes
     # the session envelope + effective worker profile and hands it to configure).
     ":spawn_config",
   ]

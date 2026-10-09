@@ -6,7 +6,7 @@
 // public consumer ABI: it marshals session/run/relay/disconnect callbacks from
 // internal I/O threads onto the single app/callback thread captured by the
 // first initialize, through a message-only window and bounded per-session FIFO
-// queues. Slice (d) (the public v8host_client_* surface) drives this engine;
+// queues. The public v8host_client_* surface drives this engine;
 // the externally observable semantics are fixed by design section 9, but this
 // internal API shape is ours.
 //
@@ -215,7 +215,7 @@ class SessionDispatch {
  public:
   // Creates a session dispatch bound to `dispatcher` (which must be
   // initialized). `handle` is the opaque V8HostSession* echoed to on_session_
-  // state (a cookie to this layer; slice (d) binds it to the real handle).
+  // state (a cookie to this layer; the public client binds it to the real handle).
   // `failed_state` is the session-state code delivered with the synthetic
   // backpressure terminal (the client's "session failed/closed" state value).
   // Returns nullptr on bad arguments or allocation failure (fail closed).

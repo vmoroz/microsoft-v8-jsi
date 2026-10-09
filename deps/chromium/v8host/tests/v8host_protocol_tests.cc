@@ -439,7 +439,7 @@ std::vector<uint8_t> VectorRelayFrame() {
   return BuildRelayFrame(h, -2, body, sizeof(body));
 }
 
-// V14 (Stage 4 slice a): header-only event frames + the RESULT disposition
+// V14: header-only event frames + the RESULT disposition
 // codec. All addressed by the header; RESULT carries the 8-byte codec.
 std::vector<uint8_t> VectorSessionReadyFrame() {
   FrameHeader h;
@@ -535,7 +535,7 @@ const uint8_t kExpectWriterPayload[14] = {0xCD, 0xAB, 0x78, 0x56, 0x34, 0x12,
                                           0x04, 0x00, 0x00, 0x00, 0x41, 0xE2,
                                           0x82, 0xAC};
 
-// Slice (b) message frames. Exact bytes computed independently; any arch must
+// Handshake/control frames. Exact bytes computed independently; any arch must
 // produce precisely these for the HELLO / HELLO_ACK / ACK / ERROR layers.
 const uint8_t kExpectHelloFrame[36] = {
     0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
@@ -562,7 +562,7 @@ const uint8_t kExpectErrorFrame[49] = {
     0x05, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x71, 0x75, 0x6F, 0x74,
     0x61};
 
-// Slice (d) message frames. Exact bytes computed independently; any arch must
+// Session/run frames. Exact bytes computed independently; any arch must
 // produce precisely these for the CREATE_SESSION / START_RUN payloads.
 const uint8_t kExpectCreateSessionFrame[131] = {
     0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,

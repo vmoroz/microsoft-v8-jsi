@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Deterministic, in-process conformance tests for the Stage 4 neutral
+// Deterministic, in-process conformance tests for the neutral
 // run-envelope codec (:run_envelope): per-type round-trips, a canonical
 // exact-byte vector (pins the layout cross-arch), magic detection, and the
 // fail-closed decode rejections. Pure byte vectors — no pipes or spawned

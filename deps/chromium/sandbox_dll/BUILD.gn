@@ -47,7 +47,7 @@ executable("sbox") {
   # Resolve statically-imported DLLs only from System32 + the app dir.
   ldflags = [ "/DEPENDENTLOADFLAG:0xA00" ]
 
-  # Stage the engine payload (v8host.dll) beside sbox.exe so the worker loads it.
+  # Copy the engine payload (v8host.dll) beside sbox.exe so the worker loads it.
   data_deps = [ "//v8host" ]
 }
 
