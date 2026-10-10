@@ -5171,6 +5171,286 @@ bool SameConnectionWorkerExitBody(std::string* detail) {
   return true;
 }
 // Each child loads its own production client singleton and immutable payload set.
+// These helpers retain the negotiated addressing and distinguish EOF from timeout.
+bool ProcessToken(WireHarness& h, uint32_t session, uint32_t run, const std::string& expected) {
+  std::vector<uint8_t> bytes; protocol::FrameHeader header; int32_t kind;
+  const uint8_t* body; size_t size;
+  return h.Receive(&bytes, &header) && header.type == protocol::MessageType::RELAY_FROM_WORKER &&
+      header.conn_id == h.hello.conn_id && header.session_id == session && header.run_id == run && !header.request_id &&
+      header.version_major == h.hello.selected_major && header.version_minor == h.hello.selected_minor &&
+      protocol::DecodeRelayPayload(bytes.data() + protocol::kFrameHeaderSize,
+          bytes.size() - protocol::kFrameHeaderSize, &kind, &body, &size) && kind == sbox_msg_string &&
+      std::string(reinterpret_cast<const char*>(body), size) == expected;
+}
+bool ProcessEof(WireHarness& h) {
+  OVERLAPPED pending = {}; pending.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!pending.hEvent) return false;
+  std::vector<uint8_t> bytes(protocol::kMaxFrameSize); DWORD size = 0;
+  const BOOL started = ::ReadFile(h.connection.pipe(), bytes.data(), static_cast<DWORD>(bytes.size()), nullptr, &pending);
+  DWORD error = started ? ERROR_SUCCESS : ::GetLastError();
+  if (started || error == ERROR_IO_PENDING) {
+    if (::WaitForSingleObject(pending.hEvent, 10000) == WAIT_OBJECT_0)
+      error = ::GetOverlappedResult(h.connection.pipe(), &pending, &size, FALSE) ? ERROR_SUCCESS : ::GetLastError();
+    else {
+      ::CancelIoEx(h.connection.pipe(), &pending);
+      ::GetOverlappedResult(h.connection.pipe(), &pending, &size, TRUE);
+      error = WAIT_TIMEOUT;
+    }
+  }
+  ::CloseHandle(pending.hEvent);
+  return error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED;
+}
+protocol::CreateSessionPayload ProcessConfig() {
+  auto config = LogicalConfig(); config.broker_mode = 1;
+  config.initial_token = sbox_token_restricted_same_access; config.delayed_integrity = sbox_integrity_untrusted;
+  return config;
+}
+bool ProcessCreate(WireHarness& h, uint32_t request, uint32_t session) {
+  return h.Send(protocol::BuildCreateSessionFrame(h.Header(request, session), ProcessConfig())) &&
+      h.Expect(protocol::MessageType::ACK, request, session) && h.Expect(protocol::MessageType::SESSION_READY, 0, session);
+}
+bool ProcessStart(WireHarness& h, uint32_t request, uint32_t session, uint32_t run, bool first) {
+  return h.Send(protocol::BuildStartRunFrame(h.Header(request, session, run), Script(
+      "host.onmessage=function(m){host.postMessage(m);};host.postMessage('armed');"))) &&
+      h.Expect(protocol::MessageType::ACK, request, session, run) &&
+      (!first || (h.Expect(protocol::MessageType::STARTUP_READY, 0, session) &&
+          h.Expect(protocol::MessageType::SECURITY_READY, 0, session))) && ProcessToken(h, session, run, "armed");
+}
+bool ProcessEcho(WireHarness& h, uint32_t session, uint32_t run, const std::string& text) {
+  auto header = h.Header(0, session, run); header.type = protocol::MessageType::RELAY_TO_WORKER;
+  return h.Send(protocol::BuildRelayFrame(header, sbox_msg_string,
+      reinterpret_cast<const uint8_t*>(text.data()), text.size())) && ProcessToken(h, session, run, text);
+}
+bool FillProcessInbound(WireHarness& h, uint32_t session, uint32_t run, size_t bytes, size_t* charged) {
+  const size_t overhead = v8host::EncodeRunEnvelope(GuestRelay(0, run)).size();
+  size_t frames = 0;
+  if (overhead != 16 || bytes > protocol::kMaxQueuedRelayBytesPerRun) return false;
+  while (bytes) {
+    size_t part = (std::min)(bytes, size_t(protocol::kMaxFramePayload));
+    // Avoid an unencodable tail without exceeding the legal per-frame envelope.
+    if (bytes > part && bytes - part < overhead) part -= overhead;
+    if (part < overhead || ++frames > 256) return false;
+    std::vector<uint8_t> payload(part - overhead, 7);
+    auto header = h.Header(0, session, run); header.type = protocol::MessageType::RELAY_TO_WORKER;
+    auto frame = protocol::BuildRelayFrame(header, sbox_msg_binary, payload.data(), payload.size());
+    if (frame.size() > protocol::kMaxFrameSize || !h.Send(std::move(frame))) return false;
+    *charged += v8host::EncodeRunEnvelope(GuestRelay(payload.size(), run)).size();
+    bytes -= part;
+  }
+  return true;
+}
+bool RealInboundAggregateBody(std::string* detail) {
+  CapturedBroker broker; WireHarness healthy;
+  *detail = "aggregate healthy-connection setup";
+  if (!OpenCaptured(broker, healthy, detail) || !ProcessStart(healthy, 2, 1, 1, true) || !broker.Observe(1)) return false;
+  HANDLE survivor = broker.Worker(0); size_t count = 1;
+  const size_t cap = protocol::kMaxQueuedRelayBytesPerConnection;
+  // Separate legal histories prove cap-1, cap, and an encoded envelope exceeding cap by exactly one.
+  for (unsigned variant = 0; variant < 4; ++variant) {
+    WireHarness pressured;
+    *detail = "aggregate authenticated admission variant=" + std::to_string(variant);
+    if (!ConnectAndHandshake(BrokerMode::kShared, 900, &pressured.connection, &pressured.hello, detail) ||
+        pressured.connection.broker_pid() != ::GetProcessId(broker.process) || pressured.hello.conn_id == healthy.hello.conn_id)
+      return false;
+    uint32_t request = 1; const size_t first = count;
+    for (uint32_t session = 1; session <= 6; ++session) {
+      if (!ProcessCreate(pressured, request++, session) || !ProcessStart(pressured, request++, session, 1, true) ||
+          !broker.Observe(++count)) return false;
+      HANDLE worker = broker.Worker(count - 1);
+      if (!worker || ::WaitForSingleObject(worker, 0) != WAIT_TIMEOUT) return false;
+      std::printf("[mapped] broker=%lu conn=%u session=%u run=1 worker=%lu\n",
+          ::GetProcessId(broker.process), pressured.hello.conn_id, session, ::GetProcessId(worker));
+      for (uint32_t run = 2; run <= 4 && !(session == 6 && run == 4); ++run) {
+        const uint32_t admitted = request++;
+        if (!pressured.Send(protocol::BuildStartRunFrame(pressured.Header(admitted, session, run), Script(
+                "host.postMessage('pending-executed');host.complete();"))) ||
+            !pressured.Expect(protocol::MessageType::ACK, admitted, session, run)) return false;
+      }
+    }
+    const size_t cap_bytes = variant == 0 ? cap - 1 : variant == 1 ? cap : cap - 15;
+    size_t charged = 0;
+    for (unsigned pending = 0; pending < 17; ++pending) {
+      const uint32_t session = pending / 3 + 1, run = pending % 3 + 2;
+      const size_t bytes = pending < 15 ? protocol::kMaxQueuedRelayBytesPerRun :
+          pending == 15 ? protocol::kMaxQueuedRelayBytesPerRun - 100 : cap_bytes - (cap - 100);
+      if (!FillProcessInbound(pressured, session, run, bytes, &charged)) return false;
+    }
+    *detail = "aggregate boundary/control fence variant=" + std::to_string(variant);
+    if (charged != cap_bytes || !pressured.Send(protocol::BuildCancelRunFrame(pressured.Header(request, 1, 99))) ||
+        !pressured.Expect(protocol::MessageType::ACK, request++, 1, 99)) return false;
+    std::printf("[pressure] conn=%u bytes=%zu cap=%zu pending=17 legal-workers=6 variant=%u\n",
+        pressured.hello.conn_id, charged, cap, variant);
+    if (variant >= 2) {
+      auto header = pressured.Header(0, 6, 3); header.type = protocol::MessageType::RELAY_TO_WORKER;
+      const size_t rejected = v8host::EncodeRunEnvelope(GuestRelay(0, 3)).size();
+      if (charged + rejected != cap + 1 ||
+          !pressured.Send(protocol::BuildRelayFrame(header, sbox_msg_binary, nullptr, 0))) return false;
+      if (variant == 2) {
+        std::vector<uint8_t> bytes; protocol::FrameHeader error_header; protocol::ErrorPayload error;
+        if (!pressured.Receive(&bytes, &error_header) || error_header.type != protocol::MessageType::ERROR ||
+            error_header.conn_id != pressured.hello.conn_id || error_header.session_id != 6 || error_header.run_id != 3 ||
+            error_header.request_id != 0 || error_header.version_major != pressured.hello.selected_major ||
+            error_header.version_minor != pressured.hello.selected_minor ||
+            !protocol::DecodeErrorPayload(bytes.data() + protocol::kFrameHeaderSize,
+                bytes.size() - protocol::kFrameHeaderSize, &error) || error.status_code != protocol::StatusCode::ERROR_QUOTA ||
+            !ProcessEof(pressured)) { *detail = "addressed ERROR_QUOTA before real EOF"; return false; }
+        std::printf("[quota] conn=%u session=6 run=3 request=0 ERROR_QUOTA before EOF; rejected=%zu\n",
+            pressured.hello.conn_id, rejected);
+      }
+      // The EOF variant does not promise a scheduler-specific writer-drain instant.
+    }
+    pressured.connection.Close();
+    for (size_t index = first; index < count; ++index) {
+      if (::WaitForSingleObject(broker.Worker(index), 10000) != WAIT_OBJECT_0) return false;
+      std::printf("[reaped] pressure worker=%lu\n", ::GetProcessId(broker.Worker(index)));
+    }
+    *detail = "aggregate unaffected original PID/fresh admission";
+    if (::WaitForSingleObject(survivor, 0) != WAIT_TIMEOUT || ::WaitForSingleObject(broker.process, 0) != WAIT_TIMEOUT ||
+        !ProcessEcho(healthy, 1, 1, "survivor-" + std::to_string(variant)) ||
+        !ProcessCreate(healthy, 3 + variant * 2, 2 + variant) ||
+        !ProcessStart(healthy, 4 + variant * 2, 2 + variant, 1, true) || !broker.Observe(++count)) return false;
+  }
+  healthy.connection.Close();
+  if (!broker.Reaped(count)) return false;
+  *detail = "real inbound cap-1/cap/cap+1; addressed quota-before-EOF; six held workers/17 pending; sibling/fresh admission/reap";
+  return true;
+}
+
+bool RealNoncooperativeFallbackBody(std::string* detail) {
+  CapturedBroker broker; ProcessSessionRecord blocked, sibling;
+  *detail = "noncooperative real-client marker/admission";
+  if (!broker.Launch(detail) || !blocked.Create()) return false;
+  const std::string guest = "host.postMessage('entered');for(;;){}";
+  V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = -1;
+  input.payload = guest.data(); input.payload_len = guest.size();
+  blocked.runs.emplace_back(); blocked.runs[0].token = "entered";
+  if (blocked.client.start(blocked.handle, &input, &blocked.runs[0].handle) != V8HOST_OK ||
+      !PumpPublic([&] { return !blocked.runs[0].messages.empty() || blocked.runs[0].terminals || blocked.disconnects; }) ||
+      !blocked.valid || blocked.disconnects || blocked.runs[0].terminals ||
+      blocked.runs[0].events != std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED} ||
+      blocked.runs[0].messages != std::vector<std::vector<uint8_t>>{ProcessSessionRecord::Text("entered")} ||
+      blocked.runs[0].kinds != std::vector<int32_t>{sbox_msg_string} || !broker.Observe(1)) return false;
+  HANDLE worker = broker.Worker(0);
+  if (!worker || ::WaitForSingleObject(worker, 0) != WAIT_TIMEOUT || !blocked.Start("pending-never-execute") ||
+      !PumpPublic([&] { return !blocked.runs[1].events.empty(); }) || !sibling.Create() ||
+      !sibling.Start("survivor") || !MapPublicWorker(broker, sibling, 1)) return false;
+  HANDLE healthy = broker.Worker(1);
+  const ULONGLONG cancelled = ::GetTickCount64();
+  if (blocked.client.cancel(blocked.runs[0].handle) != V8HOST_OK ||
+      !blocked.Terminal(0, V8HOST_RUN_EVENT_WORKER_EXITED, V8HOST_E_RUN_TERMINAL) ||
+      !blocked.Terminal(1, V8HOST_RUN_EVENT_WORKER_EXITED, V8HOST_E_RUN_TERMINAL) ||
+      !blocked.runs[1].messages.empty() || blocked.disconnects ||
+      ::WaitForSingleObject(worker, 0) != WAIT_TIMEOUT) { *detail = "fallback must retire once before kernel death"; return false; }
+  const ULONGLONG retired = ::GetTickCount64();
+  if (retired - cancelled < 4500 || !sibling.Echo(0, "during-reap", 0x31)) return false;
+  std::printf("[fallback] broker=%lu worker=%lu entered-before-cancel=1 retired_ms=%llu WORKER_EXITED active+pending once\n",
+      ::GetProcessId(broker.process), ::GetProcessId(worker), retired - cancelled);
+  *detail = "noncooperative core timeout/reap (scoped 60-second budget, no harness kill)";
+  const ULONGLONG deadline = retired + 60000; ULONGLONG next_echo = retired + 10000;
+  while (::WaitForSingleObject(worker, 100) == WAIT_TIMEOUT && ::GetTickCount64() < deadline) {
+    DrainPublic();
+    if (!blocked.valid || blocked.runs[0].terminals != 1 || blocked.runs[1].terminals != 1 ||
+        !blocked.runs[1].messages.empty() || blocked.disconnects || ::WaitForSingleObject(healthy, 0) != WAIT_TIMEOUT ||
+        ::WaitForSingleObject(broker.process, 0) != WAIT_TIMEOUT) return false;
+    if (::GetTickCount64() >= next_echo) {
+      if (!sibling.Echo(0, "reap-progress", 0x32)) return false;
+      next_echo += 10000;
+    }
+  }
+  DWORD code = 0;
+  if (::WaitForSingleObject(worker, 0) != WAIT_OBJECT_0 || !::GetExitCodeProcess(worker, &code) || code != 0xDEAD) return false;
+  std::printf("[reaped] noncooperative worker=%lu exit=%lu cancel_to_exit_ms=%llu harness_kill=0 budget_ms=60000\n",
+      ::GetProcessId(worker), code, ::GetTickCount64() - cancelled);
+  for (auto& run : blocked.runs)
+    if (blocked.client.post(run.handle, sbox_msg_string, "late", 4) != V8HOST_E_RUN_TERMINAL ||
+        blocked.client.cancel(run.handle) != V8HOST_E_RUN_TERMINAL) return false;
+  blocked.Close(); const size_t frozen = blocked.CallbackCount();
+  V8HostRun* forbidden = nullptr;
+  if (blocked.client.start(blocked.handle, &input, &forbidden) == V8HOST_OK || forbidden ||
+      !sibling.Echo(0, "after-reap", 0x33) || !sibling.Finish(0) || !sibling.Start("fresh-js") ||
+      !sibling.Armed(1) || !sibling.Echo(1, "original-pid", 0x34) || !sibling.Finish(1) ||
+      !broker.Observe(2) || ::WaitForSingleObject(healthy, 0) != WAIT_TIMEOUT) return false;
+  sibling.Close();
+  if (!broker.Reaped(2)) return false;
+  DrainPublic();
+  { std::lock_guard<std::mutex> lock(broker.mutex);
+    if (broker.diagnostics.find("[broker] target timed out; terminating") == std::string::npos) return false;
+  }
+  *detail = "entered marker; once-only WORKER_EXITED at fallback; core timeout/0xDEAD reap; sibling/fresh JS original PID";
+  return blocked.valid && sibling.valid && blocked.CallbackCount() == frozen && !sibling.disconnects;
+}
+bool RealIdleLifecycleBody(std::string* detail) {
+  CapturedBroker broker; WireHarness owner, reuse;
+  *detail = "live owner/armed worker prevents shared idle exit";
+  if (!OpenCaptured(broker, owner, detail) || !ProcessStart(owner, 2, 1, 1, true) || !broker.Observe(1)) return false;
+  HANDLE worker = broker.Worker(0);
+  if (::WaitForSingleObject(broker.process, 5500) != WAIT_TIMEOUT || ::WaitForSingleObject(worker, 0) != WAIT_TIMEOUT ||
+      !ProcessEcho(owner, 1, 1, "owner-alive") ||
+      !ConnectAndHandshake(BrokerMode::kShared, 900, &reuse.connection, &reuse.hello, detail) ||
+      reuse.connection.broker_pid() != ::GetProcessId(broker.process) || reuse.hello.conn_id == owner.hello.conn_id) return false;
+  owner.connection.Close();
+  *detail = "worker reaped while other authenticated owner preserves broker";
+  if (::WaitForSingleObject(worker, 10000) != WAIT_OBJECT_0 ||
+      ::WaitForSingleObject(broker.process, 5500) != WAIT_TIMEOUT || !ProcessCreate(reuse, 1, 1)) return false;
+  reuse.connection.Close();
+  // Broad grace cancellation, not an attempt to hit the exact cutoff instant.
+  if (::WaitForSingleObject(broker.process, 1500) != WAIT_TIMEOUT) return false;
+  WireHarness renewed;
+  if (!ConnectAndHandshake(BrokerMode::kShared, 900, &renewed.connection, &renewed.hello, detail) ||
+      renewed.connection.broker_pid() != ::GetProcessId(broker.process) || !ProcessCreate(renewed, 1, 1) ||
+      ::WaitForSingleObject(broker.process, 5500) != WAIT_TIMEOUT ||
+      !renewed.Send(protocol::BuildCloseSessionFrame(renewed.Header(2))) ||
+      !renewed.Expect(protocol::MessageType::ACK, 2, 1)) return false;
+  const ULONGLONG closed = ::GetTickCount64(); renewed.connection.Close();
+  *detail = "complete-zero shared idle exit and exact-set replacement";
+  if (!broker.Reaped(1) || ::GetTickCount64() - closed < 4900) return false;
+  CapturedBroker replacement; WireHarness fresh;
+  if (!OpenCaptured(replacement, fresh, detail) || ::GetProcessId(replacement.process) == ::GetProcessId(broker.process) ||
+      !ProcessStart(fresh, 2, 1, 1, true) || !replacement.Observe(1) || !ProcessEcho(fresh, 1, 1, "replacement-js")) return false;
+  fresh.connection.Close();
+  if (!replacement.Reaped(1) || !DedicatedOwnerExit(detail)) return false;
+  *detail = "shared reuse/live worker/live owner/grace cancellation/complete-zero exit/replacement; dedicated owner-loss drain";
+  return true;
+}
+bool IdleAcceptBoundary(std::string* detail) {
+  for (bool completed : {false, true}) {
+    const std::wstring name = L"\\\\.\\pipe\\v8host-idle-accept-" + std::to_wstring(::GetCurrentProcessId());
+    HANDLE pipe = ::CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 4096, 4096, 0, nullptr);
+    OVERLAPPED pending = {}; pending.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE client = INVALID_HANDLE_VALUE;
+    bool active = pipe != INVALID_HANDLE_VALUE && pending.hEvent &&
+        !::ConnectNamedPipe(pipe, &pending) && ::GetLastError() == ERROR_IO_PENDING;
+    bool ok = active && V8HostBrokerPollConnect(pipe, &pending, 0) == V8HostBrokerAcceptStatus::kPending;
+    if (ok && completed) {
+      client = ::CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+      ok = client != INVALID_HANDLE_VALUE && ::WaitForSingleObject(pending.hEvent, 3000) == WAIT_OBJECT_0 &&
+          V8HostBrokerPollConnect(pipe, &pending, 0) == V8HostBrokerAcceptStatus::kConnected;
+    }
+    if (ok) {
+      const bool admitted = V8HostBrokerFinishPendingConnect(pipe, &pending); active = false;
+      DWORD transferred = 0;
+      const bool succeeded = ::GetOverlappedResult(pipe, &pending, &transferred, FALSE) != FALSE;
+      const DWORD error = succeeded ? ERROR_SUCCESS : ::GetLastError();
+      ok = admitted == completed && ::WaitForSingleObject(pending.hEvent, 0) == WAIT_OBJECT_0 &&
+          (completed ? succeeded : !succeeded && error == ERROR_OPERATION_ABORTED);
+      if (ok && admitted) {
+        std::vector<uint8_t> sent = protocol::BuildHelloFrame(protocol::FrameHeader{}), received(512);
+        ok = PipeIo(client, true, &sent) && PipeIo(pipe, false, &received) && received == sent;
+      }
+      std::printf("[accept] completed=%d admitted=%d event_signaled=%d error=%lu real-pipe=1\n",
+          completed, admitted, ::WaitForSingleObject(pending.hEvent, 0) == WAIT_OBJECT_0, error);
+    }
+    if (active) { ::CancelIoEx(pipe, &pending); DWORD bytes; ::GetOverlappedResult(pipe, &pending, &bytes, TRUE); }
+    if (client != INVALID_HANDLE_VALUE) ::CloseHandle(client);
+    if (pending.hEvent) ::CloseHandle(pending.hEvent);
+    if (pipe != INVALID_HANDLE_VALUE) ::CloseHandle(pipe);
+    if (!ok) { *detail = completed ? "completed accept must win with exact HELLO" : "cancelled pending accept must drain, not admit"; return false; }
+  }
+  *detail = "pending polls retained; completed accept wins; cancelled accept drained with ERROR_OPERATION_ABORTED";
+  return true;
+}
+
 bool IsolatedPublicCase(const char* name, std::string* detail) {
   namespace fs = std::filesystem;
   static std::atomic<unsigned> sequence{0};
@@ -5281,6 +5561,9 @@ bool IsolatedPublicCase(const char* name, std::string* detail) {
       " job_empty=" + std::to_string(empty) + " overflow=" + std::to_string(overflow);
   return passed;
 }
+bool RealNoncooperativeFallback(std::string* detail) { return IsolatedPublicCase("real-noncooperative-fallback", detail); }
+bool RealIdleLifecycle(std::string* detail) { return IsolatedPublicCase("real-idle-lifecycle", detail); }
+bool RealInboundAggregate(std::string* detail) { return IsolatedPublicCase("real-inbound-aggregate", detail); }
 bool PublicRealJs(std::string* detail) { return IsolatedPublicCase("real-js", detail); }
 bool PublicRealDedicatedJs(std::string* detail) { return IsolatedPublicCase("real-dedicated-js", detail); }
 bool PublicRealCancelAndProfile(std::string* detail) { return IsolatedPublicCase("real-cancel-and-profile", detail); }
@@ -5316,7 +5599,10 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     if (std::strncmp(argv[i], "--public-child=", 15) != 0) continue;
     std::string name = argv[i] + 15, detail;
-    bool ok = name == "real-js" ? PublicRealJsMode(V8HOST_BROKER_SHARED, &detail) :
+    bool ok = name == "real-noncooperative-fallback" ? RealNoncooperativeFallbackBody(&detail) :
+        name == "real-idle-lifecycle" ? RealIdleLifecycleBody(&detail) :
+        name == "real-inbound-aggregate" ? RealInboundAggregateBody(&detail) :
+        name == "real-js" ? PublicRealJsMode(V8HOST_BROKER_SHARED, &detail) :
         name == "real-dedicated-js" ? PublicRealJsMode(V8HOST_BROKER_DEDICATED, &detail) :
         name == "real-cancel-and-profile" ? PublicRealCancelAndProfileBody(&detail) :
         name == "n-session-n-pid" ? PublicNSessionBody(&detail) :
@@ -5328,6 +5614,10 @@ int main(int argc, char** argv) {
     return ok ? 0 : 1;
   }
   const std::vector<v8host::test::TestCase> tests = {
+      {"cancel", "real-noncooperative-fallback", RealNoncooperativeFallback},
+      {"rendezvous", "real-idle-lifecycle", RealIdleLifecycle},
+      {"rendezvous", "idle-accept-boundary", IdleAcceptBoundary},
+      {"quota", "real-inbound-aggregate", RealInboundAggregate},
       {"crash", "broker-kill-no-replay", PublicBrokerKill},
       {"broker-crash", "broker-kill-no-replay", PublicBrokerKill},
       {"run", "public-js", PublicRealJs},
