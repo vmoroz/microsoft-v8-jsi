@@ -84,7 +84,7 @@ struct Pump {
         status = rendezvous.ConnectOrLaunch(&connection, stop, &deadline);
 #ifdef V8HOST_CLIENT_TESTING
         if (params.test_launch)
-          params.test_launch(params.test_context, LaunchHookPoint::kReturned, nullptr, deadline);
+          params.test_launch(params.test_context, LaunchHookPoint::kReturned, nullptr, deadline, rendezvous.endpoint().c_str());
 #endif
         if (status == RendezvousStatus::kOk)
           status = connection.Handshake(1, &hello, stop, deadline);

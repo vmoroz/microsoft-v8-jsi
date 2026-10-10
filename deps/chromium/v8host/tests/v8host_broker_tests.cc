@@ -3634,6 +3634,23 @@ bool PendingAcceptCancellation(std::string *detail) {
   }
   return true;
 }
+bool DedicatedPreConnectExpiryPolicy(std::string* detail) {
+  const std::chrono::steady_clock::time_point start{};
+  for (int ms : {0, 4999, 5000, 5001}) {
+    const auto now = start + std::chrono::milliseconds(ms);
+    if (V8HostBrokerPreConnectExpired(true, false, start, now) != (ms >= 5000) ||
+        V8HostBrokerPreConnectExpired(false, false, start, now) ||
+        V8HostBrokerPreConnectExpired(true, true, start, now) ||
+        V8HostBrokerPreConnectExpired(false, true, start, now)) {
+      *detail = "dedicated pre-connect expiry boundary or mode/accept guard";
+      return false;
+    }
+  }
+  // Pair an expired policy with both completed and uncompleted local accepts.
+  return V8HostBrokerPreConnectExpired(true, false, start,
+      start + std::chrono::milliseconds(5000)) && PendingAcceptCancellation(detail);
+}
+
 bool PendingAcceptPoll(std::string *detail) {
   const std::wstring name = L"\\\\.\\pipe\\v8host-accept-poll-" + std::to_wstring(::GetCurrentProcessId());
   HANDLE pipe = ::CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
@@ -3953,7 +3970,14 @@ bool DedicatedOwnerExit(std::string* detail) {
                            detail))
     return false;
   const DWORD broker_pid = connection.broker_pid();
+  HANDLE broker = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, broker_pid);
+  const bool alive = broker && ::WaitForSingleObject(broker, 5500) == WAIT_TIMEOUT;
+  if (broker) ::CloseHandle(broker);
   connection.Close();
+  if (!alive) {
+    *detail = "connected dedicated broker expired before owner Close";
+    return false;
+  }
   if (!v8host::test::WaitForProcessExit(broker_pid, 3000)) {
     *detail = "dedicated broker did not join and exit";
     return false;
@@ -5719,6 +5743,7 @@ int main(int argc, char** argv) {
       {"session", "create-ready", CreateReady},
       {"session", "config-fidelity-0", ConfigFidelity0},
       {"session", "config-fidelity-64", ConfigFidelity64},
+      {"rendezvous", "dedicated-preconnect-expiry-policy", DedicatedPreConnectExpiryPolicy},
       {"rendezvous", "pending-accept-cancellation", PendingAcceptCancellation},
       {"rendezvous", "pending-accept-poll", PendingAcceptPoll},
       {"rendezvous", "shared-fan-in", SharedFanIn},

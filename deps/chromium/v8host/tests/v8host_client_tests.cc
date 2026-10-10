@@ -11,6 +11,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <cstdlib>
+#include <cerrno>
 #include <cstdio>
 #include <functional>
 #include <mutex>
@@ -1427,7 +1429,7 @@ struct LaunchFixture {
   std::unique_ptr<ClientTransport> transport;
   std::atomic<HANDLE> candidate{nullptr};
   std::atomic<DWORD> hook_error{ERROR_SUCCESS};
-  std::atomic<int> before_count{0}, created_count{0}, returned_count{0};
+  std::atomic<int> before_count{0}, launching_count{0}, created_count{0}, returned_count{0};
   std::atomic<ULONGLONG> d0{0}, before_enter{0}, before_exit{0};
   std::atomic<ULONGLONG> launch_enter{0}, launch_exit{0}, shifted{0}, observed_at{0};
 
@@ -1438,7 +1440,7 @@ struct LaunchFixture {
       now = ::GetTickCount64();
   }
   static void Hook(void* context, v8host::LaunchHookPoint point, HANDLE process,
-                   ULONGLONG deadline) {
+                   ULONGLONG deadline, const wchar_t*) {
     auto& f = *static_cast<LaunchFixture*>(context);
     const ULONGLONG now = ::GetTickCount64();
     if (point == v8host::LaunchHookPoint::kBeforeCreate) {
@@ -1446,6 +1448,13 @@ struct LaunchFixture {
       f.d0 = deadline; f.before_enter = now;
       if (f.hold == LaunchHold::kExhausted) f.HoldUntil(now + 5000);
       f.before_exit = ::GetTickCount64();
+    } else if (point == v8host::LaunchHookPoint::kLaunching) {
+      ++f.launching_count;
+      f.launch_enter = now;
+      if (f.hold == LaunchHold::kSlow)
+        f.HoldUntil((std::min)(deadline + 500, now + 15000));
+      else if (f.hold == LaunchHold::kExhausted)
+        f.HoldUntil(now + 10000);
     } else if (point == v8host::LaunchHookPoint::kCreated) {
       if (++f.created_count == 1) {
         HANDLE duplicate = nullptr;
@@ -1456,13 +1465,8 @@ struct LaunchFixture {
           f.hook_error = ::GetLastError();
         f.candidate = duplicate;
       }
-      f.launch_enter = now;
       ::SetEvent(f.in_launch);
-      if (f.hold == LaunchHold::kSlow)
-        f.HoldUntil((std::min)(deadline + 500, now + 15000));
-      else if (f.hold == LaunchHold::kExhausted)
-        f.HoldUntil(now + 10000);
-      else if (f.hold == LaunchHold::kClose)
+      if (f.hold == LaunchHold::kClose)
         f.HoldUntil(now + 15000);
       f.launch_exit = ::GetTickCount64();
     } else {
@@ -1506,8 +1510,10 @@ struct LaunchFixture {
         ? true : Fail(detail, "launch candidate handle duplication");
   }
   bool Hooks(std::string* detail) {
-    if (before_count != 1 || created_count != 1 || returned_count != 1)
+    if (before_count != 1 || launching_count != 1 || created_count != 1 || returned_count != 1)
       return Fail(detail, "launch hook counts must each be one");
+    if (launch_enter < before_exit || launch_exit < launch_enter)
+      return Fail(detail, "launch hook timestamp ordering");
     const ULONGLONG lower = d0 + (launch_exit - launch_enter);
     const ULONGLONG upper = d0 + (observed_at - before_exit);
     if (shifted < lower || shifted > upper)
@@ -1570,7 +1576,8 @@ struct LaunchFixture {
           " exit=" + std::to_string(code) + " shift=" + std::to_string(shifted - d0) +
           " bracket=[" + std::to_string(d0 + launch_exit - launch_enter) + "," +
           std::to_string(d0 + observed_at - before_exit) + "] D=" + std::to_string(shifted) +
-          " hooks=" + std::to_string(before_count) + "/" + std::to_string(created_count) +
+          " hooks=" + std::to_string(before_count) + "/" + std::to_string(launching_count) +
+          "/" + std::to_string(created_count) +
           "/" + std::to_string(returned_count);
     }
     delete this;
@@ -1620,6 +1627,292 @@ bool LaunchCase(std::string* detail, int mode, LaunchHold hold) {
     return true;
   }();
   return f->Finish(passed, detail);
+}
+
+struct ExpiryHandle {
+  HANDLE value = nullptr;
+  ~ExpiryHandle() { if (value) ::CloseHandle(value); }
+  ExpiryHandle() = default;
+  ExpiryHandle(const ExpiryHandle&) = delete;
+  ExpiryHandle& operator=(const ExpiryHandle&) = delete;
+};
+
+bool ExpiryListenerReady(HANDLE broker, const std::wstring& endpoint,
+                         ULONGLONG* ready_at, HANDLE helper = nullptr) {
+  const ULONGLONG limit = ::GetTickCount64() + 3000;
+  do {
+    if (::WaitForSingleObject(broker, 0) != WAIT_TIMEOUT ||
+        (helper && ::WaitForSingleObject(helper, 0) != WAIT_TIMEOUT))
+      return false;
+    // Readiness only: opening the pipe would consume the first accept.
+    if (::WaitNamedPipeW(endpoint.c_str(), NMPWAIT_NOWAIT)) {
+      *ready_at = ::GetTickCount64();
+      return ::WaitForSingleObject(broker, 0) == WAIT_TIMEOUT;
+    }
+    ::WaitForSingleObject(broker, 10);
+  } while (::GetTickCount64() < limit);
+  return false;
+}
+
+bool ExpiryAliveUntil(HANDLE process, ULONGLONG limit) {
+  const ULONGLONG now = ::GetTickCount64();
+  return ::WaitForSingleObject(process, now < limit ? static_cast<DWORD>(limit - now) : 0) ==
+      WAIT_TIMEOUT;
+}
+
+bool ExpiryExitZero(HANDLE process, ULONGLONG limit) {
+  const ULONGLONG now = ::GetTickCount64();
+  DWORD code = STILL_ACTIVE;
+  return ::WaitForSingleObject(process, now < limit ? static_cast<DWORD>(limit - now) : 0) ==
+             WAIT_OBJECT_0 &&
+      ::GetExitCodeProcess(process, &code) && code == 0;
+}
+
+void ExpiryFailureReap(HANDLE observe, HANDLE cleanup) {
+  if (observe && ::WaitForSingleObject(observe, 5000) != WAIT_OBJECT_0) {
+    if (!cleanup || !::TerminateProcess(cleanup, 0xFA11) ||
+        ::WaitForSingleObject(observe, 5000) != WAIT_OBJECT_0)
+      g_launch_abort = true;
+  }
+}
+
+struct PreConnectFixture {
+  TransportProbe probe;
+  ExpiryHandle broker, cleanup;
+  ExpiryHandle ready, release;
+  std::wstring endpoint;
+  std::atomic<DWORD> error{ERROR_SUCCESS};
+  std::atomic<int> creates{0};
+  std::shared_ptr<ProbeDelegate> delegate = std::make_shared<ProbeDelegate>(&probe);
+  std::unique_ptr<ClientTransport> transport;
+  static void Hook(void* context, v8host::LaunchHookPoint point, HANDLE process,
+                   ULONGLONG, const wchar_t* endpoint) {
+    if (point != v8host::LaunchHookPoint::kCreated) return;
+    auto& f = *static_cast<PreConnectFixture*>(context);
+    ++f.creates;
+    f.endpoint = endpoint;
+    if (!::DuplicateHandle(::GetCurrentProcess(), process, ::GetCurrentProcess(),
+            &f.broker.value, SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0) ||
+        !::DuplicateHandle(::GetCurrentProcess(), process, ::GetCurrentProcess(),
+            &f.cleanup.value, PROCESS_TERMINATE, FALSE, 0))
+      f.error = ::GetLastError();
+    ::SetEvent(f.ready.value);
+    if (::WaitForSingleObject(f.release.value, 15000) != WAIT_OBJECT_0)
+      f.error = ERROR_TIMEOUT;
+  }
+  bool Start(std::string* detail) {
+    ready.value = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    release.value = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ready.value || !release.value) return Fail(detail, "expiry fixture events");
+    TransportParams params;
+    params.payload_directory = v8host::test::ExecutableDirectory();
+    params.broker_mode = V8HOST_BROKER_DEDICATED;
+    params.test_context = this; params.test_launch = Hook;
+    transport.reset(v8host::client::CreateRealPipeClientTransport(params, delegate.get()));
+    if (!transport || transport->Start(delegate) != V8HOST_OK ||
+        ::WaitForSingleObject(ready.value, 30000) != WAIT_OBJECT_0 ||
+        error != ERROR_SUCCESS || !broker.value || !cleanup.value)
+      return Fail(detail, "expiry launch/report failed");
+    return true;
+  }
+  bool Finish(bool passed, std::string* detail) {
+    if (release.value) ::SetEvent(release.value);
+    if (transport) transport->Close();
+    transport.reset(); delegate.reset();
+    if (::WaitForSingleObject(probe.destroyed, 15000) != WAIT_OBJECT_0) {
+      ExpiryFailureReap(broker.value, cleanup.value);
+      g_launch_abort = true;
+      *detail += " expiry teardown timeout; fixture retained";
+      return false;
+    }
+    if (passed && (error != ERROR_SUCCESS || creates != 1 || probe.connects != 0))
+      passed = Fail(detail, "expiry hook/callback count");
+    ExpiryFailureReap(broker.value, cleanup.value);
+    delete this;
+    return passed;
+  }
+};
+
+bool DedicatedNoClientExpires(std::string* detail) {
+  auto* f = new PreConnectFixture;
+  const bool passed = [&] {
+    if (!f->Start(detail)) return false;
+    ULONGLONG ready_at = 0;
+    if (!ExpiryListenerReady(f->broker.value, f->endpoint, &ready_at))
+      return Fail(detail, "dedicated listener not ready/alive");
+    if (!ExpiryAliveUntil(f->broker.value, ready_at + 4000))
+      return Fail(detail, "unconnected dedicated broker expired before readiness + 4000 ms");
+    if (!ExpiryExitZero(f->broker.value, ready_at + 8000))
+      return Fail(detail, "unconnected dedicated broker did not naturally exit0 within 8000 ms");
+    *detail = "pid=" + std::to_string(::GetProcessId(f->broker.value)) +
+        " exit=0 connects=" + std::to_string(f->probe.connects.load()) +
+        " ready-to-exit=" + std::to_string(::GetTickCount64() - ready_at);
+    return f->probe.connects == 0;
+  }();
+  return f->Finish(passed, detail);
+}
+
+constexpr uint32_t kOrphanReportMagic = 0x50584f52;
+struct OrphanReport {
+  uint32_t magic = kOrphanReportMagic;
+  uint32_t size = sizeof(OrphanReport);
+  uint32_t pid = 0, connects = 0, error = ERROR_SUCCESS;
+  uint64_t broker = 0, cleanup = 0;
+  wchar_t endpoint[512] = {};
+};
+
+struct OrphanHelper {
+  HANDLE report, release, parent;
+  static void Hook(void* context, v8host::LaunchHookPoint point, HANDLE process,
+                   ULONGLONG, const wchar_t* endpoint) {
+    if (point != v8host::LaunchHookPoint::kCreated) return;
+    auto& f = *static_cast<OrphanHelper*>(context);
+    OrphanReport report;
+    HANDLE broker = nullptr, cleanup = nullptr;
+    report.pid = ::GetProcessId(process);
+    if (!::DuplicateHandle(::GetCurrentProcess(), process, f.parent, &broker,
+            SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0) ||
+        !::DuplicateHandle(::GetCurrentProcess(), process, f.parent, &cleanup,
+            PROCESS_TERMINATE, FALSE, 0))
+      report.error = ::GetLastError();
+    report.broker = reinterpret_cast<uintptr_t>(broker);
+    report.cleanup = reinterpret_cast<uintptr_t>(cleanup);
+    if (wcslen(endpoint) >= std::size(report.endpoint))
+      report.error = ERROR_BUFFER_OVERFLOW;
+    else
+      wcscpy_s(report.endpoint, endpoint);
+    DWORD written = 0;
+    const bool sent = ::WriteFile(f.report, &report, sizeof(report), &written, nullptr) &&
+        written == sizeof(report);
+    if (sent) ::WaitForSingleObject(f.release, 15000);
+    // Exit without unwinding the unconnected candidate guard or calling Close.
+    ::ExitProcess(sent && report.error == ERROR_SUCCESS ? 0 : 2);
+  }
+};
+
+HANDLE OrphanArgument(const char* text) {
+  if (!text || *text < '0' || *text > '9') return nullptr;
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long long value = std::strtoull(text, &end, 10);
+  DWORD flags = 0;
+  HANDLE handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(value));
+  return !errno && end && !*end && value && value <= UINTPTR_MAX &&
+      ::GetHandleInformation(handle, &flags) ? handle : nullptr;
+}
+
+int RunOrphanHelper(int argc, char** argv) {
+  if (argc != 5) return 2;
+  OrphanHelper helper{OrphanArgument(argv[2]), OrphanArgument(argv[3]), OrphanArgument(argv[4])};
+  if (!helper.report || !helper.release || !helper.parent ||
+      ::GetFileType(helper.report) != FILE_TYPE_PIPE) return 2;
+  v8host::BrokerRendezvous rendezvous(v8host::test::ExecutableDirectory(),
+                                    v8host::BrokerMode::kDedicated);
+  rendezvous.SetLaunchHookForTesting(OrphanHelper::Hook, &helper);
+  v8host::BrokerConnection connection;
+  rendezvous.ConnectOrLaunch(&connection);
+  return 2;  // A successful helper exits directly from the pre-connect hook.
+}
+
+struct OrphanFixture {
+  ExpiryHandle reader, writer, release, parent, helper, broker, cleanup;
+  OrphanReport report;
+  bool Start(std::string* detail) {
+    SECURITY_ATTRIBUTES inherited = {sizeof(inherited), nullptr, TRUE};
+    if (!::CreatePipe(&reader.value, &writer.value, &inherited, 4096) ||
+        !::SetHandleInformation(reader.value, HANDLE_FLAG_INHERIT, 0))
+      return Fail(detail, "orphan report pipe creation");
+    release.value = ::CreateEventW(&inherited, TRUE, FALSE, nullptr);
+    parent.value = ::OpenProcess(PROCESS_DUP_HANDLE, TRUE, ::GetCurrentProcessId());
+    if (!release.value || !parent.value)
+      return Fail(detail, "orphan inherited capabilities");
+    SIZE_T bytes = 0;
+    ::InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
+    std::vector<uint8_t> storage(bytes);
+    auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
+    if (!::InitializeProcThreadAttributeList(attributes, 1, 0, &bytes))
+      return Fail(detail, "orphan handle-list initialization");
+    HANDLE handles[] = {writer.value, release.value, parent.value};
+    bool ok = ::UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        handles, sizeof(handles), nullptr, nullptr) != FALSE;
+    std::vector<wchar_t> executable(32768);
+    const DWORD length = ::GetModuleFileNameW(nullptr, executable.data(),
+                                             static_cast<DWORD>(executable.size()));
+    ok = ok && length && length < executable.size();
+    std::wstring command = L"\"" + std::wstring(executable.data()) + L"\" --px-orphan-helper";
+    for (HANDLE handle : handles)
+      command += L" " + std::to_wstring(reinterpret_cast<uintptr_t>(handle));
+    STARTUPINFOEXW startup = {};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.lpAttributeList = attributes;
+    PROCESS_INFORMATION process = {};
+    const std::wstring directory = v8host::test::ExecutableDirectory();
+    if (ok) ok = ::CreateProcessW(executable.data(), command.data(), nullptr, nullptr,
+        TRUE, EXTENDED_STARTUPINFO_PRESENT, nullptr, directory.c_str(),
+        &startup.StartupInfo, &process) != FALSE;
+    ::DeleteProcThreadAttributeList(attributes);
+    if (!ok) return Fail(detail, "normal orphan helper launch");
+    helper.value = process.hProcess;
+    ::CloseHandle(process.hThread);
+    ::CloseHandle(writer.value); writer.value = nullptr;
+    const ULONGLONG limit = ::GetTickCount64() + 30000;
+    DWORD available = 0;
+    while (::PeekNamedPipe(reader.value, nullptr, 0, nullptr, &available, nullptr) &&
+           available < sizeof(report) && ::GetTickCount64() < limit &&
+           ::WaitForSingleObject(helper.value, 10) == WAIT_TIMEOUT) {}
+    DWORD read = 0;
+    if (available != sizeof(report) ||
+        !::ReadFile(reader.value, &report, sizeof(report), &read, nullptr) || read != sizeof(report))
+      return Fail(detail, "orphan helper bounded report framing");
+    if (report.magic != kOrphanReportMagic || report.size != sizeof(report) ||
+        report.broker > UINTPTR_MAX || report.cleanup > UINTPTR_MAX)
+      return Fail(detail, "orphan helper report header");
+    broker.value = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(report.broker));
+    cleanup.value = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(report.cleanup));
+    DWORD flags = 0;
+    if (report.error || report.connects || !report.pid || !broker.value || !cleanup.value ||
+        !::GetHandleInformation(broker.value, &flags) ||
+        !::GetHandleInformation(cleanup.value, &flags) ||
+        ::GetProcessId(broker.value) != report.pid || !report.endpoint[0] ||
+        report.endpoint[std::size(report.endpoint) - 1] ||
+        wcsncmp(report.endpoint, L"\\\\.\\pipe\\", 9) != 0)
+      return Fail(detail, "orphan helper report identity/capability validation");
+    return true;
+  }
+  bool Finish(bool passed, std::string* detail) {
+    if (release.value) ::SetEvent(release.value);
+    if (helper.value && !ExpiryExitZero(helper.value, ::GetTickCount64() + 5000)) {
+      passed = Fail(detail, "orphan helper did not exit normally within bound");
+      if (::WaitForSingleObject(helper.value, 0) != WAIT_OBJECT_0) g_launch_abort = true;
+    }
+    ExpiryFailureReap(broker.value, cleanup.value);
+    return passed;
+  }
+};
+
+bool DedicatedClientExitOrphan(std::string* detail) {
+  OrphanFixture f;
+  const bool passed = [&] {
+    if (!f.Start(detail)) return false;
+    ULONGLONG ready_at = 0;
+    if (!ExpiryListenerReady(f.broker.value, f.report.endpoint, &ready_at, f.helper.value))
+      return Fail(detail, "orphan listener/helper/broker not alive before client exit");
+    if (!::SetEvent(f.release.value) ||
+        !ExpiryExitZero(f.helper.value, ::GetTickCount64() + 3000))
+      return Fail(detail, "orphan helper successful process death");
+    if (!ExpiryAliveUntil(f.broker.value, ready_at + 4000))
+      return Fail(detail, "orphan broker expired before readiness + 4000 ms");
+    if (::WaitForSingleObject(f.broker.value, 0) != WAIT_TIMEOUT)
+      return Fail(detail, "orphan broker did not outlive helper");
+    if (!ExpiryExitZero(f.broker.value, ready_at + 8000))
+      return Fail(detail, "orphan broker did not naturally exit0 within 8000 ms");
+    *detail = "helper_pid=" + std::to_string(::GetProcessId(f.helper.value)) +
+        " helper_exit=0 broker_pid=" + std::to_string(f.report.pid) +
+        " broker_exit=0 ready->client-exit->broker-exit=" +
+        std::to_string(::GetTickCount64() - ready_at) + "ms";
+    return true;
+  }();
+  return f.Finish(passed, detail);
 }
 
 struct PumpFixture {
@@ -2041,6 +2334,8 @@ bool TransportExactCrossing(std::string* detail) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc >= 2 && std::strcmp(argv[1], "--px-orphan-helper") == 0)
+    return RunOrphanHelper(argc, argv);
   SetTransportFactoryForTesting(&MakeFake);
   V8HostSessionConfig preinit_config = BasicConfig();
   V8HostSession* preinit_session = reinterpret_cast<V8HostSession*>(1);
@@ -2077,6 +2372,8 @@ int main(int argc, char** argv) {
       {"transport", "queue-boundaries", TransportQueueBoundaries},
       {"transport", "malformed-message", TransportMalformed},
       {"transport", "preack-retry-policy", TransportRetry},
+      {"rendezvous", "dedicated-no-client-expires", DedicatedNoClientExpires},
+      {"rendezvous", "dedicated-client-exit-orphan", DedicatedClientExitOrphan},
       {"rendezvous", "real-dedicated-connects", [](std::string* d) {
         return LaunchCase(d, V8HOST_BROKER_DEDICATED, LaunchHold::kObserve); }},
       {"rendezvous", "slow-launch-dedicated-connects", [](std::string* d) {

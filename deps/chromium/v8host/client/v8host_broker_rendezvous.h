@@ -55,8 +55,8 @@ class BrokerConnection {
 };
 
 #ifdef V8HOST_CLIENT_TESTING
-enum class LaunchHookPoint { kBeforeCreate, kCreated, kReturned };
-using LaunchHook = void (*)(void*, LaunchHookPoint, HANDLE, ULONGLONG);
+enum class LaunchHookPoint { kBeforeCreate, kLaunching, kCreated, kReturned };
+using LaunchHook = void (*)(void*, LaunchHookPoint, HANDLE, ULONGLONG, const wchar_t*);
 #endif
 
 class BrokerRendezvous {

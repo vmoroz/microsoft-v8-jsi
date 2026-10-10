@@ -141,9 +141,11 @@ class BrokerService {
     if (!security_.Initialize(sid_))
       return sbox_error;
     bool first = true;
+    bool first_accept = false;
     sbox_status result = sbox_ok;
     auto zero_since = std::chrono::steady_clock::now();
     bool zero_timing = false;
+    std::chrono::steady_clock::time_point listen_start;
     while (!draining_) {
       ReapConnectionTasks();
       if (mode_ == v8host::BrokerMode::kDedicated && owner_seen_)
@@ -171,6 +173,8 @@ class BrokerService {
         result = sbox_error;
         break;
       }
+      if (first)
+        listen_start = std::chrono::steady_clock::now();
       first = false;
       OVERLAPPED overlapped = {};
       overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -196,10 +200,14 @@ class BrokerService {
           pending = false;
         } else {
           ReapConnectionTasks();
-          if (IdleExpired(&zero_since, &zero_timing)) {
+          // An unconnected dedicated broker exits after 5 s to reclaim a broker
+          // whose launcher died before connecting. A starved client can lose this race.
+          if (IdleExpired(&zero_since, &zero_timing) ||
+              V8HostBrokerPreConnectExpired(mode_ == v8host::BrokerMode::kDedicated,
+                  first_accept, listen_start, std::chrono::steady_clock::now())) {
             connected = V8HostBrokerFinishPendingConnect(pipe, &overlapped);
             pending = false;
-            // A completed accept wins over idle shutdown and resets the grace.
+            // A completed accept wins over expiry and resets the idle grace.
             if (!connected)
               draining_ = true;
           }
@@ -209,6 +217,7 @@ class BrokerService {
         connected = V8HostBrokerFinishPendingConnect(pipe, &overlapped);
       ::CloseHandle(overlapped.hEvent);
       if (connected) {
+        first_accept = true;
         {
           std::lock_guard<std::mutex> lock(mutex_);
           ++setup_count_;

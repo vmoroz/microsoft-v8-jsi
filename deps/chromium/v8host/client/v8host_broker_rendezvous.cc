@@ -361,13 +361,16 @@ RendezvousStatus BrokerRendezvous::ConnectOrLaunch(
   if (Stopped(stop) || !Remaining(limit, 1)) return RendezvousStatus::kStartTimeout;
   PROCESS_INFORMATION candidate = {};
 #ifdef V8HOST_CLIENT_TESTING
-  if (test_launch_) test_launch_(test_context_, LaunchHookPoint::kBeforeCreate, nullptr, limit);
+  if (test_launch_) test_launch_(test_context_, LaunchHookPoint::kBeforeCreate, nullptr, limit, endpoint_.c_str());
 #endif
   const ULONGLONG launch_start = ::GetTickCount64();
+#ifdef V8HOST_CLIENT_TESTING
+  if (test_launch_) test_launch_(test_context_, LaunchHookPoint::kLaunching, nullptr, limit, endpoint_.c_str());
+#endif
   RendezvousStatus status = LaunchCandidate(&candidate);
 #ifdef V8HOST_CLIENT_TESTING
   if (status == RendezvousStatus::kOk && test_launch_)
-    test_launch_(test_context_, LaunchHookPoint::kCreated, candidate.hProcess, limit);
+    test_launch_(test_context_, LaunchHookPoint::kCreated, candidate.hProcess, limit, endpoint_.c_str());
 #endif
   limit += ::GetTickCount64() - launch_start;
   if (status != RendezvousStatus::kOk)

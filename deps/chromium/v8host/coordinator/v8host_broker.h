@@ -3,6 +3,16 @@
 
 #include "sbox.h"
 #include <windows.h>
+#include <chrono>
+
+inline constexpr auto kDedicatedPreConnectExpiry = std::chrono::seconds(5);
+
+inline bool V8HostBrokerPreConnectExpired(
+    bool dedicated, bool first_accept,
+    std::chrono::steady_clock::time_point listen_start,
+    std::chrono::steady_clock::time_point now) {
+  return dedicated && !first_accept && now - listen_start >= kDedicatedPreConnectExpiry;
+}
 
 inline bool V8HostBrokerFinishPendingConnect(HANDLE pipe, OVERLAPPED *pending) {
   ::CancelIoEx(pipe, pending);
