@@ -19,8 +19,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <mutex>
 #include <set>
@@ -2589,8 +2593,10 @@ struct CapturedBroker {
   HANDLE process = nullptr, output = nullptr;
   std::thread reader;
   std::mutex mutex;
+  std::condition_variable changed;
   std::vector<HANDLE> workers;
   bool failed = false;
+  std::string diagnostics;
   std::string lifecycle_failure;
   unsigned lifecycle_evidence = 0;
   std::string failure_selector;
@@ -2598,6 +2604,14 @@ struct CapturedBroker {
   ~CapturedBroker() {
     if (process) {
       if (::WaitForSingleObject(process, 10000) != WAIT_OBJECT_0) {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          std::printf("[failure broker reap] broker=%lu workers=%zu failed=%d\n[failure diagnostics] %s\n",
+              ::GetProcessId(process), workers.size(), failed, diagnostics.c_str());
+          for (HANDLE worker : workers)
+            std::printf("[failure worker wait] worker=%lu wait=%lu\n", ::GetProcessId(worker), ::WaitForSingleObject(worker, 0));
+        }
+        std::printf("[cleanup] forced owned broker termination\n");
         ::TerminateProcess(process, 1);
         ::WaitForSingleObject(process, 5000);
       }
@@ -2613,6 +2627,7 @@ struct CapturedBroker {
       ::CloseHandle(worker);
   }
   bool Launch(std::string *detail) {
+    *detail = "captured broker identity/capture/lifecycle setup";
     v8host::PayloadIdentity payload;
     std::vector<uint8_t> sid;
     LUID session;
@@ -2655,8 +2670,10 @@ struct CapturedBroker {
       ::SetEnvironmentVariableA("SBOX_TEST_LIFECYCLE_HELD_EVENT", name.c_str());
       ::SetEnvironmentVariableA("SBOX_TEST_LIFECYCLE_FAILURE", failure_selector.c_str());
     }
+    const ULONGLONG launch_started = ::GetTickCount64();
     bool ok = ::CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE, 0, nullptr,
         ExecutableDirectory().c_str(), &startup, &pi) != FALSE;
+    diagnostics += "[broker launch] duration_ms=" + std::to_string(::GetTickCount64() - launch_started) + "\n";
     if (!failure_selector.empty()) {
       ::SetEnvironmentVariableA("SBOX_TEST_LIFECYCLE_FAILURE", previous_size ? previous.c_str() : nullptr);
       ::SetEnvironmentVariableA("SBOX_TEST_LIFECYCLE_HELD_EVENT", event_previous_size ? event_previous.c_str() : nullptr);
@@ -2670,23 +2687,28 @@ struct CapturedBroker {
     ::CloseHandle(pi.hThread);
     reader = std::thread([this] {
       std::string line;
+      bool oversized = false;
       char chunk[1024];
       DWORD size;
       while (::ReadFile(output, chunk, sizeof(chunk), &size, nullptr) && size) {
         for (DWORD i = 0; i < size; ++i) {
           if (chunk[i] == '\n') {
+            if (oversized) { line.clear(); oversized = false; continue; }
             while (!line.empty() && line.back() == '\r')
               line.pop_back();
+            { std::lock_guard<std::mutex> lock(mutex); if (diagnostics.size() < 65536) diagnostics += line + "\n"; }
             unsigned long pid = 0;
             if (std::sscanf(line.c_str(), "[broker] target created: pid=%lu", &pid) == 1) {
-              HANDLE held = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+              HANDLE held = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, pid);
               std::lock_guard<std::mutex> lock(mutex);
-              if (!held || workers.size() >= 32) {
+              if (!held || workers.size() >= 32 || std::any_of(workers.begin(), workers.end(),
+                  [pid](HANDLE h) { return ::GetProcessId(h) == pid && ::WaitForSingleObject(h, 0) == WAIT_TIMEOUT; })) {
                 failed = true;
                 if (held)
                   ::CloseHandle(held);
               } else {
                 workers.push_back(held);
+                changed.notify_all();
                 if (lifecycle_held)
                   ::SetEvent(lifecycle_held);
                 std::printf("[captured] target created: pid=%lu\n", pid);
@@ -2694,18 +2716,24 @@ struct CapturedBroker {
               }
             }
             if (line.rfind("[sbox-test] failure=", 0) == 0) {
+              std::lock_guard<std::mutex> lock(mutex);
               lifecycle_failure = line;
               ++lifecycle_evidence;
             }
             line.clear();
-          } else if (line.size() < 4096) {
+          } else if (!oversized && line.size() < 4096) {
             line += chunk[i];
           } else {
             std::lock_guard<std::mutex> lock(mutex);
             failed = true;
+            oversized = true;
+            changed.notify_all();
           }
         }
       }
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!line.empty() || oversized) failed = true;
+      changed.notify_all();
     });
     const ULONGLONG deadline = ::GetTickCount64() + 5000;
     while (::GetTickCount64() < deadline) {
@@ -2717,13 +2745,41 @@ struct CapturedBroker {
     *detail = "captured endpoint did not become ready";
     return false;
   }
+  bool Observe(size_t count) {
+    std::unique_lock<std::mutex> lock(mutex);
+    return changed.wait_for(lock, std::chrono::seconds(10), [&] { return failed || workers.size() >= count; }) &&
+        !failed && workers.size() == count;
+  }
+  HANDLE Worker(size_t index) {
+    std::lock_guard<std::mutex> lock(mutex);
+    return !failed && index < workers.size() ? workers[index] : nullptr;
+  }
+  bool WorkersExited(size_t count) {
+    if (!Observe(count)) return false;
+    for (size_t i = 0; i < count; ++i) {
+      HANDLE h = Worker(i);
+      if (!h || ::WaitForSingleObject(h, 10000) != WAIT_OBJECT_0) return false;
+      std::printf("[reaped] broker=%lu worker=%lu\n", ::GetProcessId(process), ::GetProcessId(h));
+    }
+    return true;
+  }
   bool Reaped(size_t count) {
     if (::WaitForSingleObject(process, 10000) != WAIT_OBJECT_0)
       return false;
     reader.join();
-    return !failed && workers.size() == count && std::all_of(workers.begin(), workers.end(), [](HANDLE h) {
-      return ::WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
-    });
+    std::printf("[reaped] broker=%lu\n", ::GetProcessId(process));
+    if (failed || workers.size() != count) return false;
+    for (HANDLE h : workers) {
+      if (::WaitForSingleObject(h, 0) != WAIT_OBJECT_0) return false;
+      std::printf("[reaped] broker=%lu worker=%lu\n", ::GetProcessId(process), ::GetProcessId(h));
+    }
+    return true;
+  }
+  bool ReapedAfterKill(size_t count) {
+    if (::WaitForSingleObject(process, 10000) != WAIT_OBJECT_0) return false;
+    reader.join();
+    std::printf("[reaped] killed broker=%lu\n", ::GetProcessId(process));
+    return !failed && WorkersExited(count);
   }
 };
 bool OpenCaptured(CapturedBroker &broker, WireHarness &h, std::string *detail) {
@@ -4384,12 +4440,15 @@ struct PublicCapture {
   std::vector<V8HostStatus> statuses;
   std::vector<std::vector<uint8_t>> messages;
   int terminal = 0, disconnects = 0;
+  ULONGLONG startup_started = 0;
   bool valid = true, close_in_terminal = true, closed = false;
   std::function<bool()> observe_worker;
   static void V8HOST_CALL State(void* context, V8HostSession* session, int32_t state, V8HostStatus status) {
     auto& c = *static_cast<PublicCapture*>(context);
     c.valid &= ::GetCurrentThreadId() == c.thread && session == c.session && status == V8HOST_OK && !c.closed;
     c.states.push_back(state);
+    if (state == V8HOST_SESSION_STATE_WORKER_SECURITY_READY && c.startup_started)
+      std::printf("[client startup] session=%p duration_ms=%llu\n", session, ::GetTickCount64() - c.startup_started);
   }
   static void V8HOST_CALL Run(void* context, V8HostRun* run, int32_t event, V8HostStatus status) {
     auto& c = *static_cast<PublicCapture*>(context);
@@ -4438,6 +4497,7 @@ bool PumpPublic(Predicate done) {
 struct PublicDedicatedProcesses {
   HANDLE broker = nullptr, worker = nullptr;
   std::wstring shared_endpoint;
+  std::string observation_failure;
   bool Prepare() {
     v8host::PayloadIdentity payload;
     std::vector<uint8_t> sid;
@@ -4452,6 +4512,7 @@ struct PublicDedicatedProcesses {
     for (HANDLE process : {worker, broker}) {
       if (!process) continue;
       if (::WaitForSingleObject(process, 10000) != WAIT_OBJECT_0) {
+        std::printf("[cleanup] forced owned dedicated process termination\n");
         ::TerminateProcess(process, 1);
         ::WaitForSingleObject(process, 5000);
       }
@@ -4459,11 +4520,12 @@ struct PublicDedicatedProcesses {
     }
   }
   bool Observe() {
+    auto fail = [&](const char* why) { observation_failure = why; return false; };
     // A dedicated session must not publish the deterministic shared endpoint.
     if (::WaitNamedPipeW(shared_endpoint.c_str(), 0) || ::GetLastError() != ERROR_FILE_NOT_FOUND)
-      return false;
+      return fail("shared endpoint present or unexpected pipe error");
     HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) return false;
+    if (snapshot == INVALID_HANDLE_VALUE) return fail("process snapshot");
     std::vector<PROCESSENTRY32W> entries;
     PROCESSENTRY32W entry = {}; entry.dwSize = sizeof(entry);
     if (::Process32FirstW(snapshot, &entry)) {
@@ -4475,32 +4537,47 @@ struct PublicDedicatedProcesses {
     DWORD broker_pid = 0, worker_pid = 0;
     for (const auto& e : entries) {
       if (e.th32ParentProcessID == ::GetCurrentProcessId()) {
-        if (broker_pid) return false;
+        if (broker_pid) return fail("multiple broker children");
         broker_pid = e.th32ProcessID;
       }
     }
     for (const auto& e : entries) {
       if (e.th32ParentProcessID == broker_pid) {
-        if (worker_pid) return false;
+        if (worker_pid) return fail("multiple worker children");
         worker_pid = e.th32ProcessID;
       }
     }
-    if (!broker_pid || !worker_pid) return false;
+    if (!broker_pid || !worker_pid) return fail("missing broker/worker parent mapping");
     if (broker || worker) {
-      return broker && worker && ::GetProcessId(broker) == broker_pid &&
+      const bool alive = broker && worker && ::GetProcessId(broker) == broker_pid &&
           ::GetProcessId(worker) == worker_pid &&
           ::WaitForSingleObject(broker, 0) == WAIT_TIMEOUT &&
           ::WaitForSingleObject(worker, 0) == WAIT_TIMEOUT;
+      return alive || fail("held dedicated PID changed/exited");
     }
-    broker = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, broker_pid);
-    worker = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, worker_pid);
-    if (!broker || !worker) return false;
+    HANDLE held_broker = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, broker_pid);
+    HANDLE held_worker = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, worker_pid);
+    auto same_image = [](HANDLE h) {
+      if (!h) return false;
+      std::wstring path(32768, L'\0'); DWORD size = static_cast<DWORD>(path.size());
+      if (!::QueryFullProcessImageNameW(h, 0, path.data(), &size)) return false;
+      path.resize(size);
+      return ::_wcsicmp(path.c_str(), (ExecutableDirectory() + L"\\sbox.exe").c_str()) == 0;
+    };
+    if (!same_image(held_broker) || !same_image(held_worker)) {
+      if (held_broker) ::CloseHandle(held_broker);
+      if (held_worker) ::CloseHandle(held_worker);
+      return fail("held dedicated image mismatch/query");
+    }
+    broker = held_broker; worker = held_worker;
     std::printf("[public dedicated] broker=%lu worker=%lu\n", broker_pid, worker_pid);
     return true;
   }
   bool Reaped() {
-    return broker && worker && ::WaitForSingleObject(worker, 10000) == WAIT_OBJECT_0 &&
+    const bool exited = broker && worker && ::WaitForSingleObject(worker, 10000) == WAIT_OBJECT_0 &&
         ::WaitForSingleObject(broker, 10000) == WAIT_OBJECT_0;
+    if (exited) std::printf("[reaped] dedicated broker=%lu worker=%lu\n", ::GetProcessId(broker), ::GetProcessId(worker));
+    return exited;
   }
 };
 bool PublicRealJsMode(int32_t mode, std::string* detail) {
@@ -4535,6 +4612,7 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
     char text[6] = {}; std::memcpy(text, round ? "bravo" : "alpha", 5);
     uint8_t binary[] = {0, static_cast<uint8_t>(1 + round * 2), static_cast<uint8_t>(2 + round * 2)};
     V8HostRun* previous = capture.run;
+    if (round == 0) capture.startup_started = ::GetTickCount64();
     if (client.start(capture.session, &input, &capture.run) != V8HOST_OK || !capture.run ||
         capture.run == previous) {
       *detail = "public same-session start round=" + std::to_string(round + 1); return false;
@@ -4546,6 +4624,9 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
     }
     std::memset(text, 'x', 5); std::memset(binary, 0xFF, 3);
     if (!PumpPublic([&] { return capture.terminal >= round + 1 || capture.disconnects; })) {
+      for (size_t i = 0; i < capture.events.size(); ++i) std::printf("[failure event] %d status=%d\n", capture.events[i], capture.statuses[i]);
+      for (int32_t state : capture.states) std::printf("[failure state] %d\n", state);
+      std::printf("[failure callbacks] states=%zu events=%zu messages=%zu terminals=%d disconnects=%d\n", capture.states.size(), capture.events.size(), capture.messages.size(), capture.terminal, capture.disconnects);
       *detail = "public callbacks timed out round=" + std::to_string(round + 1); return false;
     }
     const std::vector<int32_t> events = round == 0
@@ -4563,11 +4644,15 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
             (round ? "js echo: bravo" : "js echo: alpha") ||
         capture.messages[count - 1] != std::vector<uint8_t>{0x42, static_cast<uint8_t>(1 + round * 2),
             static_cast<uint8_t>(2 + round * 2)} || capture.closed != (round == 1)) {
+      for (size_t i = 0; i < capture.events.size(); ++i) std::printf("[failure event] %d status=%d\n", capture.events[i], capture.statuses[i]);
+      for (int32_t state : capture.states) std::printf("[failure state] %d\n", state);
+      std::printf("[failure invariant] valid=%d states=%zu events=%zu messages=%zu terminal=%d closed=%d observation=%s\n", capture.valid, capture.states.size(), capture.events.size(), capture.messages.size(), capture.terminal, capture.closed, dedicated.observation_failure.c_str());
       *detail = "public readiness/copy/FIFO/sole terminal invariant round=" + std::to_string(round + 1);
       return false;
     }
   }
   if (!(mode == V8HOST_BROKER_SHARED ? broker.Reaped(1) : dedicated.Reaped())) {
+    { std::lock_guard<std::mutex> lock(broker.mutex); std::printf("[failure diagnostics] %s\n", broker.diagnostics.c_str()); }
     *detail = "public held broker/worker reaping"; return false;
   }
   MSG msg; while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) ::DispatchMessageW(&msg);
@@ -4575,7 +4660,8 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
       "JS transforms; readiness/FIFO; one COMPLETED/OK per run; callback close; one worker reaped";
   return capture.valid && capture.terminal == 2 && capture.disconnects == 0;
 }
-bool PublicRealCancelAndProfile(std::string* detail) {
+bool PublicRealCancelAndProfileBody(std::string* detail) {
+  *detail = "public profile/cancel/admission/reap check";
   CapturedBroker broker;
   if (!broker.Launch(detail)) return false;
   auto& client = PublicClient();
@@ -4600,6 +4686,7 @@ bool PublicRealCancelAndProfile(std::string* detail) {
     V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = round == 2 ? V8HOST_TIER_UNTRUSTED : -1;
     input.payload = guest.data(); input.payload_len = guest.size();
     input.engine_dll_override = round == 2 ? L"missing-profile-engine.dll" : L"v8jsisb.dll";
+    if (round == 0) c.startup_started = ::GetTickCount64();
     if (client.start(c.session, &input, &c.run) != V8HOST_OK || !c.run) { *detail = "public negative start"; return false; }
     if (round == 0) {
       if (!PumpPublic([&] { return !c.messages.empty() || c.disconnects; }) || c.messages.empty() ||
@@ -4632,17 +4719,628 @@ bool PublicRealCancelAndProfile(std::string* detail) {
   MSG msg; while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) ::DispatchMessageW(&msg);
   return c.valid && c.terminal == 4 && c.disconnects == 0;
 }
-bool PublicRealJs(std::string* detail) {
-  return PublicRealJsMode(V8HOST_BROKER_SHARED, detail);
+struct ProcessRunRecord {
+  V8HostRun* handle = nullptr;
+  std::string token;
+  std::vector<int32_t> events, kinds;
+  std::vector<V8HostStatus> statuses;
+  std::vector<std::vector<uint8_t>> messages;
+  unsigned terminals = 0;
+};
+struct ProcessSessionRecord {
+  ContractCClient& client = PublicClient();
+  V8HostSession* handle = nullptr;
+  DWORD thread = ::GetCurrentThreadId();
+  std::deque<ProcessRunRecord> runs;
+  std::vector<int32_t> states;
+  std::vector<V8HostStatus> state_statuses;
+  unsigned disconnects = 0;
+  ULONGLONG startup_started = 0;
+  bool valid = true, closed = false, close_on_terminal = false;
+  ~ProcessSessionRecord() { Close(); }
+  void Close() {
+    if (handle && !closed) { client.close(handle); closed = true; }
+  }
+  ProcessRunRecord* Find(V8HostRun* run) {
+    valid &= ::GetCurrentThreadId() == thread && !closed;
+    for (auto& r : runs) if (r.handle == run) return &r;
+    valid = false; return nullptr;
+  }
+  static void V8HOST_CALL State(void* context, V8HostSession* session, int32_t state, V8HostStatus status) {
+    auto& c = *static_cast<ProcessSessionRecord*>(context);
+    c.valid &= ::GetCurrentThreadId() == c.thread && session == c.handle && !c.closed;
+    if (c.states.size() >= 8) { c.valid = false; return; }
+    c.states.push_back(state); c.state_statuses.push_back(status);
+    if (state == V8HOST_SESSION_STATE_WORKER_SECURITY_READY && c.startup_started)
+      std::printf("[client startup] session=%p duration_ms=%llu\n", session, ::GetTickCount64() - c.startup_started);
+  }
+  static void V8HOST_CALL Event(void* context, V8HostRun* run, int32_t event, V8HostStatus status) {
+    auto& c = *static_cast<ProcessSessionRecord*>(context);
+    auto* r = c.Find(run); if (!r) return;
+    if (r->events.size() >= 8) { c.valid = false; return; }
+    r->events.push_back(event); r->statuses.push_back(status);
+    if (event != V8HOST_RUN_EVENT_STARTED) {
+      ++r->terminals; c.valid &= r->terminals == 1;
+      std::printf("[terminal] session=%p run=%p token=%s event=%d status=%d count=%u\n",
+          c.handle, run, r->token.c_str(), event, status, r->terminals);
+      if (c.close_on_terminal) c.Close();
+    }
+  }
+  static void V8HOST_CALL Message(void* context, V8HostRun* run, int32_t kind, const void* data, size_t len) {
+    auto& c = *static_cast<ProcessSessionRecord*>(context);
+    auto* r = c.Find(run); if (!r) return;
+    c.valid &= r->terminals == 0 && c.states == std::vector<int32_t>{V8HOST_SESSION_STATE_READY,
+        V8HOST_SESSION_STATE_WORKER_STARTUP_READY, V8HOST_SESSION_STATE_WORKER_SECURITY_READY};
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    if (r->messages.size() >= 32 || len > 1024) { c.valid = false; return; }
+    r->kinds.push_back(kind); r->messages.emplace_back(bytes, bytes + len);
+  }
+  static void V8HOST_CALL Disconnect(void* context) {
+    auto& c = *static_cast<ProcessSessionRecord*>(context);
+    c.valid &= ::GetCurrentThreadId() == c.thread && !c.closed;
+    ++c.disconnects; c.valid &= c.disconnects == 1;
+  }
+  bool Create() {
+    if (!client.Load()) return false;
+    V8HostSessionConfig config = {}; config.struct_size = sizeof(config);
+    config.broker_mode = V8HOST_BROKER_SHARED; config.tier = V8HOST_TIER_UNTRUSTED;
+    config.prohibit_dynamic_code = 1; config.initial_token = sbox_token_restricted_same_access;
+    config.delayed_integrity = sbox_integrity_untrusted;
+    if (client.create(&config, &handle) != V8HOST_OK || !handle) return false;
+    V8HostCallbacks cb = {}; cb.struct_size = sizeof(cb); cb.context = this;
+    cb.on_session_state = State; cb.on_run_event = Event; cb.on_relay_message = Message; cb.on_broker_disconnect = Disconnect;
+    return client.callbacks(handle, &cb) == V8HOST_OK;
+  }
+  bool Start(const std::string& token, bool finish_immediately = false) {
+    std::string guest = finish_immediately ? "host.postMessage('" + token + "');host.complete();" :
+        "host.onmessage=function(m){if(typeof m==='string'){if(m==='finish'){host.complete();return;}"
+        "host.postMessage('" + token + ":'+m);}else{var a=new Uint8Array(m);a[0]^=0x5a;"
+        "host.postMessageBinary(m);}};host.postMessage('" + token + ":armed');";
+    V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = -1;
+    input.payload = guest.data(); input.payload_len = guest.size();
+    if (runs.empty()) startup_started = ::GetTickCount64();
+    runs.emplace_back(); auto& r = runs.back(); r.token = token;
+    if (client.start(handle, &input, &r.handle) != V8HOST_OK || !r.handle) { runs.pop_back(); return false; }
+    if (std::any_of(runs.begin(), runs.end() - 1, [&](const auto& prior) { return prior.handle == r.handle; })) {
+      valid = false; return false;
+    }
+    return true;
+  }
+  bool Armed(size_t index) {
+    auto& r = runs[index];
+    return PumpPublic([&] { return !r.messages.empty() || r.terminals || disconnects; }) && valid &&
+        !disconnects && r.events == std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED} && r.terminals == 0 &&
+        r.statuses == std::vector<V8HostStatus>{V8HOST_OK} && r.kinds == std::vector<int32_t>{sbox_msg_string} &&
+        r.messages == std::vector<std::vector<uint8_t>>{Text(r.token + ":armed")} &&
+        state_statuses == std::vector<V8HostStatus>(3, V8HOST_OK);
+  }
+  static std::vector<uint8_t> Text(const std::string& s) { return {s.begin(), s.end()}; }
+  bool Echo(size_t index, const std::string& text, uint8_t value) {
+    auto& r = runs[index]; size_t before = r.messages.size();
+    uint8_t binary[] = {value, 0, 0xff};
+    if (client.post(r.handle, sbox_msg_string, text.data(), text.size()) != V8HOST_OK ||
+        client.post(r.handle, sbox_msg_binary, binary, sizeof(binary)) != V8HOST_OK ||
+        !PumpPublic([&] { return r.messages.size() >= before + 2 || r.terminals || disconnects; })) return false;
+    return valid && !disconnects && !r.terminals && r.messages.size() == before + 2 &&
+        r.kinds[before] == sbox_msg_string && r.kinds[before + 1] == sbox_msg_binary &&
+        r.messages[before] == Text(r.token + ":" + text) &&
+        r.messages[before + 1] == std::vector<uint8_t>{static_cast<uint8_t>(value ^ 0x5a), 0, 0xff};
+  }
+  bool Terminal(size_t index, int32_t event, V8HostStatus status) {
+    auto& r = runs[index];
+    return PumpPublic([&] { return r.terminals != 0; }) && valid && r.terminals == 1 &&
+        r.events == std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, event} &&
+        r.statuses == std::vector<V8HostStatus>{V8HOST_OK, status};
+  }
+  bool Finish(size_t index) {
+    return client.post(runs[index].handle, sbox_msg_string, "finish", 6) == V8HOST_OK &&
+        Terminal(index, V8HOST_RUN_EVENT_COMPLETED, V8HOST_OK);
+  }
+  size_t CallbackCount() const {
+    size_t count = states.size() + disconnects;
+    for (const auto& r : runs) count += r.events.size() + r.messages.size();
+    return count;
+  }
+};
+void DrainPublic() {
+  MSG msg;
+  while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) ::DispatchMessageW(&msg);
 }
-bool PublicRealDedicatedJs(std::string* detail) {
-  return PublicRealJsMode(V8HOST_BROKER_DEDICATED, detail);
+bool MapPublicWorker(CapturedBroker& broker, ProcessSessionRecord& session, size_t index) {
+  if (!session.Armed(0) || !broker.Observe(index + 1)) return false;
+  HANDLE worker = broker.Worker(index);
+  if (!worker || ::WaitForSingleObject(worker, 0) != WAIT_TIMEOUT) return false;
+  std::printf("[mapped] broker=%lu session=%p run=%p ordinal=%zu worker=%lu token=%s\n",
+      ::GetProcessId(broker.process), session.handle, session.runs[0].handle, index + 1,
+      ::GetProcessId(worker), session.runs[0].token.c_str());
+  return true;
+}
+bool PublicNSessionBody(std::string* detail) {
+  *detail = "session/PID/routing/reap check";
+  CapturedBroker broker;
+  if (!broker.Launch(detail)) return false;
+  std::array<ProcessSessionRecord, 3> sessions;
+  for (size_t i = 0; i < sessions.size(); ++i) {
+    if (!sessions[i].Create() || !sessions[i].Start("tenant" + std::to_string(i)) ||
+        !MapPublicWorker(broker, sessions[i], i)) { *detail = "sequential session/PID/armed mapping"; return false; }
+  }
+  std::set<DWORD> pids;
+  for (size_t i = 0; i < sessions.size(); ++i) {
+    HANDLE h = broker.Worker(i);
+    if (!h || ::WaitForSingleObject(h, 0) != WAIT_TIMEOUT || !pids.insert(::GetProcessId(h)).second) return false;
+  }
+  for (size_t round = 0; round < 2; ++round) {
+    for (size_t i = 0; i < sessions.size(); ++i) {
+      auto& c = sessions[i];
+      if (round && (!c.Start("reuse" + std::to_string(i)) || !c.Armed(round))) return false;
+      if (!c.Echo(round, "unique" + std::to_string(i + round * 3), static_cast<uint8_t>(i + round * 16)) ||
+          !c.Finish(round) || !broker.Observe(3) || ::WaitForSingleObject(broker.Worker(i), 0) != WAIT_TIMEOUT ||
+          !pids.count(::GetProcessId(broker.Worker(i)))) { *detail = "text/binary routing/reuse"; return false; }
+    }
+  }
+  for (auto& c : sessions) c.Close();
+  if (!broker.Reaped(3)) return false;
+  DrainPublic();
+  for (auto& c : sessions) if (!c.valid || c.disconnects || c.runs.size() != 2 ||
+      c.runs[0].messages.size() != 3 || c.runs[1].messages.size() != 3) return false;
+  *detail = "3 live sessions/3 distinct held PIDs; per-run text+binary tokens; 2 runs/PID; all reaped";
+  return true;
+}
+bool PublicWorkerExitBody(std::string* detail) {
+  *detail = "worker-exit admission/fault/survival/reap check";
+  CapturedBroker broker;
+  if (!broker.Launch(detail)) return false;
+  ProcessSessionRecord crashed, sibling;
+  if (!crashed.Create() || !crashed.Start("completed") || !MapPublicWorker(broker, crashed, 0) || !crashed.Finish(0) ||
+      !sibling.Create() || !sibling.Start("survivor") || !MapPublicWorker(broker, sibling, 1) ||
+      !crashed.Start("crashed-active") || !crashed.Armed(1) || !crashed.Start("crashed-pending") ||
+      !PumpPublic([&] { return !crashed.runs[2].events.empty(); })) return false;
+  if (crashed.runs[2].events != std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED} ||
+      !crashed.runs[2].messages.empty() || crashed.runs[2].terminals) return false;
+  HANDLE killed = broker.Worker(0), healthy = broker.Worker(1);
+  if (!killed || !healthy || ::WaitForSingleObject(killed, 0) != WAIT_TIMEOUT ||
+      !::TerminateProcess(killed, 0xfa17) || ::WaitForSingleObject(killed, 10000) != WAIT_OBJECT_0) return false;
+  DWORD code = 0;
+  if (!::GetExitCodeProcess(killed, &code) || code != 0xfa17) return false;
+  std::printf("[fault] broker=%lu worker=%lu exit=%lu owned-handle\n",
+      ::GetProcessId(broker.process), ::GetProcessId(killed), code);
+  if (!crashed.Terminal(1, V8HOST_RUN_EVENT_WORKER_EXITED, V8HOST_E_RUN_TERMINAL) ||
+      !crashed.Terminal(2, V8HOST_RUN_EVENT_WORKER_EXITED, V8HOST_E_RUN_TERMINAL) ||
+      !crashed.runs[2].messages.empty() || crashed.runs[0].terminals != 1 ||
+      crashed.runs[0].events.back() != V8HOST_RUN_EVENT_COMPLETED || crashed.disconnects) {
+    *detail = "completed/active/queued worker-exit arbitration"; return false;
+  }
+  for (size_t i : {size_t{1}, size_t{2}}) {
+    if (crashed.client.post(crashed.runs[i].handle, sbox_msg_string, "late", 4) != V8HOST_E_RUN_TERMINAL ||
+        crashed.client.cancel(crashed.runs[i].handle) != V8HOST_E_RUN_TERMINAL) return false;
+  }
+  crashed.Close(); size_t frozen = crashed.CallbackCount();
+  if (::WaitForSingleObject(broker.process, 0) != WAIT_TIMEOUT ||
+      ::WaitForSingleObject(healthy, 0) != WAIT_TIMEOUT || !sibling.Echo(0, "after-kill", 0x11) ||
+      !sibling.Finish(0) || !sibling.Start("survivor-fresh") || !sibling.Armed(1) ||
+      !sibling.Echo(1, "fresh-after-kill", 0x22) || !sibling.Finish(1) || !broker.Observe(2) ||
+      ::WaitForSingleObject(healthy, 0) != WAIT_TIMEOUT) { *detail = "original sibling worker did not survive"; return false; }
+  sibling.Close();
+  if (!broker.Reaped(2)) return false;
+  DrainPublic();
+  *detail = "OS-forced recorded worker exit; completed winner retained; active+queued WORKER_EXITED once; sibling original PID survives";
+  return crashed.valid && sibling.valid && crashed.CallbackCount() == frozen && !sibling.disconnects;
+}
+bool PublicDisconnectBody(std::string* detail) {
+  *detail = "disconnect admission/order/survival/reap check";
+  CapturedBroker broker;
+  if (!broker.Launch(detail)) return false;
+  ProcessSessionRecord sibling;
+  if (!sibling.Create() || !sibling.Start("disconnect-survivor") || !MapPublicWorker(broker, sibling, 0)) return false;
+  HANDLE healthy = broker.Worker(0);
+  std::array<ProcessSessionRecord, 4> closed_sessions;
+  for (size_t order = 0; order < closed_sessions.size(); ++order) {
+    auto& c = closed_sessions[order];
+    if (!c.Create() || !c.Start("close-order" + std::to_string(order)) || !MapPublicWorker(broker, c, order + 1)) return false;
+    if (order == 0) {
+      // Close the real transport before either active or queued guest completion.
+      if (!c.Start("never-execute") || !PumpPublic([&] { return !c.runs[1].events.empty(); }) ||
+          !c.runs[1].messages.empty()) return false;
+      c.Close();
+    } else if (order == 1) {
+      if (!c.Finish(0)) return false;
+      c.Close();
+    } else if (order == 2) {
+      c.close_on_terminal = true;
+      if (!c.Finish(0) || !c.closed) return false;
+    } else {
+      // Completion may race EOF, but explicit close suppresses queued delivery.
+      if (c.client.post(c.runs[0].handle, sbox_msg_string, "finish", 6) != V8HOST_OK) return false;
+      c.Close();
+    }
+    size_t frozen = c.CallbackCount();
+    HANDLE worker = broker.Worker(order + 1);
+    if (!worker || ::WaitForSingleObject(worker, 10000) != WAIT_OBJECT_0 ||
+        ::WaitForSingleObject(healthy, 0) != WAIT_TIMEOUT || ::WaitForSingleObject(broker.process, 0) != WAIT_TIMEOUT ||
+        !sibling.Echo(0, "close-survived" + std::to_string(order), static_cast<uint8_t>(order))) return false;
+    DrainPublic();
+    if (!c.valid || c.CallbackCount() != frozen || c.disconnects || c.runs[0].messages.size() != 1 ||
+        c.runs[0].terminals != ((order == 1 || order == 2) ? 1u : 0u) ||
+        (order == 0 && (c.runs[1].terminals || !c.runs[1].messages.empty()))) {
+      *detail = "close/EOF/completion/callback-close ordering=" + std::to_string(order); return false;
+    }
+    std::printf("[reaped] close-order=%zu broker=%lu session=%p worker=%lu callbacks=%zu\n",
+        order, ::GetProcessId(broker.process), c.handle, ::GetProcessId(worker), frozen);
+  }
+  if (!sibling.Finish(0) || !sibling.Start("disconnect-fresh") || !sibling.Armed(1) ||
+      !sibling.Echo(1, "fresh", 0x33) || !sibling.Finish(1) || !broker.Observe(5) ||
+      ::WaitForSingleObject(healthy, 0) != WAIT_TIMEOUT) return false;
+  sibling.Close();
+  if (!broker.Reaped(5)) return false;
+  DrainPublic();
+  *detail = "real pipe EOF before/after completion, callback-close, completion/EOF overlap; no callback after close; original sibling PID survives";
+  return sibling.valid && !sibling.disconnects;
+}
+bool PublicBrokerKillBody(std::string* detail) {
+  *detail = "broker-loss admission/terminal/replacement check";
+  CapturedBroker old_broker;
+  if (!old_broker.Launch(detail)) return false;
+  std::array<ProcessSessionRecord, 3> old;
+  for (size_t i = 0; i < old.size(); ++i) {
+    auto& c = old[i];
+    if (!c.Create() || !c.Start("old-active" + std::to_string(i)) || !MapPublicWorker(old_broker, c, i) ||
+        !c.Start("old-queued-side-effect" + std::to_string(i)) ||
+        !PumpPublic([&] { return !c.runs[1].events.empty(); }) ||
+        c.runs[1].events != std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED} ||
+        !c.runs[1].messages.empty() || c.runs[1].terminals) return false;
+  }
+  DWORD pid = ::GetProcessId(old_broker.process);
+  if (!::TerminateProcess(old_broker.process, 0xbeef) || !old_broker.ReapedAfterKill(3)) {
+    *detail = "owned broker kill did not reap every held worker"; return false;
+  }
+  std::printf("[fault] owned broker=%lu killed; every old worker exited before replacement\n", pid);
+  for (auto& c : old) {
+    for (size_t i = 0; i < c.runs.size(); ++i) {
+      if (!c.Terminal(i, V8HOST_RUN_EVENT_BROKER_LOST, V8HOST_E_BROKER_LOST) ||
+          c.client.post(c.runs[i].handle, sbox_msg_string, "old-late", 8) != V8HOST_E_RUN_TERMINAL ||
+          c.client.cancel(c.runs[i].handle) != V8HOST_E_RUN_TERMINAL) return false;
+    }
+    if (!PumpPublic([&] { return c.disconnects != 0; }) || !c.valid || c.disconnects != 1 ||
+        c.states.back() != V8HOST_SESSION_STATE_CLOSED || c.state_statuses.back() != V8HOST_E_BROKER_LOST ||
+        c.runs[0].messages.size() != 1 || !c.runs[1].messages.empty()) return false;
+  }
+  CapturedBroker replacement;
+  WireHarness observer;
+  if (!replacement.Launch(detail) ||
+      !ConnectAndHandshake(BrokerMode::kShared, 900, &observer.connection, &observer.hello, detail) ||
+      observer.connection.broker_pid() != ::GetProcessId(replacement.process)) return false;
+  auto fence = [&](uint32_t request) {
+    return observer.Send(protocol::BuildCancelRunFrame(observer.Header(request, 1, 1))) &&
+        observer.Expect(protocol::MessageType::ACK, request, 1, 1);
+  };
+  if (!fence(1)) return false;
+  for (auto& c : old) {
+    std::string guest = "host.postMessage('old-retry-side-effect');host.complete();";
+    V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = -1;
+    input.payload = guest.data(); input.payload_len = guest.size();
+    V8HostRun* run = nullptr;
+    if (c.client.start(c.handle, &input, &run) != V8HOST_E_CONNECT || run ||
+        c.client.post(c.runs[0].handle, sbox_msg_string, "old", 3) != V8HOST_E_RUN_TERMINAL) {
+      *detail = "old terminal session/run accepted replay"; return false;
+    }
+  }
+  if (!fence(2)) return false;
+  {
+    std::lock_guard<std::mutex> lock(replacement.mutex);
+    if (replacement.failed || !replacement.workers.empty()) { *detail = "replacement automatic creation"; return false; }
+  }
+  std::printf("[replacement] broker=%lu workers=0 authenticated observer; old retries rejected\n",
+      ::GetProcessId(replacement.process));
+  ProcessSessionRecord fresh;
+  if (!fresh.Create() || !fresh.Start("fresh-only") || !MapPublicWorker(replacement, fresh, 0) ||
+      !fresh.Echo(0, "new-token", 0x44) || !fresh.Finish(0) || !fence(3)) return false;
+  for (auto& c : old) {
+    if (!c.valid || c.disconnects != 1 || c.runs[0].terminals != 1 || c.runs[1].terminals != 1 ||
+        c.runs[0].messages != std::vector<std::vector<uint8_t>>{ProcessSessionRecord::Text(c.runs[0].token + ":armed")} ||
+        !c.runs[1].messages.empty()) return false;
+    c.Close();
+  }
+  fresh.Close(); observer.connection.Close();
+  if (!replacement.Reaped(1)) { *detail = "replacement extra creation or failed reap"; return false; }
+  DrainPublic();
+  *detail = "3 old workers reaped before same-set replacement; 6 BROKER_LOST once; zero automatic workers; old attempts rejected; only explicit fresh token/one worker";
+  return fresh.valid && !fresh.disconnects && fresh.runs[0].terminals == 1 &&
+      std::all_of(old.begin(), old.end(), [](const auto& c) { return c.valid; });
+}
+// Two sibling sessions share one authenticated connection; the third uses another.
+bool SameConnectionWorkerExitBody(std::string* detail) {
+  CapturedBroker broker;
+  WireHarness siblings, other;
+  *detail = "same-connection setup/admission";
+  if (!OpenCaptured(broker, siblings, detail) ||
+      !ConnectAndHandshake(BrokerMode::kShared, 900, &other.connection, &other.hello, detail) ||
+      other.connection.broker_pid() != ::GetProcessId(broker.process) ||
+      other.hello.conn_id == siblings.hello.conn_id) return false;
+  auto config = LogicalConfig(); config.broker_mode = 1;
+  config.initial_token = sbox_token_restricted_same_access; config.delayed_integrity = sbox_integrity_untrusted;
+  if (!siblings.Send(protocol::BuildCreateSessionFrame(siblings.Header(2, 2), config)) ||
+      !siblings.Expect(protocol::MessageType::ACK, 2, 2) || !siblings.Expect(protocol::MessageType::SESSION_READY, 0, 2) ||
+      !other.Send(protocol::BuildCreateSessionFrame(other.Header(1), config)) ||
+      !other.Expect(protocol::MessageType::ACK, 1, 1) || !other.Expect(protocol::MessageType::SESSION_READY, 0, 1)) return false;
+  auto relay = [&](WireHarness& h, uint32_t session, uint32_t run, int32_t kind, const std::vector<uint8_t>& body) {
+    auto header = h.Header(0, session, run); header.type = protocol::MessageType::RELAY_TO_WORKER;
+    return h.Send(protocol::BuildRelayFrame(header, kind, body.data(), body.size()));
+  };
+  auto text = [&](WireHarness& h, uint32_t session, uint32_t run, const std::string& body) {
+    return relay(h, session, run, sbox_msg_string, {body.begin(), body.end()});
+  };
+  auto message = [&](WireHarness& h, uint32_t session, uint32_t run, int32_t kind, const std::vector<uint8_t>& expected) {
+    std::vector<uint8_t> bytes; protocol::FrameHeader header; int32_t received_kind;
+    const uint8_t* body; size_t size;
+    return h.Receive(&bytes, &header) && header.type == protocol::MessageType::RELAY_FROM_WORKER &&
+        header.conn_id == h.hello.conn_id && header.session_id == session && header.run_id == run && !header.request_id &&
+        protocol::DecodeRelayPayload(bytes.data() + protocol::kFrameHeaderSize,
+            bytes.size() - protocol::kFrameHeaderSize, &received_kind, &body, &size) && received_kind == kind &&
+        std::vector<uint8_t>(body, body + size) == expected;
+  };
+  auto token = [&](WireHarness& h, uint32_t session, uint32_t run, const std::string& expected) {
+    return message(h, session, run, sbox_msg_string, {expected.begin(), expected.end()});
+  };
+  auto start = [&](WireHarness& h, uint32_t request, uint32_t session, uint32_t run, const std::string& tag, bool first) {
+    const std::string guest = "host.onmessage=function(m){if(typeof m==='string'){if(m==='finish'){host.complete();return;}"
+        "host.postMessage('" + tag + ":'+m);}else{var a=new Uint8Array(m);a[0]^=0x5a;host.postMessageBinary(m);}};"
+        "host.postMessage('" + tag + ":armed');";
+    return h.Send(protocol::BuildStartRunFrame(h.Header(request, session, run), Script(guest))) &&
+        h.Expect(protocol::MessageType::ACK, request, session, run) &&
+        (!first || (h.Expect(protocol::MessageType::STARTUP_READY, 0, session) &&
+            h.Expect(protocol::MessageType::SECURITY_READY, 0, session))) && token(h, session, run, tag + ":armed");
+  };
+  auto finish = [&](WireHarness& h, uint32_t session, uint32_t run) {
+    std::vector<uint8_t> bytes; protocol::FrameHeader header; protocol::ResultPayload result;
+    const bool ok = text(h, session, run, "finish") && h.Receive(&bytes, &header) &&
+        header.type == protocol::MessageType::RESULT && header.conn_id == h.hello.conn_id &&
+        header.session_id == session && header.run_id == run && !header.request_id &&
+        protocol::DecodeResultPayload(bytes.data() + protocol::kFrameHeaderSize,
+            bytes.size() - protocol::kFrameHeaderSize, &result) && result.disposition == protocol::ResultDisposition::kCompleted;
+    if (ok) std::printf("[terminal] wire conn=%u session=%u run=%u COMPLETED count=1\n", h.hello.conn_id, session, run);
+    return ok;
+  };
+  std::array<WireHarness*, 3> connections{&siblings, &siblings, &other};
+  std::array<uint32_t, 3> ids{1, 2, 1}, requests{3, 4, 2};
+  std::set<DWORD> pids;
+  for (size_t i = 0; i < 3; ++i) {
+    auto& h = *connections[i];
+    if (!start(h, requests[i], ids[i], 1, "wire" + std::to_string(i), true) || !broker.Observe(i + 1)) return false;
+    HANDLE worker = broker.Worker(i);
+    if (!worker || ::WaitForSingleObject(worker, 0) != WAIT_TIMEOUT || !pids.insert(::GetProcessId(worker)).second) return false;
+    std::printf("[mapped] broker=%lu conn=%u session=%u run=1 ordinal=%zu worker=%lu\n",
+        ::GetProcessId(broker.process), h.hello.conn_id, ids[i], i + 1, ::GetProcessId(worker));
+  }
+  *detail = "same-connection exact text/binary routing and two runs/original PID";
+  for (size_t round = 0; round < 2; ++round) for (size_t i = 0; i < 3; ++i) {
+    auto& h = *connections[i]; const uint32_t run = static_cast<uint32_t>(round + 1);
+    const std::string tag = "wire" + std::to_string(i) + (round ? "-reuse" : "");
+    if (round && !start(h, i == 2 ? 3 : static_cast<uint32_t>(5 + i), ids[i], run, tag, false)) return false;
+    const std::string sent = "unique" + std::to_string(i + round * 3);
+    const uint8_t value = static_cast<uint8_t>(i + round * 16);
+    if (!text(h, ids[i], run, sent) || !token(h, ids[i], run, tag + ":" + sent) ||
+        !relay(h, ids[i], run, sbox_msg_binary, {value, 0, 0xff}) ||
+        !message(h, ids[i], run, sbox_msg_binary, {static_cast<uint8_t>(value ^ 0x5a), 0, 0xff}) ||
+        !finish(h, ids[i], run) || !broker.Observe(3) || ::WaitForSingleObject(broker.Worker(i), 0) != WAIT_TIMEOUT) return false;
+  }
+  *detail = "same-connection worker fault/active+queued terminal";
+  if (!start(siblings, 7, 1, 3, "crashed", false) ||
+      !siblings.Send(protocol::BuildStartRunFrame(siblings.Header(8, 1, 4), Script("host.postMessage('never');host.complete();"))) ||
+      !siblings.Expect(protocol::MessageType::ACK, 8, 1, 4) ||
+      !start(siblings, 9, 2, 3, "sibling", false) || !start(other, 4, 1, 3, "other", false)) return false;
+  HANDLE killed = broker.Worker(0); DWORD code = 0;
+  if (!::TerminateProcess(killed, 0xfa17) || ::WaitForSingleObject(killed, 10000) != WAIT_OBJECT_0 ||
+      !::GetExitCodeProcess(killed, &code) || code != 0xfa17 ||
+      !siblings.Expect(protocol::MessageType::WORKER_EXIT, 0, 1)) return false;
+  std::printf("[fault] broker=%lu worker=%lu exit=%lu; wire conn=%u session=1 runs=3,4 WORKER_EXIT count=1\n",
+      ::GetProcessId(broker.process), ::GetProcessId(killed), code, siblings.hello.conn_id);
+  // The received terminal fences worker retirement. Late relays are dropped;
+  // CANCEL/CLOSE are idempotent ACKs, and START on the removed session is BAD_STATE.
+  *detail = "late RELAY/CANCEL/START/CLOSE responses or duplicate terminal";
+  if (!text(siblings, 1, 3, "late") || !text(siblings, 1, 4, "late") ||
+      !siblings.Send(protocol::BuildCancelRunFrame(siblings.Header(10, 1, 3))) ||
+      !siblings.Expect(protocol::MessageType::ACK, 10, 1, 3) ||
+      !siblings.Send(protocol::BuildCancelRunFrame(siblings.Header(11, 1, 4))) ||
+      !siblings.Expect(protocol::MessageType::ACK, 11, 1, 4) ||
+      !siblings.Send(protocol::BuildStartRunFrame(siblings.Header(12, 1, 5), Script("host.complete();")))) return false;
+  std::vector<uint8_t> bytes; protocol::FrameHeader header; protocol::ErrorPayload error;
+  if (!siblings.Receive(&bytes, &header) || header.type != protocol::MessageType::ERROR ||
+      header.conn_id != siblings.hello.conn_id || header.session_id != 1 || header.run_id != 5 || header.request_id != 12 ||
+      !protocol::DecodeErrorPayload(bytes.data() + protocol::kFrameHeaderSize, bytes.size() - protocol::kFrameHeaderSize, &error) ||
+      error.status_code != protocol::StatusCode::ERROR_BAD_STATE ||
+      !siblings.Send(protocol::BuildCloseSessionFrame(siblings.Header(13, 1))) ||
+      !siblings.Expect(protocol::MessageType::ACK, 13, 1) ||
+      !siblings.Send(protocol::BuildCloseSessionFrame(siblings.Header(14, 1))) ||
+      !siblings.Expect(protocol::MessageType::ACK, 14, 1)) return false;
+  *detail = "original same-connection sibling and independent connection survival";
+  for (size_t i : {size_t{1}, size_t{2}}) {
+    auto& h = *connections[i]; const std::string tag = i == 1 ? "sibling" : "other";
+    if (!text(h, ids[i], 3, "after-kill") || !token(h, ids[i], 3, tag + ":after-kill") || !finish(h, ids[i], 3) ||
+        !start(h, i == 1 ? 15 : 5, ids[i], 4, "fresh" + tag, false) ||
+        !text(h, ids[i], 4, "fresh") || !token(h, ids[i], 4, "fresh" + tag + ":fresh") || !finish(h, ids[i], 4) ||
+        !broker.Observe(3) || ::WaitForSingleObject(broker.Worker(i), 0) != WAIT_TIMEOUT ||
+        ::WaitForSingleObject(broker.process, 0) != WAIT_TIMEOUT) return false;
+  }
+  // Final control barriers reject any queued second terminal/late output.
+  if (!siblings.Send(protocol::BuildCloseSessionFrame(siblings.Header(16, 2))) ||
+      !siblings.Expect(protocol::MessageType::ACK, 16, 2) ||
+      !other.Send(protocol::BuildCloseSessionFrame(other.Header(6))) || !other.Expect(protocol::MessageType::ACK, 6, 1)) return false;
+  siblings.connection.Close(); other.connection.Close();
+  if (!broker.Reaped(3)) { *detail = "same-connection joined reaping"; return false; }
+  *detail = "3 real PIDs/2 connections including siblings; text/binary and reuse; killed session only; deterministic late-frame barriers";
+  return true;
+}
+// Each child loads its own production client singleton and immutable payload set.
+bool IsolatedPublicCase(const char* name, std::string* detail) {
+  namespace fs = std::filesystem;
+  static std::atomic<unsigned> sequence{0};
+  wchar_t temp[MAX_PATH] = {};
+  if (!::GetTempPathW(MAX_PATH, temp)) { *detail = "fixture temp path"; return false; }
+  const fs::path root = fs::path(temp) / L"v8host-broker-tests" /
+      (L"fixture-" + std::to_wstring(::GetCurrentProcessId()) + L"-" + std::to_wstring(++sequence));
+  const fs::path dir = root / L"x64";
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  if (ec) { *detail = "fixture directory: " + ec.message(); return false; }
+  struct Cleanup {
+    fs::path root;
+    ~Cleanup() {
+      std::error_code error; fs::remove_all(root, error);
+      if (error) std::printf("[cleanup] fixture removal failed: %s\n", error.message().c_str());
+    }
+  } cleanup{root};
+  for (const wchar_t* file : {L"v8host_broker_tests.exe", L"sbox.exe", L"v8host.dll", L"v8jsisb.dll",
+      L"msvcp140.dll", L"msvcp140_atomic_wait.dll", L"vcruntime140.dll", L"vcruntime140_1.dll"}) {
+    fs::copy_file(fs::path(ExecutableDirectory()) / file, dir / file, fs::copy_options::none, ec);
+    if (ec) { *detail = "fixture copy: " + ec.message(); return false; }
+  }
+  {
+    std::ofstream trailer(dir / L"sbox.exe", std::ios::binary | std::ios::app);
+    trailer << "\nfixture:" << ::GetCurrentProcessId() << ':' << sequence.load() << ':' << ::GetTickCount64();
+    trailer.close();
+    if (!trailer) { *detail = "fixture container trailer"; return false; }
+  }
+  v8host::PayloadIdentity original, isolated;
+  v8host::HeldFile original_engine, isolated_engine;
+  DWORD error = 0;
+  std::vector<uint8_t> sid;
+  LUID session;
+  std::wstring a, b;
+  std::array<uint8_t, 32> key;
+  if (!v8host::ResolvePayloadIdentity(ExecutableDirectory(), L"sbox.exe", L"v8host.dll", &original, &error) ||
+      !v8host::ResolvePayloadIdentity(dir.wstring(), L"sbox.exe", L"v8host.dll", &isolated, &error) ||
+      original.plugin.sha256() != isolated.plugin.sha256() ||
+      original.container.sha256() == isolated.container.sha256() ||
+      !v8host::OpenImmutableFile(ExecutableDirectory() + L"\\v8jsisb.dll", &original_engine, &error) ||
+      !v8host::OpenImmutableFile((dir / L"v8jsisb.dll").wstring(), &isolated_engine, &error) ||
+      original_engine.sha256() != isolated_engine.sha256() ||
+      !v8host::QueryCurrentSidAndSession(&sid, &session, &error) ||
+      !v8host::DeriveEndpoint(sid, original.plugin_set_id, BrokerMode::kShared, nullptr, &a, &key) ||
+      !v8host::DeriveEndpoint(sid, isolated.plugin_set_id, BrokerMode::kShared, nullptr, &b, &key) || a == b) {
+    *detail = "fixture identity/endpoint not isolated"; return false;
+  }
+  std::printf("[fixture] distinct exact-set endpoints; immutable DLL hashes identical; case=%s\n", name);
+  SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+  HANDLE read = nullptr, write = nullptr;
+  if (!::CreatePipe(&read, &write, &sa, 0)) { *detail = "fixture capture pipe"; return false; }
+  ::SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0);
+  STARTUPINFOW startup = {}; startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES; startup.hStdOutput = startup.hStdError = write;
+  startup.hStdInput = ::GetStdHandle(STD_INPUT_HANDLE);
+  const std::wstring exe = (dir / L"v8host_broker_tests.exe").wstring();
+  std::wstring command = L"\"" + exe + L"\" --public-child=" + std::wstring(name, name + std::strlen(name));
+  HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  if (!job || !::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+    if (job) ::CloseHandle(job);
+    ::CloseHandle(read); ::CloseHandle(write); *detail = "fixture kill-on-close job"; return false;
+  }
+  PROCESS_INFORMATION pi = {};
+  const bool launched = ::CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_SUSPENDED, nullptr,
+      dir.c_str(), &startup, &pi) != FALSE;
+  ::CloseHandle(write);
+  if (!launched) { ::CloseHandle(job); ::CloseHandle(read); *detail = "fixture child launch"; return false; }
+  if (!::AssignProcessToJobObject(job, pi.hProcess) || ::ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {
+    ::TerminateProcess(pi.hProcess, 1); ::WaitForSingleObject(pi.hProcess, 5000);
+    ::CloseHandle(pi.hThread); ::CloseHandle(pi.hProcess); ::CloseHandle(read); ::CloseHandle(job);
+    *detail = "fixture child job ownership"; return false;
+  }
+  ::CloseHandle(pi.hThread);
+  std::string output;
+  bool overflow = false;
+  std::thread reader([&] {
+    char bytes[4096]; DWORD len;
+    while (::ReadFile(read, bytes, sizeof(bytes), &len, nullptr) && len) {
+      if (output.size() + len <= 1024 * 1024) output.append(bytes, len);
+      else overflow = true;
+    }
+  });
+  bool exited = ::WaitForSingleObject(pi.hProcess, 120000) == WAIT_OBJECT_0;
+  if (!exited) { ::TerminateJobObject(job, 1); ::WaitForSingleObject(pi.hProcess, 5000); }
+  JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting = {};
+  const bool empty = ::QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+      &accounting, sizeof(accounting), nullptr) && accounting.ActiveProcesses == 0;
+  if (!empty) {
+    ::TerminateJobObject(job, 1);
+    // Drain only the owned failed fixture job before removing its files.
+    const ULONGLONG drain_deadline = ::GetTickCount64() + 5000;
+    while (::QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+        &accounting, sizeof(accounting), nullptr) && accounting.ActiveProcesses &&
+        ::GetTickCount64() < drain_deadline) ::Sleep(10);
+    if (accounting.ActiveProcesses) std::printf("[cleanup] fixture job did not drain\n");
+  }
+  DWORD code = 1; ::GetExitCodeProcess(pi.hProcess, &code);
+  ::CloseHandle(pi.hProcess);
+  reader.join(); ::CloseHandle(read); ::CloseHandle(job);
+  std::printf("%s", output.c_str());
+  const bool passed = exited && empty && !overflow && code == 0 &&
+      output.find("[cleanup]") == std::string::npos &&
+      output.find(std::string("child/") + name + ": PASS") != std::string::npos;
+  if (!passed) *detail = "isolated child exit=" + std::to_string(code) + " exited=" + std::to_string(exited) +
+      " job_empty=" + std::to_string(empty) + " overflow=" + std::to_string(overflow);
+  return passed;
+}
+bool PublicRealJs(std::string* detail) { return IsolatedPublicCase("real-js", detail); }
+bool PublicRealDedicatedJs(std::string* detail) { return IsolatedPublicCase("real-dedicated-js", detail); }
+bool PublicRealCancelAndProfile(std::string* detail) { return IsolatedPublicCase("real-cancel-and-profile", detail); }
+bool PublicBrokerKill(std::string* detail) { return IsolatedPublicCase("broker-kill-no-replay", detail); }
+bool PublicDisconnect(std::string* detail) { return IsolatedPublicCase("disconnect-orderings", detail); }
+bool PublicWorkerExit(std::string* detail) { return IsolatedPublicCase("worker-exit-isolation", detail); }
+bool SameConnectionWorkerExit(std::string* detail) { return IsolatedPublicCase("same-connection-worker-exit", detail); }
+bool PublicNSession(std::string* detail) { return IsolatedPublicCase("n-session-n-pid", detail); }
+bool PublicDllIsolation(std::string* detail) {
+  *detail = "unrelated owner/child isolation/reap check";
+  CapturedBroker unrelated;
+  WireHarness owner;
+  if (!OpenCaptured(unrelated, owner, detail) ||
+      !owner.Send(protocol::BuildStartRunFrame(owner.Header(2, 1, 1), Script(
+          "host.onmessage=function(m){host.postMessage(m);};host.postMessage('owner');"))) ||
+      !owner.Expect(protocol::MessageType::ACK, 2, 1, 1) ||
+      !owner.Expect(protocol::MessageType::STARTUP_READY, 0, 1) ||
+      !owner.Expect(protocol::MessageType::SECURITY_READY, 0, 1) ||
+      !ExpectString(owner, 1, "owner") || !unrelated.Observe(1)) return false;
+  HANDLE worker = unrelated.Worker(0);
+  for (const char* name : {"real-js", "real-dedicated-js", "real-cancel-and-profile"}) {
+    if (!IsolatedPublicCase(name, detail) || ::WaitForSingleObject(worker, 0) != WAIT_TIMEOUT ||
+        ::WaitForSingleObject(unrelated.process, 0) != WAIT_TIMEOUT ||
+        !SendString(owner, 1, name) || !ExpectString(owner, 1, name) || !unrelated.Observe(1)) return false;
+  }
+  owner.connection.Close();
+  return unrelated.Reaped(1);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i) {
+    if (std::strncmp(argv[i], "--public-child=", 15) != 0) continue;
+    std::string name = argv[i] + 15, detail;
+    bool ok = name == "real-js" ? PublicRealJsMode(V8HOST_BROKER_SHARED, &detail) :
+        name == "real-dedicated-js" ? PublicRealJsMode(V8HOST_BROKER_DEDICATED, &detail) :
+        name == "real-cancel-and-profile" ? PublicRealCancelAndProfileBody(&detail) :
+        name == "n-session-n-pid" ? PublicNSessionBody(&detail) :
+        name == "worker-exit-isolation" ? PublicWorkerExitBody(&detail) :
+        name == "same-connection-worker-exit" ? SameConnectionWorkerExitBody(&detail) :
+        name == "disconnect-orderings" ? PublicDisconnectBody(&detail) :
+        name == "broker-kill-no-replay" && PublicBrokerKillBody(&detail);
+    std::printf("child/%s: %s - %s\n", name.c_str(), ok ? "PASS" : "FAIL", detail.c_str());
+    return ok ? 0 : 1;
+  }
   const std::vector<v8host::test::TestCase> tests = {
+      {"crash", "broker-kill-no-replay", PublicBrokerKill},
+      {"broker-crash", "broker-kill-no-replay", PublicBrokerKill},
+      {"run", "public-js", PublicRealJs},
+      {"session", "public-dedicated-js", PublicRealDedicatedJs},
+      {"cancel", "public-cancel-and-profile", PublicRealCancelAndProfile},
+      {"crash", "disconnect-orderings", PublicDisconnect},
+      {"crash", "worker-exit-isolation", PublicWorkerExit},
+      {"worker-crash", "worker-exit-isolation", PublicWorkerExit},
+      {"no-crosstalk", "n-session-n-pid", PublicNSession},
+      {"no-crosstalk", "same-connection-worker-exit", SameConnectionWorkerExit},
+      {"worker-crash", "same-connection-worker-exit", SameConnectionWorkerExit},
+      {"crash", "same-connection-worker-exit", SameConnectionWorkerExit},
+      {"client", "real-dll-isolation", PublicDllIsolation},
       {"client", "real-js", PublicRealJs},
       {"client", "real-dedicated-js", PublicRealDedicatedJs},
       {"client", "real-cancel-and-profile", PublicRealCancelAndProfile},
