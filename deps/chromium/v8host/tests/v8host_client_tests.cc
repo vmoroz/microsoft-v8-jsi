@@ -7,9 +7,11 @@
 #include "v8host_protocol.h"
 #include "v8host_protocol_messages.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <cstdio>
 #include <functional>
 #include <mutex>
 #include <memory>
@@ -1378,7 +1380,8 @@ struct TransportProbe {
   HANDLE disconnected = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
   HANDLE destroyed = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
   HANDLE inbound = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  std::atomic<int> losses{0}, frames{0};
+  std::atomic<int> connects{0}, losses{0}, frames{0};
+  ULONGLONG connected_at = 0, disconnected_at = 0;
   TransportDisconnect reason = TransportDisconnect::kConnectFailed;
   uint32_t conn = 0;
   uint16_t major = 0, minor = 0;
@@ -1391,6 +1394,7 @@ struct ProbeDelegate : ClientTransportDelegate {
   ~ProbeDelegate() override { ::SetEvent(probe->destroyed); }
   void OnConnected(uint32_t id, uint16_t major, uint16_t minor) override {
     probe->conn = id; probe->major = major; probe->minor = minor;
+    probe->connected_at = ::GetTickCount64(); ++probe->connects;
     ::SetEvent(probe->connected);
   }
   void OnInboundFrame(const uint8_t*, size_t) override {
@@ -1399,12 +1403,224 @@ struct ProbeDelegate : ClientTransportDelegate {
     ::SetEvent(probe->inbound);
   }
   void OnDisconnect(TransportDisconnect reason) override {
-    probe->reason = reason; ++probe->losses; ::SetEvent(probe->disconnected);
+    probe->reason = reason; probe->disconnected_at = ::GetTickCount64();
+    ++probe->losses; ::SetEvent(probe->disconnected);
   }
   ClientTransport* close_on_frame = nullptr;
   TransportProbe* probe;
 };
 bool Signaled(HANDLE h) { return ::WaitForSingleObject(h, 5000) == WAIT_OBJECT_0; }
+
+
+enum class LaunchHold { kObserve, kSlow, kExhausted, kClose };
+bool g_launch_abort = false;
+
+struct LaunchFixture {
+  explicit LaunchFixture(int mode, LaunchHold hold) : mode(mode), hold(hold) {}
+  TransportProbe probe;
+  const int mode;
+  const LaunchHold hold;
+  HANDLE in_launch = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE release = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE returned = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  std::shared_ptr<ProbeDelegate> delegate = std::make_shared<ProbeDelegate>(&probe);
+  std::unique_ptr<ClientTransport> transport;
+  std::atomic<HANDLE> candidate{nullptr};
+  std::atomic<DWORD> hook_error{ERROR_SUCCESS};
+  std::atomic<int> before_count{0}, created_count{0}, returned_count{0};
+  std::atomic<ULONGLONG> d0{0}, before_enter{0}, before_exit{0};
+  std::atomic<ULONGLONG> launch_enter{0}, launch_exit{0}, shifted{0}, observed_at{0};
+
+  void HoldUntil(ULONGLONG until) {
+    ULONGLONG now = ::GetTickCount64();
+    while (now < until &&
+           ::WaitForSingleObject(release, static_cast<DWORD>(until - now)) == WAIT_TIMEOUT)
+      now = ::GetTickCount64();
+  }
+  static void Hook(void* context, v8host::LaunchHookPoint point, HANDLE process,
+                   ULONGLONG deadline) {
+    auto& f = *static_cast<LaunchFixture*>(context);
+    const ULONGLONG now = ::GetTickCount64();
+    if (point == v8host::LaunchHookPoint::kBeforeCreate) {
+      ++f.before_count;
+      f.d0 = deadline; f.before_enter = now;
+      if (f.hold == LaunchHold::kExhausted) f.HoldUntil(now + 5000);
+      f.before_exit = ::GetTickCount64();
+    } else if (point == v8host::LaunchHookPoint::kCreated) {
+      if (++f.created_count == 1) {
+        HANDLE duplicate = nullptr;
+        const DWORD access = SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION |
+            (f.mode == V8HOST_BROKER_DEDICATED ? PROCESS_TERMINATE : 0);
+        if (!::DuplicateHandle(::GetCurrentProcess(), process, ::GetCurrentProcess(),
+                               &duplicate, access, FALSE, 0))
+          f.hook_error = ::GetLastError();
+        f.candidate = duplicate;
+      }
+      f.launch_enter = now;
+      ::SetEvent(f.in_launch);
+      if (f.hold == LaunchHold::kSlow)
+        f.HoldUntil((std::min)(deadline + 500, now + 15000));
+      else if (f.hold == LaunchHold::kExhausted)
+        f.HoldUntil(now + 10000);
+      else if (f.hold == LaunchHold::kClose)
+        f.HoldUntil(now + 15000);
+      f.launch_exit = ::GetTickCount64();
+    } else {
+      ++f.returned_count;
+      f.shifted = deadline; f.observed_at = now;
+      ::SetEvent(f.returned);
+    }
+  }
+  bool Init(std::string* detail) {
+    if (!in_launch || !release || !returned || !probe.connected ||
+        !probe.disconnected || !probe.destroyed || !probe.inbound)
+      return Fail(detail, "launch fixture event creation");
+    const std::wstring directory = v8host::test::ExecutableDirectory();
+    if (mode == V8HOST_BROKER_SHARED) {
+      v8host::PayloadIdentity payload;
+      std::vector<uint8_t> sid;
+      LUID session = {};
+      std::wstring endpoint;
+      std::array<uint8_t, 32> key = {};
+      DWORD error = ERROR_SUCCESS;
+      if (!v8host::ResolvePayloadIdentity(directory, L"sbox.exe", L"v8host.dll", &payload, &error) ||
+          !v8host::QueryCurrentSidAndSession(&sid, &session, &error) ||
+          !v8host::DeriveEndpoint(sid, payload.plugin_set_id, v8host::BrokerMode::kShared,
+                                 nullptr, &endpoint, &key))
+        return Fail(detail, "shared endpoint identity resolution");
+      if (::WaitNamedPipeW(endpoint.c_str(), 0) || ::GetLastError() != ERROR_FILE_NOT_FOUND)
+        return Fail(detail, "shared endpoint present");
+    }
+    TransportParams params;
+    params.payload_directory = directory; params.broker_mode = mode;
+    params.test_context = this; params.test_launch = Hook;
+    transport.reset(v8host::client::CreateRealPipeClientTransport(params, delegate.get()));
+    return transport ? true : Fail(detail, "real launch transport creation");
+  }
+  bool Start(std::string* detail) {
+    if (transport->Start(delegate) != V8HOST_OK)
+      return Fail(detail, "real launch transport Start");
+    if (::WaitForSingleObject(in_launch, 30000) != WAIT_OBJECT_0)
+      return Fail(detail, "launch hook did not start within 30 s");
+    return candidate.load() && hook_error == ERROR_SUCCESS
+        ? true : Fail(detail, "launch candidate handle duplication");
+  }
+  bool Hooks(std::string* detail) {
+    if (before_count != 1 || created_count != 1 || returned_count != 1)
+      return Fail(detail, "launch hook counts must each be one");
+    const ULONGLONG lower = d0 + (launch_exit - launch_enter);
+    const ULONGLONG upper = d0 + (observed_at - before_exit);
+    if (shifted < lower || shifted > upper)
+      return Fail(detail, "launch deadline shift outside measured bracket");
+    return true;
+  }
+  bool Cancelled() {
+    DWORD code = STILL_ACTIVE;
+    return ::WaitForSingleObject(candidate.load(), 0) == WAIT_OBJECT_0 &&
+        ::GetExitCodeProcess(candidate.load(), &code) && code == ERROR_CANCELLED;
+  }
+  void ReapFailedDedicated() {
+    HANDLE process = candidate.load();
+    if (mode == V8HOST_BROKER_DEDICATED && process &&
+        ::WaitForSingleObject(process, 0) == WAIT_TIMEOUT) {
+      ::TerminateProcess(process, 0xFA11);
+      if (::WaitForSingleObject(process, 5000) != WAIT_OBJECT_0)
+        g_launch_abort = true;
+    }
+  }
+  bool Finish(bool passed, std::string* detail) {
+    ::SetEvent(release);
+    if (transport) transport->Close();
+    transport.reset();
+    delegate.reset();
+    if (::WaitForSingleObject(probe.destroyed, 15000) != WAIT_OBJECT_0) {
+      ReapFailedDedicated();
+      g_launch_abort = true;
+      *detail += " teardown timed out; fixture retained";
+      return false;
+    }
+    HANDLE process = candidate.load();
+    if (process) {
+      if (passed && (probe.losses != (hold == LaunchHold::kExhausted ? 1 : 0) ||
+                     probe.connects != (hold == LaunchHold::kClose ||
+                                       hold == LaunchHold::kExhausted ? 0 : 1)))
+        passed = Fail(detail, "late or duplicate launch callbacks");
+      if (mode == V8HOST_BROKER_DEDICATED) {
+        if (passed && (hold == LaunchHold::kClose || hold == LaunchHold::kExhausted) && !Cancelled())
+          passed = Fail(detail, "dedicated candidate not cancelled at destruction");
+        if (::WaitForSingleObject(process, passed ? 8000 : 0) != WAIT_OBJECT_0) {
+          passed = Fail(detail, "dedicated candidate did not exit");
+          ReapFailedDedicated();
+        }
+      } else {
+        if (passed && ::WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
+          passed = Fail(detail, "shared candidate exited before idle grace");
+        if (::WaitForSingleObject(process, 10000) != WAIT_OBJECT_0) {
+          passed = Fail(detail, "shared candidate idle exit timed out");
+          g_launch_abort = true;
+        } else {
+          DWORD code = STILL_ACTIVE;
+          if (!::GetExitCodeProcess(process, &code) || code != 0)
+            passed = Fail(detail, "shared candidate exit was not idle success");
+        }
+      }
+      DWORD code = STILL_ACTIVE;
+      ::GetExitCodeProcess(process, &code);
+      *detail += " pid=" + std::to_string(::GetProcessId(process)) +
+          " exit=" + std::to_string(code) + " shift=" + std::to_string(shifted - d0) +
+          " bracket=[" + std::to_string(d0 + launch_exit - launch_enter) + "," +
+          std::to_string(d0 + observed_at - before_exit) + "] D=" + std::to_string(shifted) +
+          " hooks=" + std::to_string(before_count) + "/" + std::to_string(created_count) +
+          "/" + std::to_string(returned_count);
+    }
+    delete this;
+    return passed;
+  }
+  ~LaunchFixture() {
+    if (candidate.load()) ::CloseHandle(candidate.load());
+    for (HANDLE h : {in_launch, release, returned}) if (h) ::CloseHandle(h);
+  }
+};
+
+bool LaunchCase(std::string* detail, int mode, LaunchHold hold) {
+  auto* f = new LaunchFixture(mode, hold);
+  const bool passed = [&] {
+    if (!f->Init(detail) || !f->Start(detail)) return false;
+    if (hold == LaunchHold::kClose) {
+      const ULONGLONG close_start = ::GetTickCount64();
+      f->transport->Close();
+      const ULONGLONG close_end = ::GetTickCount64();
+      ::SetEvent(f->release);
+      if (close_end - close_start > 1000)
+        return Fail(detail, "Close blocked during launch");
+      const DWORD timeout = mode == V8HOST_BROKER_SHARED ? 2000 : 5000;
+      // Drop the test lease before observing background destruction.
+      f->transport.reset(); f->delegate.reset();
+      if (::WaitForSingleObject(f->probe.destroyed, timeout) != WAIT_OBJECT_0)
+        return Fail(detail, "post-release destruction exceeded bound");
+      if (!f->Hooks(detail)) return false;
+      return f->probe.connects == 0 && f->probe.losses == 0
+          ? true : Fail(detail, "callbacks after Close during launch");
+    }
+    if (::WaitForSingleObject(f->returned, 30000) != WAIT_OBJECT_0)
+      return Fail(detail, "rendezvous did not return");
+    if (!f->Hooks(detail)) return false;
+    if (hold == LaunchHold::kExhausted) {
+      if (::WaitForSingleObject(f->probe.disconnected, 5000) != WAIT_OBJECT_0 ||
+          f->probe.connects != 0 || f->probe.losses != 1 ||
+          f->probe.reason != TransportDisconnect::kConnectFailed ||
+          f->probe.disconnected_at - f->launch_exit > 3000 || !f->Cancelled())
+        return Fail(detail, "exhausted non-launch budget or joined cancellation");
+    } else {
+      if (::WaitForSingleObject(f->probe.connected, 5000) != WAIT_OBJECT_0 ||
+          f->probe.connects != 1 || !f->probe.conn || f->probe.losses != 0 ||
+          (hold == LaunchHold::kSlow && f->probe.connected_at - f->launch_exit > 5000))
+        return Fail(detail, "real launch did not connect within startup budget");
+    }
+    return true;
+  }();
+  return f->Finish(passed, detail);
+}
 
 struct PumpFixture {
   TransportProbe probe;
@@ -1846,7 +2062,7 @@ int main(int argc, char** argv) {
   g_main_init_status = v8host_client_initialize();
   SetInitializeAfterDispatcherHookForTesting(nullptr);
   racer.join();
-  const std::vector<TestCase> tests = {
+  std::vector<TestCase> tests = {
       {"transport", "control-id-send-order", ControlIdSendOrder},
       {"transport", "close-lifetime-no-replay", TransportCallbackClose},
       {"transport", "handshake-rejects", HandshakeRejects},
@@ -1861,6 +2077,18 @@ int main(int argc, char** argv) {
       {"transport", "queue-boundaries", TransportQueueBoundaries},
       {"transport", "malformed-message", TransportMalformed},
       {"transport", "preack-retry-policy", TransportRetry},
+      {"rendezvous", "real-dedicated-connects", [](std::string* d) {
+        return LaunchCase(d, V8HOST_BROKER_DEDICATED, LaunchHold::kObserve); }},
+      {"rendezvous", "slow-launch-dedicated-connects", [](std::string* d) {
+        return LaunchCase(d, V8HOST_BROKER_DEDICATED, LaunchHold::kSlow); }},
+      {"rendezvous", "slow-launch-deadline-shift", [](std::string* d) {
+        return LaunchCase(d, V8HOST_BROKER_DEDICATED, LaunchHold::kExhausted); }},
+      {"rendezvous", "slow-launch-close-no-orphan", [](std::string* d) {
+        return LaunchCase(d, V8HOST_BROKER_DEDICATED, LaunchHold::kClose); }},
+      {"rendezvous", "real-shared-connects", [](std::string* d) {
+        return LaunchCase(d, V8HOST_BROKER_SHARED, LaunchHold::kObserve); }},
+      {"rendezvous", "slow-launch-close-shared-survives", [](std::string* d) {
+        return LaunchCase(d, V8HOST_BROKER_SHARED, LaunchHold::kClose); }},
       {"init", "concurrent-thread-binding-destruction",
        ConcurrentInitializeLifecycle},
       {"validate", "struct-sizes", ValidateStructSizes},
@@ -1889,5 +2117,17 @@ int main(int argc, char** argv) {
       {"disconnect", "no-replay", DisconnectNoReplay},
       {"race", "inbound-vs-close", InboundVsCloseRace},
   };
+  for (auto& test : tests) {
+    auto run = std::move(test.run);
+    test.run = [run = std::move(run), suite = test.suite, name = test.name](std::string* detail) {
+      if (g_launch_abort) {
+        printf("FAIL - skipping %s/%s and remaining cases after launch teardown failure\n",
+               suite, name);
+        fflush(stdout);
+        ::ExitProcess(1);
+      }
+      return run(detail);
+    };
+  }
   return v8host::test::RunTests(argc, argv, tests);
 }

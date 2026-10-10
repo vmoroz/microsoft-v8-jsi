@@ -23,6 +23,28 @@ bool Stopped(HANDLE stop) {
   return stop && ::WaitForSingleObject(stop, 0) == WAIT_OBJECT_0;
 }
 
+constexpr DWORD kCandidateReapMs = 2000;
+
+// Terminate only our unconnected dedicated candidate (pre-connect); never shared
+// candidates, which may be the canonical broker.
+struct LaunchedCandidate {
+  LaunchedCandidate(HANDLE process, BrokerMode mode) : process(process), mode(mode) {}
+  LaunchedCandidate(const LaunchedCandidate&) = delete;
+  LaunchedCandidate& operator=(const LaunchedCandidate&) = delete;
+  LaunchedCandidate(LaunchedCandidate&&) = delete;
+  LaunchedCandidate& operator=(LaunchedCandidate&&) = delete;
+  ~LaunchedCandidate() {
+    if (!connected && mode == BrokerMode::kDedicated) {
+      ::TerminateProcess(process, ERROR_CANCELLED);
+      ::WaitForSingleObject(process, kCandidateReapMs);
+    }
+    ::CloseHandle(process);
+  }
+  HANDLE process;
+  BrokerMode mode;
+  bool connected = false;
+};
+
 bool IoWithDeadline(HANDLE pipe,
                     bool write,
                     void* buffer,
@@ -308,10 +330,19 @@ RendezvousStatus BrokerRendezvous::LaunchCandidate(
   return RendezvousStatus::kOk;
 }
 
+#ifdef V8HOST_CLIENT_TESTING
+void BrokerRendezvous::SetLaunchHookForTesting(LaunchHook hook, void* context) {
+  test_launch_ = hook;
+  test_context_ = context;
+}
+#endif
+
 RendezvousStatus BrokerRendezvous::ConnectOrLaunch(
-    BrokerConnection* connection, HANDLE stop, ULONGLONG deadline) {
-  if (!deadline) deadline = ::GetTickCount64() + 5000;
-  if (Stopped(stop) || !Remaining(deadline, 1)) return RendezvousStatus::kStartTimeout;
+    BrokerConnection* connection, HANDLE stop, ULONGLONG* deadline) {
+  ULONGLONG local = 0;
+  ULONGLONG& limit = deadline ? *deadline : local;
+  if (!limit) limit = ::GetTickCount64() + 5000;
+  if (Stopped(stop) || !Remaining(limit, 1)) return RendezvousStatus::kStartTimeout;
   if (!connection)
     return RendezvousStatus::kInvalidArgument;
   if (!initialized_) {
@@ -319,7 +350,7 @@ RendezvousStatus BrokerRendezvous::ConnectOrLaunch(
     if (status != RendezvousStatus::kOk)
       return status;
   }
-  if (Stopped(stop) || !Remaining(deadline, 1)) return RendezvousStatus::kStartTimeout;
+  if (Stopped(stop) || !Remaining(limit, 1)) return RendezvousStatus::kStartTimeout;
   if (mode_ == BrokerMode::kShared) {
     RendezvousStatus existing = TryConnect(nullptr, connection);
     if (existing == RendezvousStatus::kOk)
@@ -327,48 +358,55 @@ RendezvousStatus BrokerRendezvous::ConnectOrLaunch(
     if (existing == RendezvousStatus::kPeerAuthenticationFailed)
       return existing;
   }
-  if (Stopped(stop) || !Remaining(deadline, 1)) return RendezvousStatus::kStartTimeout;
+  if (Stopped(stop) || !Remaining(limit, 1)) return RendezvousStatus::kStartTimeout;
   PROCESS_INFORMATION candidate = {};
+#ifdef V8HOST_CLIENT_TESTING
+  if (test_launch_) test_launch_(test_context_, LaunchHookPoint::kBeforeCreate, nullptr, limit);
+#endif
+  const ULONGLONG launch_start = ::GetTickCount64();
   RendezvousStatus status = LaunchCandidate(&candidate);
+#ifdef V8HOST_CLIENT_TESTING
+  if (status == RendezvousStatus::kOk && test_launch_)
+    test_launch_(test_context_, LaunchHookPoint::kCreated, candidate.hProcess, limit);
+#endif
+  limit += ::GetTickCount64() - launch_start;
   if (status != RendezvousStatus::kOk)
     return status;
   ::CloseHandle(candidate.hThread);
+  LaunchedCandidate owned(candidate.hProcess, mode_);
   DWORD delay = 10;
-  while (!Stopped(stop) && ::GetTickCount64() < deadline) {
+  while (!Stopped(stop) && ::GetTickCount64() < limit) {
     HANDLE binding = candidate.hProcess;
     DWORD exit_code = STILL_ACTIVE;
     if (::GetExitCodeProcess(candidate.hProcess, &exit_code) &&
         exit_code != STILL_ACTIVE) {
       if (mode_ == BrokerMode::kDedicated || exit_code != 0) {
-        ::CloseHandle(candidate.hProcess);
         return RendezvousStatus::kLaunchFailed;
       }
       binding = nullptr;
     }
     status = TryConnect(binding, connection);
     if (status == RendezvousStatus::kOk) {
-      ::CloseHandle(candidate.hProcess);
+      owned.connected = true;
       return status;
     }
     if (status == RendezvousStatus::kPeerAuthenticationFailed) {
       if (mode_ == BrokerMode::kShared &&
-          WaitIo(candidate.hProcess, stop, Remaining(deadline, 500))) {
+          WaitIo(candidate.hProcess, stop, Remaining(limit, 500))) {
         DWORD loser_exit = 1;
         if (::GetExitCodeProcess(candidate.hProcess, &loser_exit) &&
             loser_exit == 0) {
-          if (stop) ::WaitForSingleObject(stop, Remaining(deadline, delay));
-          else ::Sleep(Remaining(deadline, delay));
+          if (stop) ::WaitForSingleObject(stop, Remaining(limit, delay));
+          else ::Sleep(Remaining(limit, delay));
           continue;
         }
       }
-      ::CloseHandle(candidate.hProcess);
       return status;
     }
-    if (stop) ::WaitForSingleObject(stop, Remaining(deadline, delay));
-    else ::Sleep(Remaining(deadline, delay));
+    if (stop) ::WaitForSingleObject(stop, Remaining(limit, delay));
+    else ::Sleep(Remaining(limit, delay));
     delay = (std::min)(delay * 2, static_cast<DWORD>(250));
   }
-  ::CloseHandle(candidate.hProcess);
   return RendezvousStatus::kStartTimeout;
 }
 

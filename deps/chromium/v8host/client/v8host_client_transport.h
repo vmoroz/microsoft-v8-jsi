@@ -55,6 +55,7 @@ struct TransportParams {
   int32_t broker_mode = 0;
 #ifdef V8HOST_CLIENT_TESTING
   void* test_context = nullptr;
+  LaunchHook test_launch = nullptr;
   void (*test_pending)(void*, bool) = nullptr;
   RendezvousStatus (*test_connect)(void*, BrokerConnection*, HelloResult*, HANDLE,
                                    ULONGLONG) = nullptr;

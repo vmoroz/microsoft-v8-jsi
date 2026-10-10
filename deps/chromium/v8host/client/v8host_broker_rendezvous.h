@@ -54,11 +54,21 @@ class BrokerConnection {
   std::unique_ptr<State> state_;
 };
 
+#ifdef V8HOST_CLIENT_TESTING
+enum class LaunchHookPoint { kBeforeCreate, kCreated, kReturned };
+using LaunchHook = void (*)(void*, LaunchHookPoint, HANDLE, ULONGLONG);
+#endif
+
 class BrokerRendezvous {
  public:
   BrokerRendezvous(std::wstring payload_directory, BrokerMode mode);
+  // Process creation time is excluded from the startup budget; *deadline is
+  // extended by it. Signal stop to cancel; transport Close signals it.
   RendezvousStatus ConnectOrLaunch(BrokerConnection* connection,
-                                   HANDLE stop = nullptr, ULONGLONG deadline = 0);
+                                   HANDLE stop = nullptr, ULONGLONG* deadline = nullptr);
+#ifdef V8HOST_CLIENT_TESTING
+  void SetLaunchHookForTesting(LaunchHook hook, void* context);
+#endif
 
   const std::wstring& endpoint() const { return endpoint_; }
   const std::array<uint8_t, 32>& endpoint_key() const { return endpoint_key_; }
@@ -78,6 +88,10 @@ class BrokerRendezvous {
   std::array<uint8_t, 32> endpoint_key_ = {};
   std::wstring endpoint_;
   bool initialized_ = false;
+#ifdef V8HOST_CLIENT_TESTING
+  LaunchHook test_launch_ = nullptr;
+  void* test_context_ = nullptr;
+#endif
 };
 
 }  // namespace v8host

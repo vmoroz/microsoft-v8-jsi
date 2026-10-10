@@ -379,6 +379,8 @@ executable("v8host_client_tests") {
     "V8HOST_DISPATCHER_TESTING",
   ]
   libs = [ "user32.lib" ]
+  # Real rendezvous cases use the adjacent broker and plugin.
+  data_deps = [ ":v8host", "//sandbox_dll:sbox" ]
 }
 
 # Deterministic, in-process unit tests for the sbox_config builder: the

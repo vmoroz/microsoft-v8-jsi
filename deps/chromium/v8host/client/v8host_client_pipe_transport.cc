@@ -69,7 +69,10 @@ struct Pump {
     BrokerRendezvous rendezvous(params.payload_directory,
                                static_cast<BrokerMode>(params.broker_mode));
     HelloResult hello;
-    const ULONGLONG deadline = ::GetTickCount64() + 5000;
+#ifdef V8HOST_CLIENT_TESTING
+    rendezvous.SetLaunchHookForTesting(params.test_launch, params.test_context);
+#endif
+    ULONGLONG deadline = ::GetTickCount64() + 5000;
     RendezvousStatus status = RendezvousStatus::kStartTimeout;
     while (!Stopped() && ::GetTickCount64() < deadline) {
 #ifdef V8HOST_CLIENT_TESTING
@@ -78,7 +81,11 @@ struct Pump {
       } else
 #endif
       {
-        status = rendezvous.ConnectOrLaunch(&connection, stop, deadline);
+        status = rendezvous.ConnectOrLaunch(&connection, stop, &deadline);
+#ifdef V8HOST_CLIENT_TESTING
+        if (params.test_launch)
+          params.test_launch(params.test_context, LaunchHookPoint::kReturned, nullptr, deadline);
+#endif
         if (status == RendezvousStatus::kOk)
           status = connection.Handshake(1, &hello, stop, deadline);
       }
