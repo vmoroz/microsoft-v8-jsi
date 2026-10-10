@@ -1629,6 +1629,13 @@ bool LaunchCase(std::string* detail, int mode, LaunchHold hold) {
   return f->Finish(passed, detail);
 }
 
+// Keep the process oracle independent of the broker policy under test.
+constexpr ULONGLONG kExpectedPreConnectExpiryMs = 30000;
+constexpr ULONGLONG kExpiryAliveMs = kExpectedPreConnectExpiryMs - 3000;
+constexpr ULONGLONG kExpiryExitMs = kExpectedPreConnectExpiryMs + 3000;
+// Cover report/readiness bounds, the exit wait, and a failure-release margin.
+constexpr DWORD kExpiryReleaseMs = 30000 + 3000 + kExpiryExitMs + 5000;
+
 struct ExpiryHandle {
   HANDLE value = nullptr;
   ~ExpiryHandle() { if (value) ::CloseHandle(value); }
@@ -1697,7 +1704,7 @@ struct PreConnectFixture {
             &f.cleanup.value, PROCESS_TERMINATE, FALSE, 0))
       f.error = ::GetLastError();
     ::SetEvent(f.ready.value);
-    if (::WaitForSingleObject(f.release.value, 15000) != WAIT_OBJECT_0)
+    if (::WaitForSingleObject(f.release.value, kExpiryReleaseMs) != WAIT_OBJECT_0)
       f.error = ERROR_TIMEOUT;
   }
   bool Start(std::string* detail) {
@@ -1740,10 +1747,10 @@ bool DedicatedNoClientExpires(std::string* detail) {
     ULONGLONG ready_at = 0;
     if (!ExpiryListenerReady(f->broker.value, f->endpoint, &ready_at))
       return Fail(detail, "dedicated listener not ready/alive");
-    if (!ExpiryAliveUntil(f->broker.value, ready_at + 4000))
-      return Fail(detail, "unconnected dedicated broker expired before readiness + 4000 ms");
-    if (!ExpiryExitZero(f->broker.value, ready_at + 8000))
-      return Fail(detail, "unconnected dedicated broker did not naturally exit0 within 8000 ms");
+    if (!ExpiryAliveUntil(f->broker.value, ready_at + kExpiryAliveMs))
+      return Fail(detail, "unconnected dedicated broker expired before readiness + 27000 ms");
+    if (!ExpiryExitZero(f->broker.value, ready_at + kExpiryExitMs))
+      return Fail(detail, "unconnected dedicated broker did not naturally exit0 within 33000 ms");
     *detail = "pid=" + std::to_string(::GetProcessId(f->broker.value)) +
         " exit=0 connects=" + std::to_string(f->probe.connects.load()) +
         " ready-to-exit=" + std::to_string(::GetTickCount64() - ready_at);
@@ -1784,7 +1791,7 @@ struct OrphanHelper {
     DWORD written = 0;
     const bool sent = ::WriteFile(f.report, &report, sizeof(report), &written, nullptr) &&
         written == sizeof(report);
-    if (sent) ::WaitForSingleObject(f.release, 15000);
+    if (sent) ::WaitForSingleObject(f.release, kExpiryReleaseMs);
     // Exit without unwinding the unconnected candidate guard or calling Close.
     ::ExitProcess(sent && report.error == ERROR_SUCCESS ? 0 : 2);
   }
@@ -1900,12 +1907,12 @@ bool DedicatedClientExitOrphan(std::string* detail) {
     if (!::SetEvent(f.release.value) ||
         !ExpiryExitZero(f.helper.value, ::GetTickCount64() + 3000))
       return Fail(detail, "orphan helper successful process death");
-    if (!ExpiryAliveUntil(f.broker.value, ready_at + 4000))
-      return Fail(detail, "orphan broker expired before readiness + 4000 ms");
+    if (!ExpiryAliveUntil(f.broker.value, ready_at + kExpiryAliveMs))
+      return Fail(detail, "orphan broker expired before readiness + 27000 ms");
     if (::WaitForSingleObject(f.broker.value, 0) != WAIT_TIMEOUT)
       return Fail(detail, "orphan broker did not outlive helper");
-    if (!ExpiryExitZero(f.broker.value, ready_at + 8000))
-      return Fail(detail, "orphan broker did not naturally exit0 within 8000 ms");
+    if (!ExpiryExitZero(f.broker.value, ready_at + kExpiryExitMs))
+      return Fail(detail, "orphan broker did not naturally exit0 within 33000 ms");
     *detail = "helper_pid=" + std::to_string(::GetProcessId(f.helper.value)) +
         " helper_exit=0 broker_pid=" + std::to_string(f.report.pid) +
         " broker_exit=0 ready->client-exit->broker-exit=" +

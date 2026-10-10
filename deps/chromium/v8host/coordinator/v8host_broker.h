@@ -5,7 +5,7 @@
 #include <windows.h>
 #include <chrono>
 
-inline constexpr auto kDedicatedPreConnectExpiry = std::chrono::seconds(5);
+inline constexpr auto kDedicatedPreConnectExpiry = std::chrono::seconds(30);
 
 inline bool V8HostBrokerPreConnectExpired(
     bool dedicated, bool first_accept,

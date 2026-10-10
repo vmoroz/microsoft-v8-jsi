@@ -200,7 +200,7 @@ class BrokerService {
           pending = false;
         } else {
           ReapConnectionTasks();
-          // An unconnected dedicated broker exits after 5 s to reclaim a broker
+          // An unconnected dedicated broker exits after 30 s to reclaim a broker
           // whose launcher died before connecting. A starved client can lose this race.
           if (IdleExpired(&zero_since, &zero_timing) ||
               V8HostBrokerPreConnectExpired(mode_ == v8host::BrokerMode::kDedicated,

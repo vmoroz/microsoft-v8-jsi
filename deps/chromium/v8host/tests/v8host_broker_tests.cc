@@ -3636,9 +3636,11 @@ bool PendingAcceptCancellation(std::string *detail) {
 }
 bool DedicatedPreConnectExpiryPolicy(std::string* detail) {
   const std::chrono::steady_clock::time_point start{};
-  for (int ms : {0, 4999, 5000, 5001}) {
+  constexpr auto expiry_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(kDedicatedPreConnectExpiry).count();
+  for (auto ms : {decltype(expiry_ms){0}, expiry_ms - 1, expiry_ms, expiry_ms + 1}) {
     const auto now = start + std::chrono::milliseconds(ms);
-    if (V8HostBrokerPreConnectExpired(true, false, start, now) != (ms >= 5000) ||
+    if (V8HostBrokerPreConnectExpired(true, false, start, now) != (ms >= expiry_ms) ||
         V8HostBrokerPreConnectExpired(false, false, start, now) ||
         V8HostBrokerPreConnectExpired(true, true, start, now) ||
         V8HostBrokerPreConnectExpired(false, true, start, now)) {
@@ -3648,7 +3650,7 @@ bool DedicatedPreConnectExpiryPolicy(std::string* detail) {
   }
   // Pair an expired policy with both completed and uncompleted local accepts.
   return V8HostBrokerPreConnectExpired(true, false, start,
-      start + std::chrono::milliseconds(5000)) && PendingAcceptCancellation(detail);
+      start + kDedicatedPreConnectExpiry) && PendingAcceptCancellation(detail);
 }
 
 bool PendingAcceptPoll(std::string *detail) {
@@ -3971,7 +3973,9 @@ bool DedicatedOwnerExit(std::string* detail) {
     return false;
   const DWORD broker_pid = connection.broker_pid();
   HANDLE broker = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, broker_pid);
-  const bool alive = broker && ::WaitForSingleObject(broker, 5500) == WAIT_TIMEOUT;
+  // The policy test covers post-accept immunity beyond the full expiry.
+  // Here only exercise a live negotiated owner followed by prompt Close.
+  const bool alive = broker && ::WaitForSingleObject(broker, 500) == WAIT_TIMEOUT;
   if (broker) ::CloseHandle(broker);
   connection.Close();
   if (!alive) {
