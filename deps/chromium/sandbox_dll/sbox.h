@@ -22,6 +22,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
+
+#include "sbox_stela.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,54 +56,71 @@ typedef struct sbox_worker_s* sbox_worker;  // worker: the run context
 typedef struct sbox_broker_s* sbox_broker;
 typedef struct sbox_broker_worker_s* sbox_broker_worker;
 
-typedef enum {
-  sbox_status_ok = 0,
-  sbox_status_failed = 1,
-  sbox_status_version_mismatch = 2,
-  sbox_status_invalid_arg = 3,
-} sbox_status;
+/**
+ * Result codes. 0 is success; errors are grouped into bands by failure class,
+ * so a consumer can map an unknown code to its band (status & 0xF000):
+ * 0x1000 caller contract, 0x7000 the operation failed.
+ */
+SBOX_ENUM(int32_t, sbox_status){
+    sbox_status_ok = 0,
+    sbox_status_invalid_arg = 0x1001,      ///< bad argument, or a rejected setter
+    sbox_status_version_mismatch = 0x1002, ///< the host and plugin ABI versions differ
+    /// The operation failed. From sbox_broker_api.post_message it means nothing
+    /// was written.
+    sbox_status_failed = 0x7001,
+};
 
-// Message kinds on the duplex worker channel. string/binary are the engine's
-// opaque guest frames; sbox_msg_kind_lifecycle is container- or host-emitted and
-// plugin-FORBIDDEN (the worker-api post_message rejects it), so a
-// readiness marker can never be forged by the engine or a guest.
-typedef enum {
-  sbox_msg_kind_string = 0,
-  sbox_msg_kind_binary = 1,
-  sbox_msg_kind_lifecycle = 2,
-} sbox_msg_kind;
+/**
+ * Message kinds on the duplex worker channel. string and binary are the
+ * engine's opaque guest frames. lifecycle is container- or host-emitted and
+ * plugin-forbidden (the worker-api post_message rejects it), so a readiness
+ * marker can never be forged by the engine or a guest. The values are on the
+ * wire.
+ */
+SBOX_ENUM(int32_t, sbox_msg_kind){
+    sbox_msg_kind_string = 0,
+    sbox_msg_kind_binary = 1,
+    sbox_msg_kind_lifecycle = 2,
+};
 
-// Lifecycle payload: exactly four bytes, a little-endian u32 phase.
-// STARTUP/SECURITY are container observations; EXIT is broker-origin only.
-// Unknown phases are never delivered.
-typedef enum sbox_lifecycle_phase {
-  sbox_lifecycle_phase_startup = 1,
-  sbox_lifecycle_phase_security = 2,
-  sbox_lifecycle_phase_exit = 3,
-} sbox_lifecycle_phase;
+/**
+ * Lifecycle payload: exactly four bytes, a little-endian u32 phase. startup and
+ * security are container observations; exit is broker-origin only. Unknown
+ * phases are never delivered. The values are on the wire.
+ */
+SBOX_ENUM(int32_t, sbox_lifecycle_phase){
+    sbox_lifecycle_phase_startup = 1,
+    sbox_lifecycle_phase_security = 2,
+    sbox_lifecycle_phase_exit = 3,
+};
 
-typedef enum {
-  sbox_broker_mode_dedicated = 0,
-  sbox_broker_mode_shared = 1,
-} sbox_broker_mode;
+/** How the broker was started; see sbox_broker_start.mode. */
+SBOX_ENUM(int32_t, sbox_broker_mode){
+    sbox_broker_mode_dedicated = 0,
+    sbox_broker_mode_shared = 1,
+};
 
-// Mandatory integrity levels for set_integrity(initial, delayed). Mirrors the OS
-// integrity the container applies; the host maps these 1:1 to its internal enum.
-typedef enum {
-  sbox_integrity_level_low = 0,
-  sbox_integrity_level_untrusted = 1,
-} sbox_integrity_level;
+/**
+ * Mandatory integrity levels for set_integrity. Mirrors the OS integrity the
+ * container applies; the host maps these 1:1 to its internal enum.
+ */
+SBOX_ENUM(int32_t, sbox_integrity_level){
+    sbox_integrity_level_low = 0,
+    sbox_integrity_level_untrusted = 1,
+};
 
-// Restricted-token levels for set_tokens: the worker's initial token and its
-// lowered lockdown token (ordinary non-AppContainer mode). The host maps these
-// 1:1 to its internal enum (static_assert'd in sbox_config.cc).
-typedef enum {
-  sbox_token_level_lockdown = 0,                // null SID only; most restrictive
-  sbox_token_level_limited = 1,                 // restricting SIDs
-  sbox_token_level_interactive = 2,             // + Owner
-  sbox_token_level_restricted_non_admin = 3,    // keeps user/authenticated SIDs
-  sbox_token_level_restricted_same_access = 4,  // all SIDs (~ caller access); least restrictive
-} sbox_token_level;
+/**
+ * Restricted-token levels for set_tokens: the worker's initial token and its
+ * lowered lockdown token (ordinary non-AppContainer mode). The host maps these
+ * 1:1 to its internal enum (static_assert'd in sbox_config.cc).
+ */
+SBOX_ENUM(int32_t, sbox_token_level){
+    sbox_token_level_lockdown = 0,               ///< null SID only; most restrictive
+    sbox_token_level_limited = 1,                ///< restricting SIDs
+    sbox_token_level_interactive = 2,            ///< plus Owner
+    sbox_token_level_restricted_non_admin = 3,   ///< keeps user/authenticated SIDs
+    sbox_token_level_restricted_same_access = 4, ///< all SIDs; least restrictive
+};
 
 typedef void(SBOX_CDECL* sbox_message_cb)(void* ctx, sbox_msg_kind kind,
                                          const void* data, size_t len);

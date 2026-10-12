@@ -34,6 +34,23 @@
 
 bool V8HostEngineTestBatch(const std::vector<v8host::RunEnvelope> &, bool, size_t *, size_t *, size_t *);
 
+// v8host_client.h mirrors these sbox.h values without including it; the client
+// passes them through to the wire and the coordinator hands them to sbox raw.
+#define V8HOST_SAME_VALUE(a, b) \
+  static_assert(static_cast<int32_t>(a) == static_cast<int32_t>(b), #a " != " #b)
+V8HOST_SAME_VALUE(v8host_integrity_level_low, sbox_integrity_level_low);
+V8HOST_SAME_VALUE(v8host_integrity_level_untrusted, sbox_integrity_level_untrusted);
+V8HOST_SAME_VALUE(v8host_token_level_lockdown, sbox_token_level_lockdown);
+V8HOST_SAME_VALUE(v8host_token_level_limited, sbox_token_level_limited);
+V8HOST_SAME_VALUE(v8host_token_level_interactive, sbox_token_level_interactive);
+V8HOST_SAME_VALUE(v8host_token_level_restricted_non_admin, sbox_token_level_restricted_non_admin);
+V8HOST_SAME_VALUE(v8host_token_level_restricted_same_access, sbox_token_level_restricted_same_access);
+V8HOST_SAME_VALUE(v8host_message_kind_string, sbox_msg_kind_string);
+V8HOST_SAME_VALUE(v8host_message_kind_binary, sbox_msg_kind_binary);
+V8HOST_SAME_VALUE(v8host_broker_mode_dedicated, sbox_broker_mode_dedicated);
+V8HOST_SAME_VALUE(v8host_broker_mode_shared, sbox_broker_mode_shared);
+#undef V8HOST_SAME_VALUE
+
 namespace {
 
 using v8host::BrokerConnection;

@@ -22,9 +22,14 @@
 #ifndef V8HOST_CLIENT_H_
 #define V8HOST_CLIENT_H_
 
-#include <stddef.h>  // size_t
-#include <stdint.h>  // uint32_t, int32_t
+#include <stddef.h>
+#include <stdint.h>
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
 #include <wchar.h>   // wchar_t (as a type in C)
+
+#include "v8host_stela.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,70 +61,99 @@ extern "C" {
 // separately; this value is struct_size-checked against the loaded DLL.
 #define V8HOST_ABI_VERSION 1u
 
-// Broker mode (matches the wire endpoint_mode numbering).
-#define v8host_broker_mode_dedicated 0
-#define v8host_broker_mode_shared    1
+/** Broker mode. The values match the wire endpoint_mode numbering. */
+V8HOST_ENUM(int32_t, v8host_broker_mode){
+    v8host_broker_mode_dedicated = 0, ///< a broker owned by this session
+    v8host_broker_mode_shared = 1,    ///< a broker shared across sessions
+};
 
-// Security tier.
-#define v8host_tier_untrusted 0  // jitless + ACG (default)
-#define v8host_tier_trusted   1  // JIT, ACG off
+/** Security tier. */
+V8HOST_ENUM(int32_t, v8host_tier){
+    v8host_tier_untrusted = 0, ///< jitless plus ACG (default)
+    v8host_tier_trusted = 1,   ///< JIT, ACG off
+};
 
-// Session-state codes (v8host_session_state_cb `state`).
-#define v8host_session_state_creating               0
-#define v8host_session_state_ready                  1
-#define v8host_session_state_worker_startup_ready   2
-#define v8host_session_state_worker_security_ready  3
-#define v8host_session_state_closed                 4
+/** The worker's mandatory integrity level. The values are sbox's. */
+V8HOST_ENUM(int32_t, v8host_integrity_level){
+    v8host_integrity_level_low = 0,
+    v8host_integrity_level_untrusted = 1,
+};
 
-// Run-event codes (v8host_run_event_cb `event`). All except STARTED are terminal.
-#define v8host_run_event_started        0
-#define v8host_run_event_completed      1
-#define v8host_run_event_failed         2
-#define v8host_run_event_cancelled      3
-#define v8host_run_event_worker_exited  4
-#define v8host_run_event_broker_lost    5
+/**
+ * Restricted-token levels for ordinary (non-AppContainer) mode, from most to
+ * least restrictive. The values are sbox's.
+ */
+V8HOST_ENUM(int32_t, v8host_token_level){
+    v8host_token_level_lockdown = 0,               ///< null SID only
+    v8host_token_level_limited = 1,                ///< restricting SIDs
+    v8host_token_level_interactive = 2,            ///< plus Owner
+    v8host_token_level_restricted_non_admin = 3,   ///< keeps user SIDs
+    v8host_token_level_restricted_same_access = 4, ///< all SIDs
+};
 
-// Stable result codes. 0 is success; errors are grouped into stable bands by
-// failure class so new codes can be added to a band without renumbering:
-//   0x1000 - caller/argument contract and quotas (fail-closed)
-//   0x2000 - lifecycle/state and local resources
-//   0x3000 - broker transport / connection
-//   0x4000 - asynchronous session/run terminal conditions
-//   0x7000 - unexpected internal failure
-// The enum is pinned to 32-bit int (see V8HOST_STATUS_FORCE_INT32), so these
-// codes are ABI-compatible with a plain int return.
-typedef enum v8host_status {
-  v8host_status_ok = 0,  // success; for async calls, inputs were validated and accepted
+/** The kind of a relay message frame. */
+V8HOST_ENUM(int32_t, v8host_message_kind){
+    v8host_message_kind_string = 0, ///< a string frame
+    v8host_message_kind_binary = 1, ///< a binary frame
+};
 
-  // 0x1000 - caller/argument contract and quotas (fail-closed).
-  v8host_status_invalid_arg = 0x1001,  // NULL/invalid pointer, enum, or count/pair
-  v8host_status_invalid_struct_size = 0x1002,  // struct_size < required v1 size
-  v8host_status_version_mismatch     = 0x1003,  // client API / loaded-DLL ABI incompatible
-  v8host_status_quota_exceeded       = 0x1004,  // a documented cap exceeded (e.g. 64/64)
+/** Session states, reported through v8host_session_state_cb. */
+V8HOST_ENUM(int32_t, v8host_session_state){
+    v8host_session_state_creating = 0,
+    v8host_session_state_ready = 1,
+    v8host_session_state_worker_startup_ready = 2,
+    v8host_session_state_worker_security_ready = 3,
+    v8host_session_state_closed = 4,
+};
 
-  // 0x2000 - lifecycle/state and local resources.
-  v8host_status_not_initialized = 0x2001,  // called before v8host_initialize
-  v8host_status_invalid_state   = 0x2002,  // handle closed/invalid for the operation
-  v8host_status_no_memory       = 0x2003,  // local allocation failed
+/**
+ * Run events, reported through v8host_run_event_cb. Every event except
+ * started is terminal.
+ */
+V8HOST_ENUM(int32_t, v8host_run_event){
+    v8host_run_event_started = 0,
+    v8host_run_event_completed = 1,
+    v8host_run_event_failed = 2,
+    v8host_run_event_cancelled = 3,
+    v8host_run_event_worker_exited = 4,
+    v8host_run_event_broker_lost = 5,
+};
 
-  // 0x3000 - broker transport / connection.
-  v8host_status_connect_failed     = 0x3001,  // rendezvous / connect-or-launch failed
-  v8host_status_protocol_error    = 0x3002,  // malformed or unexpected wire traffic
-  v8host_status_broker_lost = 0x3003,  // broker transport dropped (terminal)
+/**
+ * Result codes. 0 is success. Errors are grouped into bands by failure class,
+ * so new codes can be added to a band without renumbering, and a consumer can
+ * map an unknown code to its band (status & 0xF000):
+ * - 0x1000: the caller's contract and quotas (fail-closed);
+ * - 0x2000: lifecycle, state, and local resources;
+ * - 0x3000: the broker transport and connection;
+ * - 0x4000: asynchronous session and run terminal conditions;
+ * - 0x7000: an unexpected internal failure.
+ */
+V8HOST_ENUM(int32_t, v8host_status){
+    /// Success. For asynchronous calls, the inputs were validated and accepted.
+    v8host_status_ok = 0,
 
-  // 0x4000 - asynchronous session/run terminal conditions.
-  v8host_status_run_terminal          = 0x4001,  // post/cancel on an ended run
-  v8host_status_callback_backpressure = 0x4002,  // app thread not draining callbacks
-  v8host_status_profile_already_bound = 0x4003,  // a later start_run's tier/engine/
-                                            // snapshot conflicts with the
-                                            // profile bound by the first run
+    v8host_status_invalid_arg = 0x1001,         ///< NULL or invalid pointer, enum, length, or text
+    v8host_status_invalid_struct_size = 0x1002, ///< struct_size is below the version 1 size
+    v8host_status_version_mismatch = 0x1003,    ///< the consumer's ABI version is newer than the DLL's
+    v8host_status_quota_exceeded = 0x1004,      ///< a documented cap was exceeded (for example 64)
 
-  // 0x7000 - unexpected internal failure.
-  v8host_status_internal_error = 0x7001,
+    v8host_status_not_initialized = 0x2001, ///< called before v8host_initialize
+    v8host_status_invalid_state = 0x2002,   ///< the handle is closed or invalid for the operation
+    v8host_status_no_memory = 0x2003,       ///< a local allocation failed
 
-  // Not a status value: pins the enum to 32-bit int for a stable ABI.
-  V8HOST_STATUS_FORCE_INT32 = 0x7fffffff
-} v8host_status;
+    v8host_status_connect_failed = 0x3001, ///< rendezvous or connect-or-launch failed
+    v8host_status_protocol_error = 0x3002, ///< malformed or unexpected wire traffic
+    v8host_status_broker_lost = 0x3003,    ///< the broker transport dropped (terminal)
+
+    v8host_status_run_terminal = 0x4001,          ///< post or cancel on an ended run
+    v8host_status_callback_backpressure = 0x4002, ///< the app thread isn't draining callbacks
+    /// A later run's tier, engine, or snapshot conflicts with the profile that
+    /// the session's first run bound.
+    v8host_status_profile_already_bound = 0x4003,
+
+    v8host_status_internal_error = 0x7001, ///< an unexpected internal failure
+};
 
 // Versioning discipline for the input and callback structs below: a caller sets
 // struct_size = sizeof(T) before passing a struct in. The DLL rejects a struct
