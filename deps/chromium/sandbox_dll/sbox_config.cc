@@ -46,13 +46,15 @@ bool IsBareFilename(const std::wstring& name) {
 // --- sbox_config_api setters (contract in sbox.h). Each returns sbox_status and,
 // on rejection, poisons the builder so a later MarshalSboxConfig refuses to
 // spawn. A null builder is a caller bug (args) and does not poison anything. ---
-sbox_status SBOX_CDECL CfgSetAcg(sbox_config c, int enable) {
+sbox_status SBOX_CDECL CfgSetAcg(sbox_config c, bool enabled) {
   if (!c)
     return sbox_status_invalid_arg;
-  c->acg = enable != 0;
+  c->acg = enabled;
   return sbox_status_ok;
 }
-sbox_status SBOX_CDECL CfgSetIntegrity(sbox_config c, int initial, int delayed) {
+sbox_status SBOX_CDECL CfgSetIntegrity(sbox_config c,
+                                       sbox_integrity_level initial,
+                                       sbox_integrity_level delayed) {
   if (!c)
     return sbox_status_invalid_arg;
   if (!IsKnownIntegrity(initial) || !IsKnownIntegrity(delayed))
@@ -61,8 +63,9 @@ sbox_status SBOX_CDECL CfgSetIntegrity(sbox_config c, int initial, int delayed) 
   c->delayed_integrity = delayed;
   return sbox_status_ok;
 }
-sbox_status SBOX_CDECL CfgSetTokens(sbox_config c, int initial_token,
-                                   int lockdown_token) {
+sbox_status SBOX_CDECL CfgSetTokens(sbox_config c,
+                                    sbox_token_level initial_token,
+                                    sbox_token_level lockdown_token) {
   if (!c)
     return sbox_status_invalid_arg;
   if (!IsKnownToken(initial_token) || !IsKnownToken(lockdown_token))
@@ -71,70 +74,72 @@ sbox_status SBOX_CDECL CfgSetTokens(sbox_config c, int initial_token,
   c->lockdown_token = lockdown_token;
   return sbox_status_ok;
 }
-sbox_status SBOX_CDECL CfgAddFileRule(sbox_config c, const wchar_t* pattern,
-                                     int readonly) {
+sbox_status SBOX_CDECL CfgAddFileRule(sbox_config c,
+                                      const sbox_char16* pattern,
+                                      bool readonly) {
   if (!c)
     return sbox_status_invalid_arg;
   if (!pattern || !pattern[0])
     return Poison(c, sbox_status_invalid_arg);
   if (c->file_patterns.size() >= kSboxMaxFileRules)
     return Poison(c, sbox_status_failed);  // quota
-  c->file_patterns.emplace_back(pattern);
+  c->file_patterns.emplace_back(SboxToWide(pattern));
   c->file_readonly.push_back(readonly ? 1 : 0);
   return sbox_status_ok;
 }
-sbox_status SBOX_CDECL CfgAddCapability(sbox_config c, const wchar_t* sid) {
+sbox_status SBOX_CDECL CfgAddCapability(sbox_config c,
+                                        const sbox_char16* sid) {
   if (!c)
     return sbox_status_invalid_arg;
   if (!sid || !sid[0])
     return Poison(c, sbox_status_invalid_arg);
   if (c->capabilities.size() >= kSboxMaxCapabilities)
     return Poison(c, sbox_status_failed);  // quota
-  c->capabilities.emplace_back(sid);
+  c->capabilities.emplace_back(SboxToWide(sid));
   return sbox_status_ok;
 }
-sbox_status SBOX_CDECL CfgSetAppContainer(sbox_config c, int enable, int lpac,
-                                         const wchar_t* profile) {
+sbox_status SBOX_CDECL CfgSetAppContainer(sbox_config c,
+                                          bool enabled,
+                                          bool lpac,
+                                          const sbox_char16* profile) {
   if (!c)
     return sbox_status_invalid_arg;
-  const bool want_ac = enable != 0;
-  const bool want_lpac = lpac != 0;
   const bool have_profile = profile && profile[0];
   // An empty profile is legal only when AppContainer is off; LPAC implies
   // AppContainer. Reject (and poison) the illegal single-call combinations.
-  if (want_ac && !have_profile)
+  if (enabled && !have_profile)
     return Poison(c, sbox_status_invalid_arg);
-  if (want_lpac && !want_ac)
+  if (lpac && !enabled)
     return Poison(c, sbox_status_invalid_arg);
-  c->use_app_container = want_ac;
-  c->lpac = want_lpac;
-  c->profile = have_profile ? profile : L"";
+  c->use_app_container = enabled;
+  c->lpac = lpac;
+  c->profile = have_profile ? SboxToWide(profile) : L"";
   return sbox_status_ok;
 }
-sbox_status SBOX_CDECL CfgAllowEngineDll(sbox_config c, const wchar_t* filename) {
+sbox_status SBOX_CDECL CfgAllowEngineDll(sbox_config c,
+                                         const sbox_char16* filename) {
   if (!c)
     return sbox_status_invalid_arg;
-  if (!filename || !IsBareFilename(filename))
+  if (!filename || !IsBareFilename(SboxToWide(filename)))
     return Poison(c, sbox_status_invalid_arg);
-  c->engine_dlls.emplace_back(filename);
+  c->engine_dlls.emplace_back(SboxToWide(filename));
   return sbox_status_ok;
 }
 sbox_status SBOX_CDECL CfgSetPluginData(sbox_config c, const void* data,
-                                       size_t len) {
+                                        size_t size) {
   if (!c)
     return sbox_status_invalid_arg;
-  if (len > kSboxMaxPluginData)
+  if (size > kSboxMaxPluginData)
     return Poison(c, sbox_status_failed);  // quota
-  if (data && len)
-    c->plugin_data.assign(static_cast<const char*>(data), len);
+  if (data && size)
+    c->plugin_data.assign(static_cast<const char*>(data), size);
   else
     c->plugin_data.clear();
   return sbox_status_ok;
 }
 
 sbox_config_api MakeConfigApi() {
-  sbox_config_api api = {};
-  api.struct_size = sizeof(api);
+  sbox_config_api api = SBOX_CONFIG_API_INIT;
   api.set_acg = &CfgSetAcg;
   api.set_integrity = &CfgSetIntegrity;
   api.add_file_rule = &CfgAddFileRule;

@@ -66,6 +66,22 @@ struct SessionConfigCopy {
   std::vector<std::wstring> capabilities;
 };
 
+struct v8host_config_s {
+  SessionConfigCopy config;
+  v8host_status status = v8host_status_ok;
+};
+
+struct v8host_run_config_s {
+  bool has_tier = false;
+  int32_t tier = 0;
+  bool has_engine = false;
+  std::wstring engine;
+  bool has_snapshot = false;
+  std::wstring snapshot;
+  std::vector<uint8_t> payload;
+  v8host_status status = v8host_status_ok;
+};
+
 struct v8host_session_s {
   std::atomic<int> refcount{1};
   std::shared_ptr<v8host::client::ClientConnection> conn;
@@ -840,71 +856,132 @@ protocol::FrameHeader MakeHeader(ClientConnection* conn,
   return header;
 }
 
-v8host_status ValidateAndCopyConfig(const V8HostSessionConfig* config,
-                                   SessionConfigCopy* copy) {
-  if (config == nullptr)
-    return v8host_status_invalid_arg;
-  if (config->struct_size < sizeof(V8HostSessionConfig))
-    return v8host_status_invalid_struct_size;
-  if ((config->broker_mode != v8host_broker_mode_dedicated &&
-       config->broker_mode != v8host_broker_mode_shared) ||
-      (config->tier != v8host_tier_untrusted &&
-       config->tier != v8host_tier_trusted)) {
-    return v8host_status_invalid_arg;
-  }
-  if (config->file_rule_count > protocol::kMaxFileRules ||
-      config->capability_count > protocol::kMaxCapabilities) {
-    return v8host_status_quota_exceeded;
-  }
-  if (!CountPairValid(config->file_rules, config->file_rule_count) ||
-      !CountPairValid(config->capabilities, config->capability_count)) {
-    return v8host_status_invalid_arg;
-  }
-  const bool app_container = config->use_app_container != 0;
-  const bool has_profile = config->app_container_profile_name != nullptr &&
-                           config->app_container_profile_name[0] != L'\0';
+v8host_status ValidateSessionConfig(const SessionConfigCopy& config) {
+  const bool app_container = config.use_app_container != 0;
+  const bool has_profile = !config.app_container_profile_name.empty();
   if ((app_container && !has_profile) ||
-      (!app_container && (has_profile || config->capability_count != 0)) ||
-      (config->low_privilege_app_container != 0 && !app_container)) {
+      (!app_container && (has_profile || !config.capabilities.empty())) ||
+      (config.low_privilege_app_container != 0 && !app_container)) {
     return v8host_status_invalid_arg;
   }
+  return v8host_status_ok;
+}
 
-  std::string utf8;
-  for (size_t i = 0; i < config->file_rule_count; ++i) {
-    const V8HostFileRule& rule = config->file_rules[i];
-    v8host_status status = WideToUtf8(rule.pattern, false, &utf8);
-    if (status != v8host_status_ok)
-      return status;
+static_assert(sizeof(wchar_t) == sizeof(v8host_char16),
+              "v8host_char16 must match the Windows wchar_t representation");
+
+// Copies consumer control-plane text into `out`. Rejects NULL, embedded NULs,
+// unpaired surrogates, and text whose UTF-8 form exceeds kMaxStringBytes.
+v8host_status CopyUtf16(const v8host_char16* value,
+                        size_t length,
+                        std::wstring* out) {
+  if (value == nullptr)
+    return v8host_status_invalid_arg;
+  if (length == V8HOST_AUTO_LENGTH) {
+    length = std::char_traits<char16_t>::length(value);
+  } else if (std::char_traits<char16_t>::find(value, length, u'\0') !=
+             nullptr) {
+    return v8host_status_invalid_arg;
   }
-  v8host_status status =
-      WideToUtf8(config->app_container_profile_name, true, &utf8);
+  std::wstring text(reinterpret_cast<const wchar_t*>(value), length);
+  std::string utf8;
+  const v8host_status status = WideToUtf8(text.c_str(), false, &utf8);
   if (status != v8host_status_ok)
     return status;
-  for (size_t i = 0; i < config->capability_count; ++i) {
-    status = WideToUtf8(config->capabilities[i], false, &utf8);
-    if (status != v8host_status_ok || utf8.empty())
-      return status == v8host_status_ok ? v8host_status_invalid_arg : status;
-  }
+  *out = std::move(text);
+  return v8host_status_ok;
+}
 
-  copy->broker_mode = config->broker_mode;
-  copy->tier = config->tier;
-  copy->integrity = config->integrity;
-  copy->delayed_integrity = config->delayed_integrity;
-  copy->initial_token = config->initial_token;
-  copy->lockdown_token = config->lockdown_token;
-  copy->prohibit_dynamic_code = config->prohibit_dynamic_code;
-  copy->use_app_container = config->use_app_container;
-  copy->low_privilege_app_container = config->low_privilege_app_container;
-  if (config->app_container_profile_name != nullptr)
-    copy->app_container_profile_name = config->app_container_profile_name;
-  copy->file_rules.reserve(config->file_rule_count);
-  for (size_t i = 0; i < config->file_rule_count; ++i) {
-    copy->file_rules.push_back(
-        {config->file_rules[i].pattern, config->file_rules[i].readonly});
+// As CopyUtf16, for UTF-8 input; invalid UTF-8 is v8host_status_invalid_arg.
+v8host_status CopyUtf8(const char* value, size_t length, std::wstring* out) {
+  if (value == nullptr)
+    return v8host_status_invalid_arg;
+  if (length == V8HOST_AUTO_LENGTH) {
+    length = std::strlen(value);
+  } else if (std::memchr(value, '\0', length) != nullptr) {
+    return v8host_status_invalid_arg;
   }
-  copy->capabilities.reserve(config->capability_count);
-  for (size_t i = 0; i < config->capability_count; ++i)
-    copy->capabilities.emplace_back(config->capabilities[i]);
+  if (length > protocol::kMaxStringBytes)
+    return v8host_status_quota_exceeded;
+  std::wstring text;
+  if (length != 0) {
+    const int chars =
+        ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value,
+                              static_cast<int>(length), nullptr, 0);
+    if (chars <= 0)
+      return v8host_status_invalid_arg;
+    text.resize(chars);
+    if (::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value,
+                              static_cast<int>(length), text.data(),
+                              chars) != chars) {
+      return v8host_status_invalid_arg;
+    }
+  }
+  *out = std::move(text);
+  return v8host_status_ok;
+}
+
+// Runs one setter against a builder: a NULL builder is v8host_status_invalid_arg
+// (nothing to poison), a poisoned builder returns its stored status unchanged,
+// and the first failure poisons the builder.
+template <typename Builder, typename Setter>
+v8host_status ApplySetter(Builder* builder, Setter&& setter) {
+  if (builder == nullptr)
+    return v8host_status_invalid_arg;
+  if (builder->status != v8host_status_ok)
+    return builder->status;
+  const v8host_status status = setter(*builder);
+  if (status != v8host_status_ok)
+    builder->status = status;
+  return status;
+}
+
+bool IsValidTier(v8host_tier value) {
+  return value == v8host_tier_untrusted || value == v8host_tier_trusted;
+}
+
+bool IsValidIntegrityLevel(v8host_integrity_level value) {
+  return value == v8host_integrity_level_low ||
+         value == v8host_integrity_level_untrusted;
+}
+
+bool IsValidTokenLevel(v8host_token_level value) {
+  const int32_t level = static_cast<int32_t>(value);
+  return level >= v8host_token_level_lockdown &&
+         level <= v8host_token_level_restricted_same_access;
+}
+
+v8host_status AddFileRule(v8host_config_s& builder,
+                          std::wstring pattern,
+                          bool readonly) {
+  if (builder.config.file_rules.size() >= protocol::kMaxFileRules)
+    return v8host_status_quota_exceeded;
+  builder.config.file_rules.push_back({std::move(pattern), readonly ? 1 : 0});
+  return v8host_status_ok;
+}
+
+v8host_status AddCapability(v8host_config_s& builder, std::wstring sid) {
+  if (sid.empty())
+    return v8host_status_invalid_arg;
+  if (builder.config.capabilities.size() >= protocol::kMaxCapabilities)
+    return v8host_status_quota_exceeded;
+  builder.config.capabilities.push_back(std::move(sid));
+  return v8host_status_ok;
+}
+
+v8host_status SetEngineDll(v8host_run_config_s& builder, std::wstring name) {
+  if (!IsBareFilename(name))
+    return v8host_status_invalid_arg;
+  builder.has_engine = true;
+  builder.engine = std::move(name);
+  return v8host_status_ok;
+}
+
+v8host_status SetSnapshotPath(v8host_run_config_s& builder, std::wstring path) {
+  if (path.empty())
+    return v8host_status_invalid_arg;
+  builder.has_snapshot = true;
+  builder.snapshot = std::move(path);
   return v8host_status_ok;
 }
 
@@ -947,24 +1024,289 @@ void v8host_session_s::Release() {
 
 extern "C" {
 
-v8host_status V8HOST_CDECL v8host_initialize(void) {
+v8host_status V8HOST_CDECL v8host_initialize(uint32_t abi_version) {
+  if (abi_version == 0 || abi_version > V8HOST_ABI_VERSION)
+    return v8host_status_version_mismatch;
   return v8host::client::ClientRuntime::Instance().Initialize();
 }
 
+v8host_status V8HOST_CDECL v8host_config_set_broker_mode(
+    v8host_config config,
+    v8host_broker_mode value) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    if (value != v8host_broker_mode_dedicated &&
+        value != v8host_broker_mode_shared) {
+      return v8host_status_invalid_arg;
+    }
+    builder.config.broker_mode = value;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_set_tier(v8host_config config,
+                                                  v8host_tier value) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    if (!v8host::client::IsValidTier(value))
+      return v8host_status_invalid_arg;
+    builder.config.tier = value;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_set_integrity_level(
+    v8host_config config,
+    v8host_integrity_level value) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    if (!v8host::client::IsValidIntegrityLevel(value))
+      return v8host_status_invalid_arg;
+    builder.config.integrity = value;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_set_delayed_integrity_level(
+    v8host_config config,
+    v8host_integrity_level value) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    if (!v8host::client::IsValidIntegrityLevel(value))
+      return v8host_status_invalid_arg;
+    builder.config.delayed_integrity = value;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_set_initial_token_level(
+    v8host_config config,
+    v8host_token_level value) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    if (!v8host::client::IsValidTokenLevel(value))
+      return v8host_status_invalid_arg;
+    builder.config.initial_token = value;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_set_lockdown_token_level(
+    v8host_config config,
+    v8host_token_level value) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    if (!v8host::client::IsValidTokenLevel(value))
+      return v8host_status_invalid_arg;
+    builder.config.lockdown_token = value;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_set_prohibit_dynamic_code(
+    v8host_config config,
+    bool value) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    builder.config.prohibit_dynamic_code = value ? 1 : 0;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_add_file_rule_utf8(
+    v8host_config config,
+    const char* pattern,
+    size_t length,
+    bool readonly) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    std::wstring text;
+    const v8host_status status =
+        v8host::client::CopyUtf8(pattern, length, &text);
+    if (status != v8host_status_ok)
+      return status;
+    return v8host::client::AddFileRule(builder, std::move(text), readonly);
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_add_file_rule_utf16(
+    v8host_config config,
+    const v8host_char16* pattern,
+    size_t length,
+    bool readonly) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    std::wstring text;
+    const v8host_status status =
+        v8host::client::CopyUtf16(pattern, length, &text);
+    if (status != v8host_status_ok)
+      return status;
+    return v8host::client::AddFileRule(builder, std::move(text), readonly);
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_set_use_app_container(
+    v8host_config config,
+    bool value) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    builder.config.use_app_container = value ? 1 : 0;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_set_low_privilege_app_container(
+    v8host_config config,
+    bool value) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    builder.config.low_privilege_app_container = value ? 1 : 0;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_set_profile_name_utf8(
+    v8host_config config,
+    const char* value,
+    size_t length) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    return v8host::client::CopyUtf8(
+        value, length, &builder.config.app_container_profile_name);
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_set_profile_name_utf16(
+    v8host_config config,
+    const v8host_char16* value,
+    size_t length) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    return v8host::client::CopyUtf16(
+        value, length, &builder.config.app_container_profile_name);
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_add_capability_utf8(
+    v8host_config config,
+    const char* value,
+    size_t length) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    std::wstring text;
+    const v8host_status status = v8host::client::CopyUtf8(value, length, &text);
+    if (status != v8host_status_ok)
+      return status;
+    return v8host::client::AddCapability(builder, std::move(text));
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_config_add_capability_utf16(
+    v8host_config config,
+    const v8host_char16* value,
+    size_t length) {
+  return v8host::client::ApplySetter(config, [&](v8host_config_s& builder) {
+    std::wstring text;
+    const v8host_status status =
+        v8host::client::CopyUtf16(value, length, &text);
+    if (status != v8host_status_ok)
+      return status;
+    return v8host::client::AddCapability(builder, std::move(text));
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_run_config_set_tier(v8host_run_config config,
+                                                      v8host_tier value) {
+  return v8host::client::ApplySetter(config, [&](v8host_run_config_s& builder) {
+    if (!v8host::client::IsValidTier(value))
+      return v8host_status_invalid_arg;
+    builder.has_tier = true;
+    builder.tier = value;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_run_config_set_engine_dll_utf8(
+    v8host_run_config config,
+    const char* value,
+    size_t length) {
+  return v8host::client::ApplySetter(config, [&](v8host_run_config_s& builder) {
+    std::wstring text;
+    const v8host_status status = v8host::client::CopyUtf8(value, length, &text);
+    if (status != v8host_status_ok)
+      return status;
+    return v8host::client::SetEngineDll(builder, std::move(text));
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_run_config_set_engine_dll_utf16(
+    v8host_run_config config,
+    const v8host_char16* value,
+    size_t length) {
+  return v8host::client::ApplySetter(config, [&](v8host_run_config_s& builder) {
+    std::wstring text;
+    const v8host_status status =
+        v8host::client::CopyUtf16(value, length, &text);
+    if (status != v8host_status_ok)
+      return status;
+    return v8host::client::SetEngineDll(builder, std::move(text));
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_run_config_set_startup_snapshot_path_utf8(
+    v8host_run_config config,
+    const char* value,
+    size_t length) {
+  return v8host::client::ApplySetter(config, [&](v8host_run_config_s& builder) {
+    std::wstring text;
+    const v8host_status status = v8host::client::CopyUtf8(value, length, &text);
+    if (status != v8host_status_ok)
+      return status;
+    return v8host::client::SetSnapshotPath(builder, std::move(text));
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_run_config_set_startup_snapshot_path_utf16(
+    v8host_run_config config,
+    const v8host_char16* value,
+    size_t length) {
+  return v8host::client::ApplySetter(config, [&](v8host_run_config_s& builder) {
+    std::wstring text;
+    const v8host_status status =
+        v8host::client::CopyUtf16(value, length, &text);
+    if (status != v8host_status_ok)
+      return status;
+    return v8host::client::SetSnapshotPath(builder, std::move(text));
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_run_config_set_payload(
+    v8host_run_config config,
+    const void* data,
+    size_t size) {
+  return v8host::client::ApplySetter(config, [&](v8host_run_config_s& builder) {
+    if (!v8host::client::CountPairValid(data, size))
+      return v8host_status_invalid_arg;
+    if (size > v8host::protocol::kMaxFramePayload)
+      return v8host_status_quota_exceeded;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    builder.payload.assign(bytes, bytes + size);
+    return v8host_status_ok;
+  });
+}
+
 v8host_status V8HOST_CDECL v8host_session_open(
-    const V8HostSessionConfig* config,
-    v8host_session_s** out_session) {
+    v8host_configure_session_cb configure,
+    void* user_data,
+    v8host_session* out_session) {
   if (out_session == nullptr)
     return v8host_status_invalid_arg;
   *out_session = nullptr;
   if (!v8host::client::ClientRuntime::Instance().IsInitialized())
     return v8host_status_not_initialized;
 
-  SessionConfigCopy config_copy;
-  v8host_status status =
-      v8host::client::ValidateAndCopyConfig(config, &config_copy);
+  std::unique_ptr<v8host_config_s> builder(new (std::nothrow) v8host_config_s());
+  if (!builder)
+    return v8host_status_no_memory;
+  v8host_status status = v8host_status_ok;
+  if (configure != nullptr) {
+    status = configure(user_data, builder.get());
+    if (status != v8host_status_ok)
+      return status;
+  }
+  if (builder->status != v8host_status_ok)
+    return builder->status;
+  status = v8host::client::ValidateSessionConfig(builder->config);
   if (status != v8host_status_ok)
     return status;
+  SessionConfigCopy config_copy = std::move(builder->config);
+  builder.reset();
 
   std::shared_ptr<v8host::client::ClientConnection> connection(
       new (std::nothrow) v8host::client::ClientConnection());
@@ -1012,7 +1354,7 @@ v8host_status V8HOST_CDECL v8host_session_open(
 }
 
 v8host_status V8HOST_CDECL v8host_session_set_callbacks(
-    v8host_session_s* session,
+    v8host_session session,
     const v8host_callbacks* callbacks) {
   if (session == nullptr || callbacks == nullptr)
     return v8host_status_invalid_arg;
@@ -1023,53 +1365,49 @@ v8host_status V8HOST_CDECL v8host_session_set_callbacks(
 }
 
 v8host_status V8HOST_CDECL v8host_session_start_run(
-    v8host_session_s* session,
-    const V8HostRunInputs* inputs,
-    v8host_run_s** out_run) {
+    v8host_session session,
+    v8host_configure_run_cb configure,
+    void* user_data,
+    v8host_run* out_run) {
   if (out_run == nullptr)
     return v8host_status_invalid_arg;
   *out_run = nullptr;
-  if (session == nullptr || inputs == nullptr)
+  if (session == nullptr)
     return v8host_status_invalid_arg;
-  if (inputs->struct_size < sizeof(V8HostRunInputs))
-    return v8host_status_invalid_struct_size;
-  if (inputs->tier_override < -1 || inputs->tier_override > 1)
-    return v8host_status_invalid_arg;
+
+  std::unique_ptr<v8host_run_config_s> inputs(
+      new (std::nothrow) v8host_run_config_s());
+  if (!inputs)
+    return v8host_status_no_memory;
+  v8host_status status = v8host_status_ok;
+  if (configure != nullptr) {
+    status = configure(user_data, inputs.get());
+    if (status != v8host_status_ok)
+      return status;
+  }
+  if (inputs->status != v8host_status_ok)
+    return inputs->status;
+  const int32_t tier_override = inputs->has_tier ? inputs->tier : -1;
   const int32_t effective_tier =
-      inputs->tier_override == -1 ? session->config.tier : inputs->tier_override;
+      tier_override == -1 ? session->config.tier : tier_override;
   if (effective_tier == v8host_tier_trusted &&
       session->config.prohibit_dynamic_code != 0) {
     return v8host_status_invalid_arg;
   }
-  if (!v8host::client::CountPairValid(inputs->payload, inputs->payload_len))
-    return v8host_status_invalid_arg;
 
-  std::wstring engine =
-      inputs->engine_dll_override != nullptr ? inputs->engine_dll_override : L"";
-  std::wstring snapshot = inputs->startup_snapshot_path != nullptr
-                              ? inputs->startup_snapshot_path
-                              : L"";
-  if (inputs->engine_dll_override != nullptr &&
-      !v8host::client::IsBareFilename(engine)) {
-    return v8host_status_invalid_arg;
-  }
-  if (inputs->startup_snapshot_path != nullptr && snapshot.empty())
-    return v8host_status_invalid_arg;
   std::string engine_utf8;
   std::string snapshot_utf8;
-  v8host_status status = v8host::client::WideToUtf8(
-      inputs->engine_dll_override, true, &engine_utf8);
+  status = v8host::client::WideToUtf8(inputs->engine.c_str(), false,
+                                      &engine_utf8);
   if (status != v8host_status_ok)
     return status;
-  status = v8host::client::WideToUtf8(inputs->startup_snapshot_path, true,
-                                     &snapshot_utf8);
+  status = v8host::client::WideToUtf8(inputs->snapshot.c_str(), false,
+                                      &snapshot_utf8);
   if (status != v8host_status_ok)
     return status;
-  if (inputs->payload_len > v8host::protocol::kMaxFramePayload)
-    return v8host_status_quota_exceeded;
   const size_t variable_size = sizeof(uint32_t) + engine_utf8.size() +
                                sizeof(uint32_t) + snapshot_utf8.size() +
-                               inputs->payload_len;
+                               inputs->payload.size();
   if (v8host::protocol::kStartRunFixedSize + variable_size >
       v8host::protocol::kMaxFramePayload) {
     return v8host_status_quota_exceeded;
@@ -1099,15 +1437,12 @@ v8host_status V8HOST_CDECL v8host_session_start_run(
   v8host_run_s* run_handle = run.get();
 
   v8host::protocol::StartRunPayload payload;
-  payload.tier_override = inputs->tier_override;
-  payload.has_engine_override = inputs->engine_dll_override != nullptr;
-  payload.has_snapshot = inputs->startup_snapshot_path != nullptr;
+  payload.tier_override = tier_override;
+  payload.has_engine_override = inputs->has_engine;
+  payload.has_snapshot = inputs->has_snapshot;
   payload.engine_filename = std::move(engine_utf8);
   payload.snapshot_path = std::move(snapshot_utf8);
-  if (inputs->payload_len != 0) {
-    const auto* bytes = static_cast<const uint8_t*>(inputs->payload);
-    payload.guest_payload.assign(bytes, bytes + inputs->payload_len);
-  }
+  payload.guest_payload = std::move(inputs->payload);
   session->runs.emplace(run->run_id, std::move(run));
   status = session->conn->SubmitControl(
       {v8host::client::PendingType::kStart, session->session_id, run_handle->run_id},
@@ -1125,13 +1460,16 @@ v8host_status V8HOST_CDECL v8host_session_start_run(
 }
 
 v8host_status V8HOST_CDECL v8host_run_post_message(
-    v8host_run_s* run,
-    int32_t kind,
+    v8host_run run,
+    v8host_message_kind kind,
     const void* data,
-    size_t len) {
-  if (run == nullptr || !v8host::client::CountPairValid(data, len))
+    size_t size) {
+  if (run == nullptr || !v8host::client::CountPairValid(data, size) ||
+      (kind != v8host_message_kind_string &&
+       kind != v8host_message_kind_binary)) {
     return v8host_status_invalid_arg;
-  if (len > v8host::protocol::kMaxFramePayload - sizeof(uint32_t))
+  }
+  if (size > v8host::protocol::kMaxFramePayload - sizeof(uint32_t))
     return v8host_status_quota_exceeded;
   if (run->terminal_local.load(std::memory_order_acquire))
     return v8host_status_run_terminal;
@@ -1145,12 +1483,12 @@ v8host_status V8HOST_CDECL v8host_run_post_message(
       session->conn.get(), session->session_id, run->run_id, 0, false);
   header.type = v8host::protocol::MessageType::RELAY_TO_WORKER;
   const auto frame = v8host::protocol::BuildRelayFrame(
-      header, kind, static_cast<const uint8_t*>(data), len);
+      header, kind, static_cast<const uint8_t*>(data), size);
   const v8host_status send_status = session->conn->Send(frame);
   return send_status;
 }
 
-v8host_status V8HOST_CDECL v8host_run_cancel(v8host_run_s* run) {
+v8host_status V8HOST_CDECL v8host_run_cancel(v8host_run run) {
   if (run == nullptr)
     return v8host_status_invalid_arg;
   if (run->terminal_local.load(std::memory_order_acquire))
@@ -1169,7 +1507,7 @@ v8host_status V8HOST_CDECL v8host_run_cancel(v8host_run_s* run) {
   return status;
 }
 
-void V8HOST_CDECL v8host_session_close(v8host_session_s* session) {
+void V8HOST_CDECL v8host_session_close(v8host_session session) {
   if (session == nullptr)
     return;
   {

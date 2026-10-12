@@ -2,6 +2,7 @@
 
 #include "v8host_broker_rendezvous.h"
 #include "v8host_client.h"
+#include "v8host_client_test_config.h"
 #include "v8host_broker.h"
 #include "v8host_file_identity.h"
 #include "v8host_payload_identity.h"
@@ -469,7 +470,7 @@ struct EngineFixture {
       auto &f = *reinterpret_cast<EngineFixture *>(worker);
       *data = f.profile.data(); *size = f.profile.size(); return sbox_status_ok;
     };
-    api.acg_enabled = [](sbox_worker) { return 1; };
+    api.acg_enabled = [](sbox_worker) { return true; };
     api.post_message = [](sbox_worker worker, sbox_msg_kind kind, const void *data, size_t size) -> sbox_status {
       auto &f = *reinterpret_cast<EngineFixture *>(worker);
       v8host::RunEnvelope env;
@@ -4453,6 +4454,7 @@ struct ContractCClient {
   decltype(&v8host_run_post_message) post = nullptr;
   decltype(&v8host_run_cancel) cancel = nullptr;
   decltype(&v8host_session_close) close = nullptr;
+  v8host::test::ConfigApi config_api;
   bool Load() {
     if (module) return true;
     const std::wstring path = ExecutableDirectory() + L"/v8host.dll";
@@ -4467,8 +4469,20 @@ struct ContractCClient {
     CLIENT_ENTRY(post, v8host_run_post_message);
     CLIENT_ENTRY(cancel, v8host_run_cancel);
     CLIENT_ENTRY(close, v8host_session_close);
+#define CLIENT_SETTER(name) CLIENT_ENTRY(config_api.name, v8host_##name);
+    V8HOST_TEST_CONFIG_SETTERS(CLIENT_SETTER)
+#undef CLIENT_SETTER
 #undef CLIENT_ENTRY
-    return initialize() == v8host_status_ok;
+    return initialize(V8HOST_ABI_VERSION) == v8host_status_ok;
+  }
+  // create / start through the DLL's own builder setters.
+  v8host_status Open(const v8host::test::TestSessionConfig* config, v8host_session* out) const {
+    v8host::test::SessionConfigure args{&config_api, config};
+    return create(&v8host::test::ConfigureSession, &args, out);
+  }
+  v8host_status Start(v8host_session session, const v8host::test::TestRunInputs* inputs, v8host_run* out) const {
+    v8host::test::RunConfigure args{&config_api, inputs};
+    return start(session, &v8host::test::ConfigureRun, &args, out);
   }
 };
 ContractCClient& PublicClient() {
@@ -4488,15 +4502,15 @@ struct PublicCapture {
   ULONGLONG startup_started = 0;
   bool valid = true, close_in_terminal = true, closed = false;
   std::function<bool()> observe_worker;
-  static void V8HOST_CDECL State(void* context, v8host_session_s* session, int32_t state, v8host_status status) {
-    auto& c = *static_cast<PublicCapture*>(context);
+  static void V8HOST_CDECL State(void* user_data, v8host_session session, v8host_session_state state, v8host_status status) {
+    auto& c = *static_cast<PublicCapture*>(user_data);
     c.valid &= ::GetCurrentThreadId() == c.thread && session == c.session && status == v8host_status_ok && !c.closed;
     c.states.push_back(state);
     if (state == v8host_session_state_worker_security_ready && c.startup_started)
       std::printf("[client startup] session=%p duration_ms=%llu\n", session, ::GetTickCount64() - c.startup_started);
   }
-  static void V8HOST_CDECL Run(void* context, v8host_run_s* run, int32_t event, v8host_status status) {
-    auto& c = *static_cast<PublicCapture*>(context);
+  static void V8HOST_CDECL Run(void* user_data, v8host_run run, v8host_run_event event, v8host_status status) {
+    auto& c = *static_cast<PublicCapture*>(user_data);
     c.valid &= ::GetCurrentThreadId() == c.thread && run == c.run && !c.closed;
     c.events.push_back(event); c.statuses.push_back(status);
     if (event != v8host_run_event_started) {
@@ -4506,22 +4520,22 @@ struct PublicCapture {
       }
     }
   }
-  static void V8HOST_CDECL Message(void* context, v8host_run_s* run, int32_t kind, const void* data, size_t len) {
-    auto& c = *static_cast<PublicCapture*>(context);
+  static void V8HOST_CDECL Message(void* user_data, v8host_run run, v8host_message_kind kind, const void* data, size_t size) {
+    auto& c = *static_cast<PublicCapture*>(user_data);
     c.valid &= ::GetCurrentThreadId() == c.thread && run == c.run && !c.closed &&
         c.states == std::vector<int32_t>{v8host_session_state_ready,
           v8host_session_state_worker_startup_ready, v8host_session_state_worker_security_ready};
     c.kinds.push_back(kind);
     const auto* bytes = static_cast<const uint8_t*>(data);
-    c.messages.emplace_back(bytes, bytes + len);
+    c.messages.emplace_back(bytes, bytes + size);
     if (c.observe_worker) c.valid &= c.observe_worker();
   }
-  static void V8HOST_CDECL Disconnect(void* context) {
-    auto& c = *static_cast<PublicCapture*>(context);
+  static void V8HOST_CDECL Disconnect(void* user_data) {
+    auto& c = *static_cast<PublicCapture*>(user_data);
     c.valid &= ::GetCurrentThreadId() == c.thread && !c.closed; ++c.disconnects;
   }
   v8host_callbacks Table() {
-    v8host_callbacks t = {}; t.struct_size = sizeof(t); t.context = this;
+    v8host_callbacks t = {}; t.struct_size = sizeof(t); t.user_data = this;
     t.on_session_state = State; t.on_run_event = Run; t.on_relay_message = Message;
     t.on_broker_disconnect = Disconnect; return t;
   }
@@ -4636,11 +4650,11 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
     if (!dedicated.Prepare()) { *detail = "dedicated shared-endpoint identity"; return false; }
     capture.observe_worker = [&] { return dedicated.Observe(); };
   }
-  V8HostSessionConfig config = {}; config.struct_size = sizeof(config);
-  config.broker_mode = mode; config.tier = v8host_tier_untrusted;
+  v8host::test::TestSessionConfig config;
+  config.broker_mode = static_cast<v8host_broker_mode>(mode); config.tier = v8host_tier_untrusted;
   config.prohibit_dynamic_code = 1; config.initial_token = sbox_token_level_restricted_same_access;
   config.delayed_integrity = sbox_integrity_level_untrusted;
-  if (client.create(&config, &capture.session) != v8host_status_ok || !capture.session) {
+  if (client.Open(&config, &capture.session) != v8host_status_ok || !capture.session) {
     *detail = "public create"; return false;
   }
   auto callbacks = capture.Table();
@@ -4652,19 +4666,19 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
     std::string guest = "var n=0;host.onmessage=function(m){if(typeof m==='string'){"
         "host.postMessage('js echo: '+m);}else{var a=new Uint8Array(m);a[0]=0x42;"
         "host.postMessageBinary(m);}if(++n===2)host.complete();};";
-    V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = -1;
+    v8host::test::TestRunInputs input; input.tier_override = -1;
     input.payload = guest.data(); input.payload_len = guest.size();
     char text[6] = {}; std::memcpy(text, round ? "bravo" : "alpha", 5);
     uint8_t binary[] = {0, static_cast<uint8_t>(1 + round * 2), static_cast<uint8_t>(2 + round * 2)};
     v8host_run_s* previous = capture.run;
     if (round == 0) capture.startup_started = ::GetTickCount64();
-    if (client.start(capture.session, &input, &capture.run) != v8host_status_ok || !capture.run ||
+    if (client.Start(capture.session, &input, &capture.run) != v8host_status_ok || !capture.run ||
         capture.run == previous) {
       *detail = "public same-session start round=" + std::to_string(round + 1); return false;
     }
     std::fill(guest.begin(), guest.end(), ' ');
-    if (client.post(capture.run, sbox_msg_kind_string, text, 5) != v8host_status_ok ||
-        client.post(capture.run, sbox_msg_kind_binary, binary, 3) != v8host_status_ok) {
+    if (client.post(capture.run, v8host_message_kind_string, text, 5) != v8host_status_ok ||
+        client.post(capture.run, v8host_message_kind_binary, binary, 3) != v8host_status_ok) {
       *detail = "public relay admission"; return false;
     }
     std::memset(text, 'x', 5); std::memset(binary, 0xFF, 3);
@@ -4712,10 +4726,10 @@ bool PublicRealCancelAndProfileBody(std::string* detail) {
   auto& client = PublicClient();
   if (!client.Load()) { *detail = "public client load"; return false; }
   PublicCapture c; c.client = &client; c.close_in_terminal = false;
-  V8HostSessionConfig config = {}; config.struct_size = sizeof(config);
+  v8host::test::TestSessionConfig config;
   config.broker_mode = v8host_broker_mode_shared; config.tier = v8host_tier_trusted;
   config.initial_token = sbox_token_level_restricted_same_access; config.delayed_integrity = sbox_integrity_level_untrusted;
-  if (client.create(&config, &c.session) != v8host_status_ok) return false;
+  if (client.Open(&config, &c.session) != v8host_status_ok) return false;
   auto callbacks = c.Table(); if (client.callbacks(c.session, &callbacks) != v8host_status_ok) return false;
   DWORD worker_pid = 0;
   auto same_worker = [&] {
@@ -4728,11 +4742,11 @@ bool PublicRealCancelAndProfileBody(std::string* detail) {
   for (int round = 0; round < 4; ++round) {
     std::string guest = round == 0 ? "host.onmessage=function(m){};host.postMessage('armed');" :
         "host.postMessage('done');host.complete();";
-    V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = round == 2 ? v8host_tier_untrusted : -1;
+    v8host::test::TestRunInputs input; input.tier_override = round == 2 ? v8host_tier_untrusted : -1;
     input.payload = guest.data(); input.payload_len = guest.size();
     input.engine_dll_override = round == 2 ? L"missing-profile-engine.dll" : L"v8jsisb.dll";
     if (round == 0) c.startup_started = ::GetTickCount64();
-    if (client.start(c.session, &input, &c.run) != v8host_status_ok || !c.run) { *detail = "public negative start"; return false; }
+    if (client.Start(c.session, &input, &c.run) != v8host_status_ok || !c.run) { *detail = "public negative start"; return false; }
     if (round == 0) {
       if (!PumpPublic([&] { return !c.messages.empty() || c.disconnects; }) || c.messages.empty() ||
           std::string(c.messages[0].begin(), c.messages[0].end()) != "armed" ||
@@ -4751,7 +4765,7 @@ bool PublicRealCancelAndProfileBody(std::string* detail) {
         std::vector<int32_t>{v8host_run_event_started, v8host_run_event_cancelled, v8host_run_event_started, v8host_run_event_completed, v8host_run_event_started, v8host_run_event_failed, v8host_run_event_started, v8host_run_event_completed};
     if (!c.valid || c.disconnects || c.terminal != round + 1 || c.events != expected_events ||
         c.events.back() != expected_event || c.statuses.back() != expected_status || !same_worker() ||
-        client.cancel(c.run) != v8host_status_run_terminal || client.post(c.run, sbox_msg_kind_string, "late", 4) != v8host_status_run_terminal) {
+        client.cancel(c.run) != v8host_status_run_terminal || client.post(c.run, v8host_message_kind_string, "late", 4) != v8host_status_run_terminal) {
       *detail = "public cancel/profile/terminal/reuse round=" + std::to_string(round); return false;
     }
   }
@@ -4791,16 +4805,16 @@ struct ProcessSessionRecord {
     for (auto& r : runs) if (r.handle == run) return &r;
     valid = false; return nullptr;
   }
-  static void V8HOST_CDECL State(void* context, v8host_session_s* session, int32_t state, v8host_status status) {
-    auto& c = *static_cast<ProcessSessionRecord*>(context);
+  static void V8HOST_CDECL State(void* user_data, v8host_session session, v8host_session_state state, v8host_status status) {
+    auto& c = *static_cast<ProcessSessionRecord*>(user_data);
     c.valid &= ::GetCurrentThreadId() == c.thread && session == c.handle && !c.closed;
     if (c.states.size() >= 8) { c.valid = false; return; }
     c.states.push_back(state); c.state_statuses.push_back(status);
     if (state == v8host_session_state_worker_security_ready && c.startup_started)
       std::printf("[client startup] session=%p duration_ms=%llu\n", session, ::GetTickCount64() - c.startup_started);
   }
-  static void V8HOST_CDECL Event(void* context, v8host_run_s* run, int32_t event, v8host_status status) {
-    auto& c = *static_cast<ProcessSessionRecord*>(context);
+  static void V8HOST_CDECL Event(void* user_data, v8host_run run, v8host_run_event event, v8host_status status) {
+    auto& c = *static_cast<ProcessSessionRecord*>(user_data);
     auto* r = c.Find(run); if (!r) return;
     if (r->events.size() >= 8) { c.valid = false; return; }
     r->events.push_back(event); r->statuses.push_back(status);
@@ -4811,28 +4825,28 @@ struct ProcessSessionRecord {
       if (c.close_on_terminal) c.Close();
     }
   }
-  static void V8HOST_CDECL Message(void* context, v8host_run_s* run, int32_t kind, const void* data, size_t len) {
-    auto& c = *static_cast<ProcessSessionRecord*>(context);
+  static void V8HOST_CDECL Message(void* user_data, v8host_run run, v8host_message_kind kind, const void* data, size_t size) {
+    auto& c = *static_cast<ProcessSessionRecord*>(user_data);
     auto* r = c.Find(run); if (!r) return;
     c.valid &= r->terminals == 0 && c.states == std::vector<int32_t>{v8host_session_state_ready,
         v8host_session_state_worker_startup_ready, v8host_session_state_worker_security_ready};
     const auto* bytes = static_cast<const uint8_t*>(data);
-    if (r->messages.size() >= 32 || len > 1024) { c.valid = false; return; }
-    r->kinds.push_back(kind); r->messages.emplace_back(bytes, bytes + len);
+    if (r->messages.size() >= 32 || size > 1024) { c.valid = false; return; }
+    r->kinds.push_back(kind); r->messages.emplace_back(bytes, bytes + size);
   }
-  static void V8HOST_CDECL Disconnect(void* context) {
-    auto& c = *static_cast<ProcessSessionRecord*>(context);
+  static void V8HOST_CDECL Disconnect(void* user_data) {
+    auto& c = *static_cast<ProcessSessionRecord*>(user_data);
     c.valid &= ::GetCurrentThreadId() == c.thread && !c.closed;
     ++c.disconnects; c.valid &= c.disconnects == 1;
   }
   bool Create() {
     if (!client.Load()) return false;
-    V8HostSessionConfig config = {}; config.struct_size = sizeof(config);
+    v8host::test::TestSessionConfig config;
     config.broker_mode = v8host_broker_mode_shared; config.tier = v8host_tier_untrusted;
     config.prohibit_dynamic_code = 1; config.initial_token = sbox_token_level_restricted_same_access;
     config.delayed_integrity = sbox_integrity_level_untrusted;
-    if (client.create(&config, &handle) != v8host_status_ok || !handle) return false;
-    v8host_callbacks cb = {}; cb.struct_size = sizeof(cb); cb.context = this;
+    if (client.Open(&config, &handle) != v8host_status_ok || !handle) return false;
+    v8host_callbacks cb = {}; cb.struct_size = sizeof(cb); cb.user_data = this;
     cb.on_session_state = State; cb.on_run_event = Event; cb.on_relay_message = Message; cb.on_broker_disconnect = Disconnect;
     return client.callbacks(handle, &cb) == v8host_status_ok;
   }
@@ -4841,11 +4855,11 @@ struct ProcessSessionRecord {
         "host.onmessage=function(m){if(typeof m==='string'){if(m==='finish'){host.complete();return;}"
         "host.postMessage('" + token + ":'+m);}else{var a=new Uint8Array(m);a[0]^=0x5a;"
         "host.postMessageBinary(m);}};host.postMessage('" + token + ":armed');";
-    V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = -1;
+    v8host::test::TestRunInputs input; input.tier_override = -1;
     input.payload = guest.data(); input.payload_len = guest.size();
     if (runs.empty()) startup_started = ::GetTickCount64();
     runs.emplace_back(); auto& r = runs.back(); r.token = token;
-    if (client.start(handle, &input, &r.handle) != v8host_status_ok || !r.handle) { runs.pop_back(); return false; }
+    if (client.Start(handle, &input, &r.handle) != v8host_status_ok || !r.handle) { runs.pop_back(); return false; }
     if (std::any_of(runs.begin(), runs.end() - 1, [&](const auto& prior) { return prior.handle == r.handle; })) {
       valid = false; return false;
     }
@@ -4863,8 +4877,8 @@ struct ProcessSessionRecord {
   bool Echo(size_t index, const std::string& text, uint8_t value) {
     auto& r = runs[index]; size_t before = r.messages.size();
     uint8_t binary[] = {value, 0, 0xff};
-    if (client.post(r.handle, sbox_msg_kind_string, text.data(), text.size()) != v8host_status_ok ||
-        client.post(r.handle, sbox_msg_kind_binary, binary, sizeof(binary)) != v8host_status_ok ||
+    if (client.post(r.handle, v8host_message_kind_string, text.data(), text.size()) != v8host_status_ok ||
+        client.post(r.handle, v8host_message_kind_binary, binary, sizeof(binary)) != v8host_status_ok ||
         !PumpPublic([&] { return r.messages.size() >= before + 2 || r.terminals || disconnects; })) return false;
     return valid && !disconnects && !r.terminals && r.messages.size() == before + 2 &&
         r.kinds[before] == sbox_msg_kind_string && r.kinds[before + 1] == sbox_msg_kind_binary &&
@@ -4878,7 +4892,7 @@ struct ProcessSessionRecord {
         r.statuses == std::vector<v8host_status>{v8host_status_ok, status};
   }
   bool Finish(size_t index) {
-    return client.post(runs[index].handle, sbox_msg_kind_string, "finish", 6) == v8host_status_ok &&
+    return client.post(runs[index].handle, v8host_message_kind_string, "finish", 6) == v8host_status_ok &&
         Terminal(index, v8host_run_event_completed, v8host_status_ok);
   }
   size_t CallbackCount() const {
@@ -4956,7 +4970,7 @@ bool PublicWorkerExitBody(std::string* detail) {
     *detail = "completed/active/queued worker-exit arbitration"; return false;
   }
   for (size_t i : {size_t{1}, size_t{2}}) {
-    if (crashed.client.post(crashed.runs[i].handle, sbox_msg_kind_string, "late", 4) != v8host_status_run_terminal ||
+    if (crashed.client.post(crashed.runs[i].handle, v8host_message_kind_string, "late", 4) != v8host_status_run_terminal ||
         crashed.client.cancel(crashed.runs[i].handle) != v8host_status_run_terminal) return false;
   }
   crashed.Close(); size_t frozen = crashed.CallbackCount();
@@ -4995,7 +5009,7 @@ bool PublicDisconnectBody(std::string* detail) {
       if (!c.Finish(0) || !c.closed) return false;
     } else {
       // Completion may race EOF, but explicit close suppresses queued delivery.
-      if (c.client.post(c.runs[0].handle, sbox_msg_kind_string, "finish", 6) != v8host_status_ok) return false;
+      if (c.client.post(c.runs[0].handle, v8host_message_kind_string, "finish", 6) != v8host_status_ok) return false;
       c.Close();
     }
     size_t frozen = c.CallbackCount();
@@ -5042,7 +5056,7 @@ bool PublicBrokerKillBody(std::string* detail) {
   for (auto& c : old) {
     for (size_t i = 0; i < c.runs.size(); ++i) {
       if (!c.Terminal(i, v8host_run_event_broker_lost, v8host_status_broker_lost) ||
-          c.client.post(c.runs[i].handle, sbox_msg_kind_string, "old-late", 8) != v8host_status_run_terminal ||
+          c.client.post(c.runs[i].handle, v8host_message_kind_string, "old-late", 8) != v8host_status_run_terminal ||
           c.client.cancel(c.runs[i].handle) != v8host_status_run_terminal) return false;
     }
     if (!PumpPublic([&] { return c.disconnects != 0; }) || !c.valid || c.disconnects != 1 ||
@@ -5061,11 +5075,11 @@ bool PublicBrokerKillBody(std::string* detail) {
   if (!fence(1)) return false;
   for (auto& c : old) {
     std::string guest = "host.postMessage('old-retry-side-effect');host.complete();";
-    V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = -1;
+    v8host::test::TestRunInputs input; input.tier_override = -1;
     input.payload = guest.data(); input.payload_len = guest.size();
     v8host_run_s* run = nullptr;
-    if (c.client.start(c.handle, &input, &run) != v8host_status_connect_failed || run ||
-        c.client.post(c.runs[0].handle, sbox_msg_kind_string, "old", 3) != v8host_status_run_terminal) {
+    if (c.client.Start(c.handle, &input, &run) != v8host_status_connect_failed || run ||
+        c.client.post(c.runs[0].handle, v8host_message_kind_string, "old", 3) != v8host_status_run_terminal) {
       *detail = "old terminal session/run accepted replay"; return false;
     }
   }
@@ -5366,10 +5380,10 @@ bool RealNoncooperativeFallbackBody(std::string* detail) {
   *detail = "noncooperative real-client marker/admission";
   if (!broker.Launch(detail) || !blocked.Create()) return false;
   const std::string guest = "host.postMessage('entered');for(;;){}";
-  V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = -1;
+  v8host::test::TestRunInputs input; input.tier_override = -1;
   input.payload = guest.data(); input.payload_len = guest.size();
   blocked.runs.emplace_back(); blocked.runs[0].token = "entered";
-  if (blocked.client.start(blocked.handle, &input, &blocked.runs[0].handle) != v8host_status_ok ||
+  if (blocked.client.Start(blocked.handle, &input, &blocked.runs[0].handle) != v8host_status_ok ||
       !PumpPublic([&] { return !blocked.runs[0].messages.empty() || blocked.runs[0].terminals || blocked.disconnects; }) ||
       !blocked.valid || blocked.disconnects || blocked.runs[0].terminals ||
       blocked.runs[0].events != std::vector<int32_t>{v8host_run_event_started} ||
@@ -5407,11 +5421,11 @@ bool RealNoncooperativeFallbackBody(std::string* detail) {
   std::printf("[reaped] noncooperative worker=%lu exit=%lu cancel_to_exit_ms=%llu harness_kill=0 budget_ms=60000\n",
       ::GetProcessId(worker), code, ::GetTickCount64() - cancelled);
   for (auto& run : blocked.runs)
-    if (blocked.client.post(run.handle, sbox_msg_kind_string, "late", 4) != v8host_status_run_terminal ||
+    if (blocked.client.post(run.handle, v8host_message_kind_string, "late", 4) != v8host_status_run_terminal ||
         blocked.client.cancel(run.handle) != v8host_status_run_terminal) return false;
   blocked.Close(); const size_t frozen = blocked.CallbackCount();
   v8host_run_s* forbidden = nullptr;
-  if (blocked.client.start(blocked.handle, &input, &forbidden) == v8host_status_ok || forbidden ||
+  if (blocked.client.Start(blocked.handle, &input, &forbidden) == v8host_status_ok || forbidden ||
       !sibling.Echo(0, "after-reap", 0x33) || !sibling.Finish(0) || !sibling.Start("fresh-js") ||
       !sibling.Armed(1) || !sibling.Echo(1, "original-pid", 0x34) || !sibling.Finish(1) ||
       !broker.Observe(2) || ::WaitForSingleObject(healthy, 0) != WAIT_TIMEOUT) return false;

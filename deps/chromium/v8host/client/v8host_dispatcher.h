@@ -272,7 +272,7 @@ class SessionDispatch {
 
   // Atomically replaces the callback table for FUTURE dispatch; already-queued
   // events keep the snapshot captured when they were queued. The table (and its
-  // context) are copied; no consumer pointer is retained. NULL members decline
+  // user_data) are copied; no consumer pointer is retained. NULL members decline
   // their callback. Rejects a null pointer (INVALID_ARG), an undersized struct
   // (STRUCT_SIZE), or a closed session (INVALID_STATE).
   v8host_status SetCallbacks(const v8host_callbacks* callbacks);

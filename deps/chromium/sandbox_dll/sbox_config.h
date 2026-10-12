@@ -18,6 +18,17 @@ constexpr size_t kSboxMaxFileRules = 64;
 constexpr size_t kSboxMaxCapabilities = 64;
 constexpr size_t kSboxMaxPluginData = 4096;
 
+// sbox.h strings are sbox_char16; the core and Win32 use wchar_t, which is the
+// same UTF-16 code unit on Windows.
+static_assert(sizeof(sbox_char16) == sizeof(wchar_t),
+              "sbox_char16 must match wchar_t");
+inline const wchar_t* SboxToWide(const sbox_char16* text) {
+  return reinterpret_cast<const wchar_t*>(text);
+}
+inline const sbox_char16* WideToSbox(const wchar_t* text) {
+  return reinterpret_cast<const sbox_char16*>(text);
+}
+
 // sbox_config: the broker's policy builder. plugin.configure() writes into it via
 // the sbox_config_api setters; MarshalSboxConfig then marshals it to an
 // SboxPolicy. Any setter that rejects its input also sets `invalid` (poison), so

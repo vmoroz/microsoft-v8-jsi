@@ -27,6 +27,13 @@ namespace {
 namespace protocol = v8host::protocol;
 namespace router = v8host::coordinator;
 
+// sbox.h strings are sbox_char16, the same UTF-16 code unit as wchar_t here.
+static_assert(sizeof(sbox_char16) == sizeof(wchar_t),
+              "sbox_char16 must match wchar_t");
+const wchar_t* AsWide(const sbox_char16* text) {
+  return reinterpret_cast<const wchar_t*>(text);
+}
+
 bool IoWithDeadline(HANDLE pipe,
                     bool write,
                     void* buffer,
@@ -151,7 +158,7 @@ class BrokerService {
       if (mode_ == v8host::BrokerMode::kDedicated && owner_seen_)
         break;
       HANDLE pipe = ::CreateNamedPipeW(
-          start_->endpoint_name,
+          AsWide(start_->endpoint_name),
           PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
               (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
           PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
@@ -305,8 +312,9 @@ class BrokerService {
     DWORD delay = 10;
     while (::GetTickCount64() < deadline) {
       HANDLE pipe =
-          ::CreateFileW(start_->endpoint_name, GENERIC_READ | GENERIC_WRITE, 0,
-                        nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+          ::CreateFileW(AsWide(start_->endpoint_name),
+                        GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                        OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
       if (pipe != INVALID_HANDLE_VALUE) {
         v8host::PeerAuthPolicy policy = {};
         policy.peer_side = v8host::PeerSide::kPipeServer;
@@ -323,7 +331,7 @@ class BrokerService {
         return ok;
       }
       if (::GetLastError() == ERROR_PIPE_BUSY)
-        ::WaitNamedPipeW(start_->endpoint_name, delay);
+        ::WaitNamedPipeW(AsWide(start_->endpoint_name), delay);
       else
         ::Sleep(delay);
       delay = (std::min)(delay * 2, static_cast<DWORD>(250));
@@ -526,10 +534,10 @@ sbox_status V8HostBrokerRun(sbox_broker broker,
 
   DWORD error = ERROR_SUCCESS;
   v8host::PayloadIdentity payload;
-  if (!v8host::OpenImmutableFile(start->container_final_path,
+  if (!v8host::OpenImmutableFile(AsWide(start->container_final_path),
                                  &payload.container, &error) ||
-      !v8host::OpenImmutableFile(start->plugin_final_path, &payload.plugin,
-                                 &error) ||
+      !v8host::OpenImmutableFile(AsWide(start->plugin_final_path),
+                                 &payload.plugin, &error) ||
       payload.container.machine() != start->native_machine ||
       payload.plugin.machine() != start->native_machine ||
       std::memcmp(payload.container.sha256().data(), start->container_sha256,
@@ -566,7 +574,7 @@ sbox_status V8HostBrokerRun(sbox_broker broker,
               ? v8host::BrokerMode::kShared
               : v8host::BrokerMode::kDedicated,
           nonce_ptr, &expected_endpoint, &endpoint_key) ||
-      expected_endpoint != start->endpoint_name)
+      expected_endpoint != AsWide(start->endpoint_name))
     return sbox_status_failed;
   printf("[v8host] broker endpoint=%s mode=%s pid=%lu\n",
          v8host::HexPrefix(endpoint_key, 6).c_str(),

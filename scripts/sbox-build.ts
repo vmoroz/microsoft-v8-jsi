@@ -574,21 +574,43 @@ interface SandboxBinary {
 //                 the statically-linked sbox_* core resolve at link time rather
 //                 than through the EXE's export table.
 //   v8host.dll  — the engine payload: exports the single plugin-ABI entry plus
-//                 the seven approved Contract C client entry points.
+//                 the 28 approved Contract C client entry points (7 session /
+//                 run functions and 21 configuration builder setters).
 const sandboxBinaries: SandboxBinary[] = [
   // sbox.exe budget: <= 2 MiB (measured ~1.76 MiB; floor at the Hybrid CRT).
   { file: "sbox.exe", allowedExports: [], maxBytes: 2 * 1024 * 1024 },
-  // v8host.dll budget: <= 640 KiB (measured 535,040 bytes): plugin + engine
+  // v8host.dll budget: <= 640 KiB (measured 581,632 bytes): plugin + engine
   // glue + coordinator router + client; the engine DLL is loaded at runtime.
   {
     file: "v8host.dll",
     allowedExports: [
       "sbox_plugin_main",
+      "v8host_config_add_capability_utf16",
+      "v8host_config_add_capability_utf8",
+      "v8host_config_add_file_rule_utf16",
+      "v8host_config_add_file_rule_utf8",
+      "v8host_config_set_broker_mode",
+      "v8host_config_set_delayed_integrity_level",
+      "v8host_config_set_initial_token_level",
+      "v8host_config_set_integrity_level",
+      "v8host_config_set_lockdown_token_level",
+      "v8host_config_set_low_privilege_app_container",
+      "v8host_config_set_profile_name_utf16",
+      "v8host_config_set_profile_name_utf8",
+      "v8host_config_set_prohibit_dynamic_code",
+      "v8host_config_set_tier",
+      "v8host_config_set_use_app_container",
+      "v8host_initialize",
       "v8host_run_cancel",
+      "v8host_run_config_set_engine_dll_utf16",
+      "v8host_run_config_set_engine_dll_utf8",
+      "v8host_run_config_set_payload",
+      "v8host_run_config_set_startup_snapshot_path_utf16",
+      "v8host_run_config_set_startup_snapshot_path_utf8",
+      "v8host_run_config_set_tier",
+      "v8host_run_post_message",
       "v8host_session_close",
       "v8host_session_open",
-      "v8host_initialize",
-      "v8host_run_post_message",
       "v8host_session_set_callbacks",
       "v8host_session_start_run",
     ],

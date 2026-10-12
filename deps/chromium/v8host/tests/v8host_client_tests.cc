@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 #include "v8host_test_support.h"  // windows.h first
+#include "v8host_client_test_config.h"
 #include "v8host_client_transport.h"
 #include "v8host_dispatcher.h"
 #include "v8host_protocol.h"
@@ -34,7 +35,12 @@ using v8host::client::SetInboundStatusObserverForTesting;
 using v8host::client::SetTransportFactoryForTesting;
 using v8host::client::TransportDisconnect;
 using v8host::client::TransportParams;
+using v8host::test::OpenSession;
+using v8host::test::StartRun;
 using v8host::test::TestCase;
+using v8host::test::TestFileRule;
+using v8host::test::TestRunInputs;
+using v8host::test::TestSessionConfig;
 
 bool Fail(std::string* detail, const char* text) {
   *detail = text;
@@ -158,18 +164,16 @@ FakeTransport* LatestFake() {
   return Fakes().back();
 }
 
-V8HostSessionConfig BasicConfig() {
-  V8HostSessionConfig c = {};
-  c.struct_size = sizeof(c);
+TestSessionConfig BasicConfig() {
+  TestSessionConfig c;
   c.broker_mode = v8host_broker_mode_shared;
   c.tier = v8host_tier_untrusted;
   c.prohibit_dynamic_code = 1;
   return c;
 }
 
-V8HostRunInputs BasicRun(const void* data = nullptr, size_t len = 0) {
-  V8HostRunInputs i = {};
-  i.struct_size = sizeof(i);
+TestRunInputs BasicRun(const void* data = nullptr, size_t len = 0) {
+  TestRunInputs i;
   i.tier_override = -1;
   i.payload = data;
   i.payload_len = len;
@@ -254,11 +258,11 @@ struct Recorder {
 
 v8host_callbacks Callbacks(Recorder* r);
 
-void V8HOST_CDECL OnState(void* context,
-                         v8host_session_s* session,
-                         int32_t state,
+void V8HOST_CDECL OnState(void* user_data,
+                         v8host_session session,
+                         v8host_session_state state,
                          v8host_status status) {
-  auto* r = static_cast<Recorder*>(context);
+  auto* r = static_cast<Recorder*>(user_data);
   r->callback_thread = ::GetCurrentThreadId();
   r->state_thread = r->callback_thread;
   r->states.push_back(state);
@@ -268,23 +272,24 @@ void V8HOST_CDECL OnState(void* context,
     r->close_in_callback = false;
     v8host_session_close(session);
     v8host_run_s* ignored = reinterpret_cast<v8host_run_s*>(1);
-    V8HostRunInputs input = BasicRun();
-    r->after_close = v8host_session_start_run(session, &input, &ignored);
+    TestRunInputs input = BasicRun();
+    r->after_close = StartRun(session, &input, &ignored);
     v8host_callbacks callbacks = Callbacks(r);
     r->set_after_close = v8host_session_set_callbacks(session, &callbacks);
     if (r->run != nullptr) {
       r->post_after_close =
-          v8host_run_post_message(r->run, 1, nullptr, 0);
+          v8host_run_post_message(r->run, v8host_message_kind_binary, nullptr,
+                                  0);
       r->cancel_after_close = v8host_run_cancel(r->run);
     }
   }
 }
 
-void V8HOST_CDECL OnRun(void* context,
-                       v8host_run_s* run,
-                       int32_t event,
+void V8HOST_CDECL OnRun(void* user_data,
+                       v8host_run run,
+                       v8host_run_event event,
                        v8host_status status) {
-  auto* r = static_cast<Recorder*>(context);
+  auto* r = static_cast<Recorder*>(user_data);
   r->callback_thread = ::GetCurrentThreadId();
   r->run_thread = r->callback_thread;
   r->events.push_back(event);
@@ -293,12 +298,12 @@ void V8HOST_CDECL OnRun(void* context,
   r->run = run;
 }
 
-void V8HOST_CDECL OnRelay(void* context,
-                         v8host_run_s*,
-                         int32_t kind,
+void V8HOST_CDECL OnRelay(void* user_data,
+                         v8host_run,
+                         v8host_message_kind kind,
                          const void* data,
                          size_t len) {
-  auto* r = static_cast<Recorder*>(context);
+  auto* r = static_cast<Recorder*>(user_data);
   r->callback_thread = ::GetCurrentThreadId();
   r->relay_thread = r->callback_thread;
   r->kinds.push_back(kind);
@@ -307,8 +312,8 @@ void V8HOST_CDECL OnRelay(void* context,
   r->total.fetch_add(1);
 }
 
-void V8HOST_CDECL OnDisconnect(void* context) {
-  auto* r = static_cast<Recorder*>(context);
+void V8HOST_CDECL OnDisconnect(void* user_data) {
+  auto* r = static_cast<Recorder*>(user_data);
   r->callback_thread = ::GetCurrentThreadId();
   r->disconnect_thread = r->callback_thread;
   ++r->disconnects;
@@ -318,7 +323,7 @@ void V8HOST_CDECL OnDisconnect(void* context) {
 v8host_callbacks Callbacks(Recorder* r) {
   v8host_callbacks c = {};
   c.struct_size = sizeof(c);
-  c.context = r;
+  c.user_data = r;
   c.on_session_state = OnState;
   c.on_run_event = OnRun;
   c.on_relay_message = OnRelay;
@@ -327,9 +332,9 @@ v8host_callbacks Callbacks(Recorder* r) {
 }
 
 v8host_session_s* Create(FakeTransport** fake = nullptr) {
-  V8HostSessionConfig c = BasicConfig();
+  TestSessionConfig c = BasicConfig();
   v8host_session_s* session = nullptr;
-  if (v8host_session_open(&c, &session) != v8host_status_ok)
+  if (OpenSession(&c, &session) != v8host_status_ok)
     return nullptr;
   if (fake)
     *fake = LatestFake();
@@ -360,29 +365,46 @@ bool ConcurrentInitializeLifecycle(std::string* detail) {
   return true;
 }
 
+v8host_status V8HOST_CDECL FailSessionConfigure(void*, v8host_config) {
+  return v8host_status_internal_error;
+}
+
+v8host_status V8HOST_CDECL FailRunConfigure(void*, v8host_run_config) {
+  return v8host_status_no_memory;
+}
+
+// The builders replaced the versioned input structs, so v8host_callbacks is the
+// only struct_size-checked input left. A configure callback's failure is
+// returned unchanged, and a NULL run configure callback means all defaults.
 bool ValidateStructSizes(std::string* detail) {
-  v8host_session_s* out = reinterpret_cast<v8host_session_s*>(1);
-  V8HostSessionConfig c = BasicConfig();
-  c.struct_size = sizeof(c) - 1;
-  if (v8host_session_open(&c, &out) != v8host_status_invalid_struct_size ||
+  // The consumer passes the ABI version it compiled against; the DLL serves
+  // older consumers and rejects newer ones (and 0).
+  if (v8host_initialize(0) != v8host_status_version_mismatch ||
+      v8host_initialize(V8HOST_ABI_VERSION + 1) !=
+          v8host_status_version_mismatch ||
+      v8host_initialize(V8HOST_ABI_VERSION) != v8host_status_ok)
+    return Fail(detail, "initialize ABI version");
+  v8host_session out = reinterpret_cast<v8host_session>(1);
+  if (v8host_session_open(&FailSessionConfigure, nullptr, &out) !=
+          v8host_status_internal_error ||
       out != nullptr)
-    return Fail(detail, "session struct_size/output nulling");
-  c = BasicConfig();
-  c.struct_size = sizeof(c) + 16;
-  if (v8host_session_open(&c, &out) != v8host_status_ok || out == nullptr)
-    return Fail(detail, "larger session struct rejected");
-  V8HostRunInputs input = BasicRun();
-  input.struct_size--;
-  v8host_run_s* run = reinterpret_cast<v8host_run_s*>(1);
-  if (v8host_session_start_run(out, &input, &run) != v8host_status_invalid_struct_size ||
+    return Fail(detail, "configure failure/output nulling");
+  TestSessionConfig c = BasicConfig();
+  if (OpenSession(&c, &out) != v8host_status_ok || out == nullptr)
+    return Fail(detail, "create");
+  v8host_run run = reinterpret_cast<v8host_run>(1);
+  if (v8host_session_start_run(out, &FailRunConfigure, nullptr, &run) !=
+          v8host_status_no_memory ||
       run != nullptr)
-    return Fail(detail, "run struct_size/output nulling");
-  input = BasicRun();
-  input.struct_size = sizeof(input) + 16;
-  if (v8host_session_start_run(out, &input, &run) != v8host_status_ok ||
+    return Fail(detail, "run configure failure/output nulling");
+  if (v8host_session_start_run(out, nullptr, nullptr, &run) !=
+          v8host_status_ok ||
       run == nullptr)
-    return Fail(detail, "larger run struct rejected");
-  v8host_callbacks cb = {};
+    return Fail(detail, "null run configure (defaults) rejected");
+  v8host_callbacks cb = V8HOST_CALLBACKS_INIT;
+  if (cb.struct_size != sizeof(v8host_callbacks) || cb.user_data != nullptr ||
+      cb.on_session_state != nullptr || cb.on_broker_disconnect != nullptr)
+    return Fail(detail, "V8HOST_CALLBACKS_INIT");
   cb.struct_size = sizeof(cb) - 1;
   if (v8host_session_set_callbacks(out, &cb) != v8host_status_invalid_struct_size)
     return Fail(detail, "callback struct_size");
@@ -394,57 +416,344 @@ bool ValidateStructSizes(std::string* detail) {
 }
 
 bool ValidatePairsAndPolicy(std::string* detail) {
-  V8HostSessionConfig c = BasicConfig();
-  V8HostFileRule rule{L"x", 1};
-  c.file_rules = &rule;
-  if (v8host_session_open(&c, nullptr) != v8host_status_invalid_arg)
+  TestSessionConfig c = BasicConfig();
+  if (OpenSession(&c, nullptr) != v8host_status_invalid_arg)
     return Fail(detail, "null output");
-  v8host_session_s* out = reinterpret_cast<v8host_session_s*>(1);
-  if (v8host_session_open(&c, &out) != v8host_status_invalid_arg ||
-      out != nullptr)
-    return Fail(detail, "non-null/zero file pair");
-  c = BasicConfig();
+  TestFileRule rule{nullptr, true};
+  c.file_rules = &rule;
   c.file_rule_count = 1;
-  out = reinterpret_cast<v8host_session_s*>(1);
-  if (v8host_session_open(&c, &out) != v8host_status_invalid_arg ||
-      out != nullptr)
-    return Fail(detail, "null/nonzero file pair");
+  v8host_session out = reinterpret_cast<v8host_session>(1);
+  if (OpenSession(&c, &out) != v8host_status_invalid_arg || out != nullptr)
+    return Fail(detail, "null file pattern");
+  const wchar_t* null_cap = nullptr;
+  c = BasicConfig();
+  c.use_app_container = true;
+  c.app_container_profile_name = L"profile";
+  c.capabilities = &null_cap;
+  c.capability_count = 1;
+  out = reinterpret_cast<v8host_session>(1);
+  if (OpenSession(&c, &out) != v8host_status_invalid_arg || out != nullptr)
+    return Fail(detail, "null capability");
+  const wchar_t* empty_cap = L"";
+  c.capabilities = &empty_cap;
+  out = reinterpret_cast<v8host_session>(1);
+  if (OpenSession(&c, &out) != v8host_status_invalid_arg || out != nullptr)
+    return Fail(detail, "empty capability");
   const wchar_t* cap = L"cap";
   c = BasicConfig();
-  c.capabilities = &cap;
-  out = reinterpret_cast<v8host_session_s*>(1);
-  if (v8host_session_open(&c, &out) != v8host_status_invalid_arg ||
-      out != nullptr)
-    return Fail(detail, "non-null/zero capability pair");
-  c = BasicConfig();
-  c.capability_count = 1;
-  out = reinterpret_cast<v8host_session_s*>(1);
-  if (v8host_session_open(&c, &out) != v8host_status_invalid_arg ||
-      out != nullptr)
-    return Fail(detail, "null/nonzero capability pair");
-  c = BasicConfig();
   c.app_container_profile_name = L"profile";
-  out = reinterpret_cast<v8host_session_s*>(1);
-  if (v8host_session_open(&c, &out) != v8host_status_invalid_arg ||
+  out = reinterpret_cast<v8host_session>(1);
+  if (OpenSession(&c, &out) != v8host_status_invalid_arg ||
       out != nullptr)
     return Fail(detail, "profile without AC");
   c = BasicConfig();
   c.capabilities = &cap;
   c.capability_count = 1;
-  out = reinterpret_cast<v8host_session_s*>(1);
-  if (v8host_session_open(&c, &out) != v8host_status_invalid_arg ||
+  out = reinterpret_cast<v8host_session>(1);
+  if (OpenSession(&c, &out) != v8host_status_invalid_arg ||
       out != nullptr)
     return Fail(detail, "capability without AC");
   c = BasicConfig();
-  c.use_app_container = 1;
-  out = reinterpret_cast<v8host_session_s*>(1);
-  if (v8host_session_open(&c, &out) != v8host_status_invalid_arg ||
+  c.use_app_container = true;
+  out = reinterpret_cast<v8host_session>(1);
+  if (OpenSession(&c, &out) != v8host_status_invalid_arg ||
       out != nullptr)
     return Fail(detail, "AC without profile");
   c = BasicConfig();
-  c.low_privilege_app_container = 1;
-  if (v8host_session_open(&c, &out) != v8host_status_invalid_arg)
+  c.use_app_container = true;
+  c.app_container_profile_name = L"";
+  out = reinterpret_cast<v8host_session>(1);
+  if (OpenSession(&c, &out) != v8host_status_invalid_arg || out != nullptr)
+    return Fail(detail, "AC with empty profile");
+  c = BasicConfig();
+  c.low_privilege_app_container = true;
+  if (OpenSession(&c, &out) != v8host_status_invalid_arg)
     return Fail(detail, "LPAC without AC");
+  return true;
+}
+
+// One failing setter applied to a fresh session builder. The configure callback
+// ignores the failure and returns ok, so open must still fail closed with the
+// poison status; a later valid setter must return that same status.
+struct SetterCase {
+  const char* name;
+  v8host_status expected;
+  std::function<v8host_status(v8host_config)> apply;
+  v8host_status first = v8host_status_ok;
+  v8host_status after = v8host_status_ok;
+};
+
+v8host_status V8HOST_CDECL ApplySetterCase(void* user_data,
+                                           v8host_config config) {
+  auto* c = static_cast<SetterCase*>(user_data);
+  v8host_config_set_broker_mode(config, v8host_broker_mode_shared);
+  v8host_config_set_prohibit_dynamic_code(config, true);
+  c->first = c->apply(config);
+  c->after = v8host_config_set_tier(config, v8host_tier_untrusted);
+  return v8host_status_ok;
+}
+
+struct RunSetterCase {
+  const char* name;
+  v8host_status expected;
+  std::function<v8host_status(v8host_run_config)> apply;
+  v8host_status first = v8host_status_ok;
+  v8host_status after = v8host_status_ok;
+};
+
+v8host_status V8HOST_CDECL ApplyRunSetterCase(void* user_data,
+                                              v8host_run_config config) {
+  auto* c = static_cast<RunSetterCase*>(user_data);
+  c->first = c->apply(config);
+  c->after = v8host_run_config_set_tier(config, v8host_tier_untrusted);
+  return v8host_status_ok;
+}
+
+v8host_status V8HOST_CDECL ConfigureUtf8Session(void*, v8host_config config) {
+  v8host_status s = v8host_config_set_broker_mode(config, v8host_broker_mode_shared);
+  if (s == v8host_status_ok)
+    s = v8host_config_set_prohibit_dynamic_code(config, true);
+  if (s == v8host_status_ok)
+    s = v8host_config_set_integrity_level(config, v8host_integrity_level_low);
+  if (s == v8host_status_ok) {
+    s = v8host_config_set_delayed_integrity_level(
+        config, v8host_integrity_level_untrusted);
+  }
+  if (s == v8host_status_ok) {
+    s = v8host_config_add_file_rule_utf8(config, "C:\\a\\*", V8HOST_AUTO_LENGTH,
+                                         true);
+  }
+  if (s == v8host_status_ok) {
+    // An explicit length need not end at a NUL.
+    s = v8host_config_add_file_rule_utf8(config, "C:\\b\\*tail", 6, false);
+  }
+  if (s == v8host_status_ok) {
+    s = v8host_config_add_file_rule_utf8(config, "C:\\\xC3\xA9\\*",
+                                         V8HOST_AUTO_LENGTH, false);
+  }
+  if (s == v8host_status_ok)
+    s = v8host_config_set_use_app_container(config, true);
+  if (s == v8host_status_ok) {
+    s = v8host_config_set_profile_name_utf8(config, "profile",
+                                            V8HOST_AUTO_LENGTH);
+  }
+  if (s == v8host_status_ok) {
+    s = v8host_config_add_capability_utf8(config, "S-1-15-3-1xx", 10);
+  }
+  if (s == v8host_status_ok) {
+    s = v8host_config_add_capability_utf16(config, u"S-1-15-3-2",
+                                           V8HOST_AUTO_LENGTH);
+  }
+  return s;
+}
+
+v8host_status V8HOST_CDECL ConfigureUtf8Run(void*, v8host_run_config config) {
+  v8host_status s =
+      v8host_run_config_set_engine_dll_utf8(config, "engine.dllx", 10);
+  if (s == v8host_status_ok) {
+    s = v8host_run_config_set_startup_snapshot_path_utf8(config, "snap.bin",
+                                                         V8HOST_AUTO_LENGTH);
+  }
+  return s;
+}
+
+bool ValidateBuilderSetters(std::string* detail) {
+  // A NULL builder is reported but has nothing to poison.
+  if (v8host_config_set_tier(nullptr, v8host_tier_untrusted) !=
+          v8host_status_invalid_arg ||
+      v8host_config_add_file_rule_utf8(nullptr, "x", V8HOST_AUTO_LENGTH,
+                                       false) != v8host_status_invalid_arg ||
+      v8host_run_config_set_tier(nullptr, v8host_tier_untrusted) !=
+          v8host_status_invalid_arg ||
+      v8host_run_config_set_payload(nullptr, nullptr, 0) !=
+          v8host_status_invalid_arg) {
+    return Fail(detail, "null builder");
+  }
+
+  const std::string too_long(kMaxStringBytes + 1, 'x');
+  const std::u16string unpaired(1, static_cast<char16_t>(0xD800));
+  SetterCase cases[] = {
+      {"broker mode range", v8host_status_invalid_arg,
+       [](v8host_config c) {
+         return v8host_config_set_broker_mode(c,
+                                              static_cast<v8host_broker_mode>(2));
+       }},
+      {"tier range", v8host_status_invalid_arg,
+       [](v8host_config c) {
+         return v8host_config_set_tier(c, static_cast<v8host_tier>(-1));
+       }},
+      {"integrity range", v8host_status_invalid_arg,
+       [](v8host_config c) {
+         return v8host_config_set_integrity_level(
+             c, static_cast<v8host_integrity_level>(2));
+       }},
+      {"delayed integrity range", v8host_status_invalid_arg,
+       [](v8host_config c) {
+         return v8host_config_set_delayed_integrity_level(
+             c, static_cast<v8host_integrity_level>(-1));
+       }},
+      {"initial token range", v8host_status_invalid_arg,
+       [](v8host_config c) {
+         return v8host_config_set_initial_token_level(
+             c, static_cast<v8host_token_level>(5));
+       }},
+      {"lockdown token range", v8host_status_invalid_arg,
+       [](v8host_config c) {
+         return v8host_config_set_lockdown_token_level(
+             c, static_cast<v8host_token_level>(-1));
+       }},
+      {"utf8 null", v8host_status_invalid_arg,
+       [](v8host_config c) {
+         return v8host_config_add_file_rule_utf8(c, nullptr, 0, false);
+       }},
+      {"utf8 embedded nul", v8host_status_invalid_arg,
+       [](v8host_config c) {
+         return v8host_config_add_file_rule_utf8(c, "a\0b", 3, false);
+       }},
+      {"utf8 invalid", v8host_status_invalid_arg,
+       [](v8host_config c) {
+         return v8host_config_add_file_rule_utf8(c, "\xC3\x28",
+                                                 V8HOST_AUTO_LENGTH, false);
+       }},
+      {"utf8 encoded surrogate", v8host_status_invalid_arg,
+       [](v8host_config c) {
+         return v8host_config_set_profile_name_utf8(c, "\xED\xA0\x80",
+                                                    V8HOST_AUTO_LENGTH);
+       }},
+      {"utf8 too long", v8host_status_quota_exceeded,
+       [&](v8host_config c) {
+         return v8host_config_add_file_rule_utf8(c, too_long.data(),
+                                                 too_long.size(), false);
+       }},
+      {"utf16 unpaired surrogate", v8host_status_invalid_arg,
+       [&](v8host_config c) {
+         return v8host_config_add_file_rule_utf16(c, unpaired.data(),
+                                                  unpaired.size(), false);
+       }},
+      {"utf16 embedded nul", v8host_status_invalid_arg,
+       [](v8host_config c) {
+         return v8host_config_set_profile_name_utf16(c, u"a\0b", 3);
+       }},
+      {"empty capability", v8host_status_invalid_arg,
+       [](v8host_config c) {
+         return v8host_config_add_capability_utf8(c, "", V8HOST_AUTO_LENGTH);
+       }},
+      {"65th file rule", v8host_status_quota_exceeded,
+       [](v8host_config c) {
+         for (int n = 0; n < 64; ++n) {
+           if (v8host_config_add_file_rule_utf8(c, "x", 1, false) !=
+               v8host_status_ok)
+             return v8host_status_internal_error;
+         }
+         return v8host_config_add_file_rule_utf8(c, "x", 1, false);
+       }},
+      {"65th capability", v8host_status_quota_exceeded,
+       [](v8host_config c) {
+         for (int n = 0; n < 64; ++n) {
+           if (v8host_config_add_capability_utf8(c, "cap", 3) !=
+               v8host_status_ok)
+             return v8host_status_internal_error;
+         }
+         return v8host_config_add_capability_utf8(c, "cap", 3);
+       }},
+  };
+  for (SetterCase& c : cases) {
+    v8host_session out = reinterpret_cast<v8host_session>(1);
+    const v8host_status status =
+        v8host_session_open(&ApplySetterCase, &c, &out);
+    if (c.first != c.expected || c.after != c.expected ||
+        status != c.expected || out != nullptr) {
+      *detail = std::string("session setter: ") + c.name;
+      return false;
+    }
+  }
+
+  FakeTransport* fake = nullptr;
+  v8host_session session = nullptr;
+  if (v8host_session_open(&ConfigureUtf8Session, nullptr, &session) !=
+      v8host_status_ok)
+    return Fail(detail, "utf8 session");
+  fake = LatestFake();
+  FrameHeader h;
+  const uint8_t* body = nullptr;
+  size_t len = 0;
+  CreateSessionPayload p;
+  const auto frame = fake->Frame(0);
+  if (!DecodeFrame(frame, &h, &body, &len) ||
+      !DecodeCreateSessionPayload(body, len, &p) ||
+      p.integrity != 0 || p.delayed_integrity != 1 ||
+      p.file_rules.size() != 3 || p.file_rules[0].pattern != "C:\\a\\*" ||
+      !p.file_rules[0].readonly || p.file_rules[1].pattern != "C:\\b\\*" ||
+      p.file_rules[1].readonly ||
+      p.file_rules[2].pattern != "C:\\\xC3\xA9\\*" ||
+      p.app_container_profile != "profile" || p.capabilities.size() != 2 ||
+      p.capabilities[0] != "S-1-15-3-1" || p.capabilities[1] != "S-1-15-3-2") {
+    v8host_session_close(session);
+    Drain();
+    return Fail(detail, "utf8 session roundtrip");
+  }
+
+  v8host_run run = nullptr;
+  if (v8host_session_start_run(session, &ConfigureUtf8Run, nullptr, &run) !=
+      v8host_status_ok) {
+    v8host_session_close(session);
+    Drain();
+    return Fail(detail, "utf8 run");
+  }
+  StartRunPayload rp;
+  const auto run_frame = fake->Frame(1);
+  const bool run_ok = DecodeFrame(run_frame, &h, &body, &len) &&
+                      DecodeStartRunPayload(body, len, &rp) &&
+                      rp.tier_override == -1 && rp.has_engine_override &&
+                      rp.engine_filename == "engine.dll" && rp.has_snapshot &&
+                      rp.snapshot_path == "snap.bin";
+
+  const std::vector<uint8_t> big(kMaxFramePayload + 1, 0);
+  RunSetterCase run_cases[] = {
+      {"run tier range", v8host_status_invalid_arg,
+       [](v8host_run_config c) {
+         return v8host_run_config_set_tier(c, static_cast<v8host_tier>(2));
+       }},
+      {"engine utf8 path", v8host_status_invalid_arg,
+       [](v8host_run_config c) {
+         return v8host_run_config_set_engine_dll_utf8(c, "a/b.dll",
+                                                      V8HOST_AUTO_LENGTH);
+       }},
+      {"engine utf8 invalid", v8host_status_invalid_arg,
+       [](v8host_run_config c) {
+         return v8host_run_config_set_engine_dll_utf8(c, "\xFF.dll",
+                                                      V8HOST_AUTO_LENGTH);
+       }},
+      {"snapshot utf8 empty", v8host_status_invalid_arg,
+       [](v8host_run_config c) {
+         return v8host_run_config_set_startup_snapshot_path_utf8(c, "", 0);
+       }},
+      {"payload over frame", v8host_status_quota_exceeded,
+       [&](v8host_run_config c) {
+         return v8host_run_config_set_payload(c, big.data(), big.size());
+       }},
+  };
+  bool cases_ok = true;
+  const char* failed = nullptr;
+  for (RunSetterCase& c : run_cases) {
+    v8host_run out = reinterpret_cast<v8host_run>(1);
+    const v8host_status status =
+        v8host_session_start_run(session, &ApplyRunSetterCase, &c, &out);
+    if (c.first != c.expected || c.after != c.expected ||
+        status != c.expected || out != nullptr) {
+      cases_ok = false;
+      failed = c.name;
+      break;
+    }
+  }
+  v8host_session_close(session);
+  Drain();
+  if (!run_ok)
+    return Fail(detail, "utf8 run roundtrip");
+  if (!cases_ok) {
+    *detail = std::string("run setter: ") + failed;
+    return false;
+  }
   return true;
 }
 
@@ -453,16 +762,16 @@ bool ValidateRunPolicyAndOutputs(std::string* detail) {
   if (!session)
     return Fail(detail, "create");
   v8host_run_s* out = reinterpret_cast<v8host_run_s*>(1);
-  V8HostRunInputs i = BasicRun();
+  TestRunInputs i = BasicRun();
   i.tier_override = v8host_tier_trusted;
-  if (v8host_session_start_run(session, &i, &out) != v8host_status_invalid_arg ||
+  if (StartRun(session, &i, &out) != v8host_status_invalid_arg ||
       out != nullptr)
     return Fail(detail, "tier envelope");
   for (int32_t tier : {-2, 2}) {
     i = BasicRun();
     i.tier_override = tier;
     out = reinterpret_cast<v8host_run_s*>(1);
-    if (v8host_session_start_run(session, &i, &out) != v8host_status_invalid_arg ||
+    if (StartRun(session, &i, &out) != v8host_status_invalid_arg ||
         out != nullptr)
       return Fail(detail, "invalid tier/output");
   }
@@ -472,25 +781,25 @@ bool ValidateRunPolicyAndOutputs(std::string* detail) {
     i = BasicRun();
     i.engine_dll_override = value;
     out = reinterpret_cast<v8host_run_s*>(1);
-    if (v8host_session_start_run(session, &i, &out) != v8host_status_invalid_arg ||
+    if (StartRun(session, &i, &out) != v8host_status_invalid_arg ||
         out != nullptr)
       return Fail(detail, "bad engine path/output");
   }
   char byte = 0;
   i = BasicRun(&byte, 0);
   out = reinterpret_cast<v8host_run_s*>(1);
-  if (v8host_session_start_run(session, &i, &out) != v8host_status_invalid_arg ||
+  if (StartRun(session, &i, &out) != v8host_status_invalid_arg ||
       out != nullptr)
     return Fail(detail, "payload pair");
   i = BasicRun(nullptr, 1);
   out = reinterpret_cast<v8host_run_s*>(1);
-  if (v8host_session_start_run(session, &i, &out) != v8host_status_invalid_arg ||
+  if (StartRun(session, &i, &out) != v8host_status_invalid_arg ||
       out != nullptr)
     return Fail(detail, "reverse payload pair");
   i = BasicRun();
   i.startup_snapshot_path = L"";
   out = reinterpret_cast<v8host_run_s*>(1);
-  if (v8host_session_start_run(session, &i, &out) != v8host_status_invalid_arg ||
+  if (StartRun(session, &i, &out) != v8host_status_invalid_arg ||
       out != nullptr)
     return Fail(detail, "empty snapshot/output");
   v8host_session_close(session);
@@ -523,22 +832,22 @@ bool ConfigRoundTrip(std::string* detail) {
   Drain();
 
   std::vector<std::wstring> patterns(64), caps(64);
-  std::vector<V8HostFileRule> rules(64);
+  std::vector<TestFileRule> rules(64);
   std::vector<const wchar_t*> cap_ptrs(64);
   for (size_t n = 0; n < 64; ++n) {
     patterns[n] = L"rule" + std::to_wstring(n);
     caps[n] = L"cap" + std::to_wstring(n);
-    rules[n] = {patterns[n].c_str(), static_cast<int32_t>(n & 1)};
+    rules[n] = {patterns[n].c_str(), (n & 1) != 0};
     cap_ptrs[n] = caps[n].c_str();
   }
-  V8HostSessionConfig c = BasicConfig();
-  c.integrity = 3; c.delayed_integrity = 4; c.initial_token = 5;
-  c.lockdown_token = 6; c.file_rules = rules.data(); c.file_rule_count = 64;
+  TestSessionConfig c = BasicConfig();
+  c.integrity = 1; c.delayed_integrity = 0; c.initial_token = 3;
+  c.lockdown_token = 4; c.file_rules = rules.data(); c.file_rule_count = 64;
   c.use_app_container = 1; c.low_privilege_app_container = 1;
   c.app_container_profile_name = L"profile";
   c.capabilities = cap_ptrs.data(); c.capability_count = 64;
   v8host_session_s* session = nullptr;
-  if (v8host_session_open(&c, &session) != v8host_status_ok)
+  if (OpenSession(&c, &session) != v8host_status_ok)
     return Fail(detail, "create 64");
   patterns[0] = L"mutated";
   FrameHeader h; const uint8_t* body; size_t len;
@@ -547,9 +856,9 @@ bool ConfigRoundTrip(std::string* detail) {
   bool ok = DecodeFrame(frame, &h, &body, &len) &&
             DecodeCreateSessionPayload(body, len, &p) &&
             p.broker_mode == v8host_broker_mode_shared &&
-            p.tier == v8host_tier_untrusted && p.integrity == 3 &&
-            p.delayed_integrity == 4 && p.initial_token == 5 &&
-            p.lockdown_token == 6 && p.prohibit_dynamic_code &&
+            p.tier == v8host_tier_untrusted && p.integrity == 1 &&
+            p.delayed_integrity == 0 && p.initial_token == 3 &&
+            p.lockdown_token == 4 && p.prohibit_dynamic_code &&
             p.use_app_container && p.low_privilege_app_container &&
             p.app_container_profile == "profile" &&
             p.file_rules.size() == 64 && p.capabilities.size() == 64 &&
@@ -565,12 +874,12 @@ bool ConfigRoundTrip(std::string* detail) {
 }
 
 bool BoundaryQuotas(std::string* detail) {
-  std::vector<V8HostFileRule> rules(65, V8HostFileRule{L"x", 0});
-  V8HostSessionConfig config = BasicConfig();
+  std::vector<TestFileRule> rules(65, TestFileRule{L"x", false});
+  TestSessionConfig config = BasicConfig();
   config.file_rules = rules.data();
   config.file_rule_count = 65;
   v8host_session_s* session = reinterpret_cast<v8host_session_s*>(1);
-  if (v8host_session_open(&config, &session) != v8host_status_quota_exceeded ||
+  if (OpenSession(&config, &session) != v8host_status_quota_exceeded ||
       session != nullptr)
     return Fail(detail, "65 file rules not rejected/null");
   std::vector<const wchar_t*> caps(65, L"cap");
@@ -580,37 +889,37 @@ bool BoundaryQuotas(std::string* detail) {
   config.capabilities = caps.data();
   config.capability_count = 65;
   session = reinterpret_cast<v8host_session_s*>(1);
-  if (v8host_session_open(&config, &session) != v8host_status_quota_exceeded ||
+  if (OpenSession(&config, &session) != v8host_status_quota_exceeded ||
       session != nullptr)
     return Fail(detail, "65 capabilities not rejected/null");
 
   std::wstring accepted(kMaxStringBytes, L'a');
-  V8HostFileRule long_rule{accepted.c_str(), 0};
+  TestFileRule long_rule{accepted.c_str(), false};
   config = BasicConfig();
   config.file_rules = &long_rule;
   config.file_rule_count = 1;
-  if (v8host_session_open(&config, &session) != v8host_status_ok)
+  if (OpenSession(&config, &session) != v8host_status_ok)
     return Fail(detail, "32-KiB string boundary rejected");
   v8host_session_close(session);
   Drain();
   std::wstring rejected(kMaxStringBytes + 1, L'a');
   long_rule.pattern = rejected.c_str();
   session = reinterpret_cast<v8host_session_s*>(1);
-  if (v8host_session_open(&config, &session) != v8host_status_quota_exceeded ||
+  if (OpenSession(&config, &session) != v8host_status_quota_exceeded ||
       session != nullptr)
     return Fail(detail, "32-KiB+1 string not rejected/null");
 
   FakeTransport* fake = nullptr;
   session = Create(&fake);
-  V8HostRunInputs input = BasicRun();
+  TestRunInputs input = BasicRun();
   v8host_run_s* runs[5] = {};
   for (int n = 0; n < 4; ++n) {
-    if (v8host_session_start_run(session, &input, &runs[n]) != v8host_status_ok)
+    if (StartRun(session, &input, &runs[n]) != v8host_status_ok)
       return Fail(detail, "four-run boundary rejected");
   }
 
   runs[4] = reinterpret_cast<v8host_run_s*>(1);
-  if (v8host_session_start_run(session, &input, &runs[4]) != v8host_status_quota_exceeded ||
+  if (StartRun(session, &input, &runs[4]) != v8host_status_quota_exceeded ||
       runs[4] != nullptr)
     return Fail(detail, "fifth in-flight run not rejected/null");
   v8host_session_close(session);
@@ -622,7 +931,7 @@ bool BoundaryQuotas(std::string* detail) {
   std::vector<uint8_t> guest(max_guest, 0xA5);
   input = BasicRun(guest.data(), guest.size());
   v8host_run_s* run = nullptr;
-  if (v8host_session_start_run(session, &input, &run) != v8host_status_ok)
+  if (StartRun(session, &input, &run) != v8host_status_ok)
     return Fail(detail, "exact frame ceiling rejected");
   v8host_session_close(session);
   Drain();
@@ -631,7 +940,7 @@ bool BoundaryQuotas(std::string* detail) {
   input = BasicRun(guest.data(), guest.size());
   run = reinterpret_cast<v8host_run_s*>(1);
   const bool over =
-      v8host_session_start_run(session, &input, &run) == v8host_status_quota_exceeded &&
+      StartRun(session, &input, &run) == v8host_status_quota_exceeded &&
       run == nullptr;
   v8host_session_close(session);
   Drain();
@@ -639,27 +948,31 @@ bool BoundaryQuotas(std::string* detail) {
 }
 
 bool ExhaustiveFailingOutputNulling(std::string* detail) {
-  auto create_fails_null = [&](const V8HostSessionConfig* config) {
+  auto create_fails_null = [&](const TestSessionConfig* config) {
     v8host_session_s* out = reinterpret_cast<v8host_session_s*>(1);
-    return v8host_session_open(config, &out) != v8host_status_ok &&
+    return OpenSession(config, &out) != v8host_status_ok &&
            out == nullptr;
   };
-  V8HostSessionConfig config = BasicConfig();
-  if (!create_fails_null(nullptr))
-    return Fail(detail, "null config output");
-  config.struct_size--;
-  if (!create_fails_null(&config))
-    return Fail(detail, "small config output");
-  config = BasicConfig();
-  config.broker_mode = 2;
+  TestSessionConfig config = BasicConfig();
+  {
+    v8host_session out = reinterpret_cast<v8host_session>(1);
+    if (v8host_session_open(&FailSessionConfigure, nullptr, &out) ==
+            v8host_status_ok ||
+        out != nullptr) {
+      return Fail(detail, "failing configure output");
+    }
+  }
+  config.broker_mode = static_cast<v8host_broker_mode>(2);
   if (!create_fails_null(&config))
     return Fail(detail, "broker enum output");
   config = BasicConfig();
-  config.tier = 2;
+  config.tier = static_cast<v8host_tier>(2);
   if (!create_fails_null(&config))
     return Fail(detail, "tier enum output");
   config = BasicConfig();
-  config.file_rule_count = 65;
+  const std::vector<TestFileRule> too_many_rules(65, TestFileRule{L"C:\\x"});
+  config.file_rules = too_many_rules.data();
+  config.file_rule_count = too_many_rules.size();
   if (!create_fails_null(&config))
     return Fail(detail, "count output");
   config = BasicConfig();
@@ -668,18 +981,20 @@ bool ExhaustiveFailingOutputNulling(std::string* detail) {
     return Fail(detail, "AppContainer output");
 
   v8host_session_s* session = Create();
-  auto start_fails_null = [&](const V8HostRunInputs* input) {
+  auto start_fails_null = [&](const TestRunInputs* input) {
     v8host_run_s* out = reinterpret_cast<v8host_run_s*>(1);
-    return v8host_session_start_run(session, input, &out) != v8host_status_ok &&
+    return StartRun(session, input, &out) != v8host_status_ok &&
            out == nullptr;
   };
-  if (!start_fails_null(nullptr))
-    return Fail(detail, "null run input output");
-  V8HostRunInputs input = BasicRun();
-  input.struct_size--;
-  if (!start_fails_null(&input))
-    return Fail(detail, "small run input output");
-  input = BasicRun();
+  {
+    v8host_run out = reinterpret_cast<v8host_run>(1);
+    if (v8host_session_start_run(session, &FailRunConfigure, nullptr, &out) ==
+            v8host_status_ok ||
+        out != nullptr) {
+      return Fail(detail, "failing run configure output");
+    }
+  }
+  TestRunInputs input = BasicRun();
   input.tier_override = 1;
   if (!start_fails_null(&input))
     return Fail(detail, "tier envelope output");
@@ -707,11 +1022,11 @@ bool RunAndRelayRoundTrip(std::string* detail) {
   FakeTransport* fake = nullptr;
   v8host_session_s* session = Create(&fake);
   char payload[] = "guest";
-  V8HostRunInputs i = BasicRun(payload, 5);
+  TestRunInputs i = BasicRun(payload, 5);
   i.engine_dll_override = L"engine.dll";
   i.startup_snapshot_path = L"snap.bin";
   v8host_run_s* run = nullptr;
-  if (v8host_session_start_run(session, &i, &run) != v8host_status_ok)
+  if (StartRun(session, &i, &run) != v8host_status_ok)
     return Fail(detail, "start");
   std::memset(payload, 'x', 5);
   FrameHeader h; const uint8_t* body; size_t len;
@@ -723,14 +1038,22 @@ bool RunAndRelayRoundTrip(std::string* detail) {
       p.engine_filename != "engine.dll" || h.run_id == 0)
     return Fail(detail, "start roundtrip/copy");
   char relay[] = "abc";
-  if (v8host_run_post_message(run, -7, relay, 3) != v8host_status_ok)
+  // A kind outside v8host_message_kind is rejected before anything is queued;
+  // the next frame must still be the valid relay below.
+  for (int32_t bad_kind : {-7, 2}) {
+    if (v8host_run_post_message(run, static_cast<v8host_message_kind>(bad_kind),
+                                relay, 3) != v8host_status_invalid_arg)
+      return Fail(detail, "relay kind not rejected");
+  }
+  if (v8host_run_post_message(run, v8host_message_kind_binary, relay, 3) !=
+      v8host_status_ok)
     return Fail(detail, "relay post");
   std::memset(relay, 'z', 3);
   frame = fake->Frame(2);
   int32_t kind; const uint8_t* relay_body; size_t relay_len;
   if (!DecodeFrame(frame, &h, &body, &len) ||
       !DecodeRelayPayload(body, len, &kind, &relay_body, &relay_len) ||
-      h.request_id != 0 || kind != -7 || relay_len != 3 ||
+      h.request_id != 0 || kind != v8host_message_kind_binary || relay_len != 3 ||
       std::memcmp(relay_body, "abc", 3) != 0)
     return Fail(detail, "relay roundtrip/copy");
   if (v8host_run_cancel(run) != v8host_status_ok)
@@ -739,7 +1062,8 @@ bool RunAndRelayRoundTrip(std::string* detail) {
   if (!DecodeFrame(frame, &h, &body, &len) ||
       h.type != MessageType::CANCEL_RUN || len != 0)
     return Fail(detail, "cancel serialization");
-  if (v8host_run_post_message(run, 9, nullptr, 0) != v8host_status_ok)
+  if (v8host_run_post_message(run, v8host_message_kind_string, nullptr, 0) !=
+      v8host_status_ok)
     return Fail(detail, "empty relay");
   FrameHeader empty_header;
   frame = fake->Frame(4);
@@ -815,9 +1139,9 @@ bool InboundRunAndTerminal(std::string* detail) {
   Recorder r;
   v8host_callbacks cb = Callbacks(&r);
   v8host_session_set_callbacks(session, &cb);
-  V8HostRunInputs input = BasicRun();
+  TestRunInputs input = BasicRun();
   v8host_run_s* run = nullptr;
-  v8host_session_start_run(session, &input, &run);
+  StartRun(session, &input, &run);
   FrameHeader start;
   const auto start_frame = fake->Frame(1);
   DecodeAndValidateFrame(start_frame.data(), start_frame.size(), &start);
@@ -843,7 +1167,7 @@ bool InboundRunAndTerminal(std::string* detail) {
       r.kinds.size() == 1 && r.kinds[0] == 42 && r.messages[0] == "hi" &&
       r.run_thread == ::GetCurrentThreadId() &&
       r.relay_thread == ::GetCurrentThreadId() &&
-      v8host_run_post_message(run, 0, nullptr, 0) ==
+      v8host_run_post_message(run, v8host_message_kind_string, nullptr, 0) ==
           v8host_status_run_terminal &&
       v8host_run_cancel(run) == v8host_status_run_terminal;
   v8host_session_close(session);
@@ -857,9 +1181,9 @@ bool InboundCancelledResult(std::string* detail) {
   Recorder r;
   v8host_callbacks cb = Callbacks(&r);
   v8host_session_set_callbacks(session, &cb);
-  V8HostRunInputs input = BasicRun();
+  TestRunInputs input = BasicRun();
   v8host_run_s* run = nullptr;
-  v8host_session_start_run(session, &input, &run);
+  StartRun(session, &input, &run);
   FrameHeader start;
   const auto start_frame = fake->Frame(1);
   DecodeAndValidateFrame(start_frame.data(), start_frame.size(), &start);
@@ -886,9 +1210,9 @@ bool LateTrafficAfterTerminal(std::string* detail) {
   Recorder r;
   v8host_callbacks callbacks = Callbacks(&r);
   v8host_session_set_callbacks(session, &callbacks);
-  V8HostRunInputs input = BasicRun();
+  TestRunInputs input = BasicRun();
   v8host_run_s* run = nullptr;
-  v8host_session_start_run(session, &input, &run);
+  StartRun(session, &input, &run);
   const auto start_frame = fake->Frame(1);
   FrameHeader start;
   DecodeAndValidateFrame(start_frame.data(), start_frame.size(), &start);
@@ -918,9 +1242,9 @@ bool CorrelationMismatchDisconnects(std::string* detail) {
     Recorder r;
     v8host_callbacks callbacks = Callbacks(&r);
     v8host_session_set_callbacks(session, &callbacks);
-    V8HostRunInputs input = BasicRun();
+    TestRunInputs input = BasicRun();
     v8host_run_s* run = nullptr;
-    v8host_session_start_run(session, &input, &run);
+    StartRun(session, &input, &run);
     const auto request = fake->Frame(1);
     FrameHeader request_header;
     DecodeAndValidateFrame(request.data(), request.size(), &request_header);
@@ -964,9 +1288,9 @@ bool UnknownRequestIdDisconnects(std::string* detail) {
     Recorder r;
     v8host_callbacks callbacks = Callbacks(&r);
     v8host_session_set_callbacks(session, &callbacks);
-    V8HostRunInputs input = BasicRun();
+    TestRunInputs input = BasicRun();
     v8host_run_s* run = nullptr;
-    v8host_session_start_run(session, &input, &run);
+    StartRun(session, &input, &run);
     const auto request = fake->Frame(1);
     std::vector<uint8_t> response =
         use_error ? ErrorFor(request) : AckFor(request);
@@ -999,8 +1323,8 @@ bool RelayQuotaError(std::string* detail) {
     if (!session) return Fail(detail, "quota session");
     Recorder r; auto cb = Callbacks(&r); v8host_session_set_callbacks(session, &cb);
     auto input = BasicRun(); v8host_run_s *first = nullptr, *second = nullptr;
-    if (v8host_session_start_run(session, &input, &first) != v8host_status_ok ||
-        v8host_session_start_run(session, &input, &second) != v8host_status_ok) return Fail(detail, "quota runs");
+    if (StartRun(session, &input, &first) != v8host_status_ok ||
+        StartRun(session, &input, &second) != v8host_status_ok) return Fail(detail, "quota runs");
     FrameHeader h; auto request = fake->Frame(1); DecodeAndValidateFrame(request.data(), request.size(), &h);
     fake->Inbound(AckFor(fake->Frame(0)));
     h.request_id = 0;
@@ -1022,7 +1346,8 @@ bool RelayQuotaError(std::string* detail) {
           r.events[0] != (path == 2 ? v8host_run_event_completed : v8host_run_event_failed) ||
           r.event_status[0] != (path == 2 ? v8host_status_ok : v8host_status_quota_exceeded) ||
           v8host_run_cancel(first) != v8host_status_run_terminal ||
-          v8host_run_post_message(second, 0, nullptr, 0) != v8host_status_ok)
+          v8host_run_post_message(second, v8host_message_kind_string, nullptr, 0) !=
+          v8host_status_ok)
         return Fail(detail, "quota addressing/duplicate/winner/other-run containment");
       if (path == 0) fake->Inbound(ResultFrame(h.session_id, h.run_id + 1));
       else fake->Disconnect();
@@ -1048,9 +1373,9 @@ bool RelayQuotaError(std::string* detail) {
 bool PendingCapacityAndDuplicateAck(std::string* detail) {
   FakeTransport* fake = nullptr;
   v8host_session_s* session = Create(&fake);
-  V8HostRunInputs input = BasicRun();
+  TestRunInputs input = BasicRun();
   v8host_run_s* run = nullptr;
-  if (v8host_session_start_run(session, &input, &run) != v8host_status_ok)
+  if (StartRun(session, &input, &run) != v8host_status_ok)
     return Fail(detail, "capacity run setup");
   fake->Inbound(AckFor(fake->Frame(0)));
   fake->Inbound(AckFor(fake->Frame(1)));
@@ -1071,7 +1396,8 @@ bool PendingCapacityAndDuplicateAck(std::string* detail) {
     fake->Inbound(AckFor(fake->Frame(n)));
   fake->Inbound(first_ack);
   if (fake->closed.load() ||
-      v8host_run_post_message(run, 7, nullptr, 0) != v8host_status_ok)
+      v8host_run_post_message(run, v8host_message_kind_binary, nullptr, 0) !=
+          v8host_status_ok)
     return Fail(detail, "duplicate ACK falsely terminalized connection");
   v8host_session_close(session);
   Drain();
@@ -1085,9 +1411,9 @@ bool ReentrantClose(std::string* detail) {
   r.close_in_callback = true;
   v8host_callbacks cb = Callbacks(&r);
   v8host_session_set_callbacks(session, &cb);
-  V8HostRunInputs input = BasicRun();
+  TestRunInputs input = BasicRun();
   v8host_run_s* run = nullptr;
-  if (v8host_session_start_run(session, &input, &run) != v8host_status_ok)
+  if (StartRun(session, &input, &run) != v8host_status_ok)
     return Fail(detail, "reentrant close run setup");
   r.run = run;
   FrameHeader h;
@@ -1115,14 +1441,14 @@ struct ReentrantOps {
   std::atomic<int> calls{0};
 };
 
-void V8HOST_CDECL OnReentrantPostSet(void* context,
-                                    v8host_session_s*,
-                                    int32_t,
+void V8HOST_CDECL OnReentrantPostSet(void* user_data,
+                                    v8host_session,
+                                    v8host_session_state,
                                     v8host_status) {
-  auto* ops = static_cast<ReentrantOps*>(context);
+  auto* ops = static_cast<ReentrantOps*>(user_data);
   const char value[] = "r";
-  ops->post_status =
-      v8host_run_post_message(ops->run, 99, value, sizeof(value) - 1);
+  ops->post_status = v8host_run_post_message(
+      ops->run, v8host_message_kind_string, value, sizeof(value) - 1);
   ops->set_status =
       v8host_session_set_callbacks(ops->session, &ops->replacement);
   ops->calls.fetch_add(1);
@@ -1131,9 +1457,9 @@ void V8HOST_CDECL OnReentrantPostSet(void* context,
 bool ReentrantPostAndSet(std::string* detail) {
   FakeTransport* fake = nullptr;
   v8host_session_s* session = Create(&fake);
-  V8HostRunInputs input = BasicRun();
+  TestRunInputs input = BasicRun();
   v8host_run_s* run = nullptr;
-  v8host_session_start_run(session, &input, &run);
+  StartRun(session, &input, &run);
   Recorder replacement;
   ReentrantOps ops;
   ops.session = session;
@@ -1141,7 +1467,7 @@ bool ReentrantPostAndSet(std::string* detail) {
   ops.replacement = Callbacks(&replacement);
   v8host_callbacks callbacks = {};
   callbacks.struct_size = sizeof(callbacks);
-  callbacks.context = &ops;
+  callbacks.user_data = &ops;
   callbacks.on_session_state = &OnReentrantPostSet;
   v8host_session_set_callbacks(session, &callbacks);
   FrameHeader h;
@@ -1231,10 +1557,10 @@ bool DisconnectNoReplay(std::string* detail) {
   Recorder r;
   auto cb = Callbacks(&r);
   v8host_session_set_callbacks(session, &cb);
-  V8HostRunInputs input = BasicRun();
+  TestRunInputs input = BasicRun();
   v8host_run_s* run1 = nullptr; v8host_run_s* run2 = nullptr;
-  v8host_session_start_run(session, &input, &run1);
-  v8host_session_start_run(session, &input, &run2);
+  StartRun(session, &input, &run1);
+  StartRun(session, &input, &run2);
   const size_t before = fake->FrameCount();
   std::thread io([&] { fake->Disconnect(); });
   io.join();
@@ -1329,7 +1655,7 @@ bool StartupRegistrationFailure(std::string* detail) {
   Recorder r; auto callbacks = Callbacks(&r);
   v8host_session_set_callbacks(session, &callbacks);
   auto input = BasicRun(); v8host_run_s* run = nullptr;
-  if (v8host_session_start_run(session, &input, &run) != v8host_status_ok) return Fail(detail, "prestart run");
+  if (StartRun(session, &input, &run) != v8host_status_ok) return Fail(detail, "prestart run");
   if (!PumpUntil([&] { return r.total.load() >= 3; }) || r.states.size() != 1 || r.events.size() != 1 ||
       r.disconnects != 1 || r.state_status[0] != v8host_status_connect_failed ||
       r.events[0] != v8host_run_event_failed || r.event_status[0] != v8host_status_connect_failed || !fake->closed)
@@ -1345,7 +1671,7 @@ bool ClientIdExhaustion(std::string* detail) {
     v8host::client::SetIdsForTesting(session, request ? UINT32_MAX : 2, request ? 1 : UINT32_MAX);
     auto input = BasicRun(); v8host_run_s* run = reinterpret_cast<v8host_run_s*>(1);
     size_t count = fake->FrameCount();
-    if (v8host_session_start_run(session, &input, &run) != v8host_status_quota_exceeded || run ||
+    if (StartRun(session, &input, &run) != v8host_status_quota_exceeded || run ||
         !PumpUntil([&] { return r.disconnects == 1; }) || r.states.size() != 1 ||
         r.state_status[0] != v8host_status_protocol_error || fake->FrameCount() != count)
       return Fail(detail, "id exhaustion must close without wrap/write");
@@ -1360,15 +1686,15 @@ bool AdmissionRollback(std::string* detail) {
   fake->send_status = v8host_status_quota_exceeded;
   for (unsigned i = 0; i < 300; ++i) {
     v8host_run_s* run = reinterpret_cast<v8host_run_s*>(1);
-    if (v8host_session_start_run(session, &input, &run) != v8host_status_quota_exceeded || run)
+    if (StartRun(session, &input, &run) != v8host_status_quota_exceeded || run)
       return Fail(detail, "enqueue rejection pending/run rollback");
   }
   fake->send_status = v8host_status_ok;
   v8host_run_s* run = nullptr;
-  if (v8host_session_start_run(session, &input, &run) != v8host_status_ok || !run)
+  if (StartRun(session, &input, &run) != v8host_status_ok || !run)
     return Fail(detail, "admission after quota rejection");
   fake->send_status = v8host_status_quota_exceeded;
-  if (v8host_run_post_message(run, 0, nullptr, 0) != v8host_status_quota_exceeded ||
+  if (v8host_run_post_message(run, v8host_message_kind_string, nullptr, 0) != v8host_status_quota_exceeded ||
       v8host_run_cancel(run) != v8host_status_quota_exceeded)
     return Fail(detail, "post/cancel admission status");
   Drain();
@@ -2034,7 +2360,7 @@ bool RealClientFailurePaths(std::string* detail) {
     struct CloseSession { v8host_session_s* session; ~CloseSession() { if (session) v8host_session_close(session); } } cleanup{session};
     Recorder r; auto callbacks = Callbacks(&r); v8host_session_set_callbacks(session, &callbacks);
     auto input = BasicRun(); v8host_run_s* run = nullptr;
-    if (v8host_session_start_run(session, &input, &run) != v8host_status_ok) return Fail(detail, "real transport client start");
+    if (StartRun(session, &input, &run) != v8host_status_ok) return Fail(detail, "real transport client start");
     ::SetEvent(f.gate);
     if (!PumpUntil([&] { return ::WaitForSingleObject(f.entered, 0) == WAIT_OBJECT_0; }))
       return Fail(detail, "real client scheduled startup");
@@ -2255,7 +2581,7 @@ bool ControlIdSendOrder(std::string* detail) {
   FakeTransport* fake = nullptr; v8host_session_s* session = Create(&fake);
   Recorder r; auto callbacks = Callbacks(&r); v8host_session_set_callbacks(session, &callbacks);
   auto input = BasicRun(); v8host_run_s* run = nullptr;
-  if (v8host_session_start_run(session, &input, &run) != v8host_status_ok) return Fail(detail, "start");
+  if (StartRun(session, &input, &run) != v8host_status_ok) return Fail(detail, "start");
   g_first_admitted = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
   g_second_attempted = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
   g_submission_before = g_submission_after = 0;
@@ -2344,10 +2670,10 @@ int main(int argc, char** argv) {
   if (argc >= 2 && std::strcmp(argv[1], "--px-orphan-helper") == 0)
     return RunOrphanHelper(argc, argv);
   SetTransportFactoryForTesting(&MakeFake);
-  V8HostSessionConfig preinit_config = BasicConfig();
+  TestSessionConfig preinit_config = BasicConfig();
   v8host_session_s* preinit_session = reinterpret_cast<v8host_session_s*>(1);
   g_preinitialize_output_was_nulled =
-      v8host_session_open(&preinit_config, &preinit_session) ==
+      OpenSession(&preinit_config, &preinit_session) ==
           v8host_status_not_initialized &&
       preinit_session == nullptr;
   g_initializing_thread = ::GetCurrentThreadId();
@@ -2359,9 +2685,9 @@ int main(int argc, char** argv) {
       g_racer_calling = true;
       g_init_cv.notify_all();
     }
-    g_racer_init_status = v8host_initialize();
+    g_racer_init_status = v8host_initialize(V8HOST_ABI_VERSION);
   });
-  g_main_init_status = v8host_initialize();
+  g_main_init_status = v8host_initialize(V8HOST_ABI_VERSION);
   SetInitializeAfterDispatcherHookForTesting(nullptr);
   racer.join();
   std::vector<TestCase> tests = {
@@ -2397,6 +2723,7 @@ int main(int argc, char** argv) {
        ConcurrentInitializeLifecycle},
       {"validate", "struct-sizes", ValidateStructSizes},
       {"validate", "count-pointer-appcontainer", ValidatePairsAndPolicy},
+      {"validate", "builder-setters", ValidateBuilderSetters},
       {"validate", "tier-path-output-nulling", ValidateRunPolicyAndOutputs},
       {"config", "roundtrip-zero-and-64", ConfigRoundTrip},
       {"boundary", "counts-runs-strings-frame", BoundaryQuotas},

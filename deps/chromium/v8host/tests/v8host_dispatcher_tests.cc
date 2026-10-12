@@ -117,11 +117,11 @@ struct Recorder {
   std::atomic<int> total{0};
 };
 
-void V8HOST_CDECL OnSessionState(void* context,
-                                v8host_session_s* session,
-                                int32_t state,
+void V8HOST_CDECL OnSessionState(void* user_data,
+                                v8host_session session,
+                                v8host_session_state state,
                                 v8host_status status) {
-  auto* r = static_cast<Recorder*>(context);
+  auto* r = static_cast<Recorder*>(user_data);
   r->last_thread_id = ::GetCurrentThreadId();
   r->last_session = session;
   r->session_states.push_back(state);
@@ -129,11 +129,11 @@ void V8HOST_CDECL OnSessionState(void* context,
   r->total.fetch_add(1, std::memory_order_relaxed);
 }
 
-void V8HOST_CDECL OnRunEvent(void* context,
-                            v8host_run_s* run,
-                            int32_t event,
+void V8HOST_CDECL OnRunEvent(void* user_data,
+                            v8host_run run,
+                            v8host_run_event event,
                             v8host_status status) {
-  auto* r = static_cast<Recorder*>(context);
+  auto* r = static_cast<Recorder*>(user_data);
   r->last_thread_id = ::GetCurrentThreadId();
   r->last_run = run;
   r->run_events.push_back(event);
@@ -141,26 +141,26 @@ void V8HOST_CDECL OnRunEvent(void* context,
   r->total.fetch_add(1, std::memory_order_relaxed);
 }
 
-void V8HOST_CDECL OnRelay(void* context,
-                         v8host_run_s* run,
-                         int32_t kind,
+void V8HOST_CDECL OnRelay(void* user_data,
+                         v8host_run run,
+                         v8host_message_kind kind,
                          const void* data,
-                         size_t len) {
-  auto* r = static_cast<Recorder*>(context);
+                         size_t size) {
+  auto* r = static_cast<Recorder*>(user_data);
   r->last_thread_id = ::GetCurrentThreadId();
   r->last_run = run;
   r->relay_kinds.push_back(kind);
   // A zero-length relay carries a null pointer; build an empty string rather
   // than std::string(nullptr, 0) (constructing from a null pointer is UB).
-  if (len == 0 || data == nullptr)
+  if (size == 0 || data == nullptr)
     r->relay_data.emplace_back();
   else
-    r->relay_data.emplace_back(static_cast<const char*>(data), len);
+    r->relay_data.emplace_back(static_cast<const char*>(data), size);
   r->total.fetch_add(1, std::memory_order_relaxed);
 }
 
-void V8HOST_CDECL OnDisconnect(void* context) {
-  auto* r = static_cast<Recorder*>(context);
+void V8HOST_CDECL OnDisconnect(void* user_data) {
+  auto* r = static_cast<Recorder*>(user_data);
   r->last_thread_id = ::GetCurrentThreadId();
   r->disconnects++;
   r->total.fetch_add(1, std::memory_order_relaxed);
@@ -169,7 +169,7 @@ void V8HOST_CDECL OnDisconnect(void* context) {
 v8host_callbacks MakeTable(Recorder* r) {
   v8host_callbacks t = {};
   t.struct_size = sizeof(v8host_callbacks);
-  t.context = r;
+  t.user_data = r;
   t.on_session_state = &OnSessionState;
   t.on_run_event = &OnRunEvent;
   t.on_relay_message = &OnRelay;
@@ -495,11 +495,11 @@ struct ReentryCtx {
   std::atomic<int> total{0};
 };
 
-void V8HOST_CDECL ReentrySessionCb(void* context,
-                                  v8host_session_s* /*session*/,
-                                  int32_t /*state*/,
+void V8HOST_CDECL ReentrySessionCb(void* user_data,
+                                  v8host_session /*session*/,
+                                  v8host_session_state /*state*/,
                                   v8host_status /*status*/) {
-  auto* x = static_cast<ReentryCtx*>(context);
+  auto* x = static_cast<ReentryCtx*>(user_data);
   x->tid = ::GetCurrentThreadId();
   x->total.fetch_add(1, std::memory_order_relaxed);
 
@@ -522,7 +522,7 @@ void V8HOST_CDECL ReentrySessionCb(void* context,
 v8host_callbacks MakeReentryTable(ReentryCtx* ctx) {
   v8host_callbacks t = {};
   t.struct_size = sizeof(v8host_callbacks);
-  t.context = ctx;
+  t.user_data = ctx;
   t.on_session_state = &ReentrySessionCb;
   return t;
 }

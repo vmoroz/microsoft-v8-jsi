@@ -204,17 +204,19 @@ static_assert(sizeof(sbox_msg_kind) == sizeof(int) &&
 
 // --- sbox_worker_api: worker services the plugin's warmup()/run() call, bridged
 // to the sandbox core's sbox_target_* message channel ---
-sbox_status SBOX_CDECL WkGetPluginData(sbox_worker w, const void** data,
-                                      size_t* len) {
-  if (!w || !w->target || !data || !len)
+sbox_status SBOX_CDECL WkGetPluginData(sbox_worker w, const void** out_data,
+                                       size_t* out_size) {
+  if (!w || !w->target || !out_data || !out_size)
     return sbox_status_invalid_arg;
-  return sbox_target_plugin_data(w->target, data, len) ? sbox_status_ok : sbox_status_failed;
+  return sbox_target_plugin_data(w->target, out_data, out_size)
+             ? sbox_status_ok
+             : sbox_status_failed;
 }
-int SBOX_CDECL WkAcgEnabled(sbox_worker w) {
-  return (w && w->target) ? sbox_target_acg_enabled(w->target) : 0;
+bool SBOX_CDECL WkAcgEnabled(sbox_worker w) {
+  return (w && w->target) ? sbox_target_acg_enabled(w->target) != 0 : false;
 }
 sbox_status SBOX_CDECL WkPostMessage(sbox_worker w, sbox_msg_kind kind,
-                                    const void* data, size_t len) {
+                                     const void* data, size_t size) {
   if (!w || !w->target)
     return sbox_status_invalid_arg;
   // The engine/guest may post only opaque string/binary frames. sbox_msg_kind_lifecycle
@@ -223,20 +225,22 @@ sbox_status SBOX_CDECL WkPostMessage(sbox_worker w, sbox_msg_kind kind,
   if (kind != sbox_msg_kind_string && kind != sbox_msg_kind_binary)
     return sbox_status_invalid_arg;
   return sbox_target_post_message(w->target, static_cast<int>(kind), data,
-                                  len) == 0
+                                  size) == 0
              ? sbox_status_ok
              : sbox_status_failed;
 }
 void* SBOX_CDECL WkInboundEvent(sbox_worker w) {
   return (w && w->target) ? sbox_target_inbound_event(w->target) : nullptr;
 }
-sbox_status SBOX_CDECL WkDrainMessages(sbox_worker w, sbox_message_cb cb,
-                                      void* ctx) {
-  if (!w || !w->target || !cb)
+sbox_status SBOX_CDECL WkDrainMessages(sbox_worker w,
+                                       sbox_message_cb on_message,
+                                       void* user_data) {
+  if (!w || !w->target || !on_message)
     return sbox_status_invalid_arg;
   // sbox_message_cb and SboxMessageCb differ only in the kind parameter's type
   // (sbox_msg_kind vs int) — ABI-identical, so the reinterpret_cast is safe.
-  sbox_target_drain_messages(w->target, reinterpret_cast<SboxMessageCb>(cb), ctx);
+  sbox_target_drain_messages(
+      w->target, reinterpret_cast<SboxMessageCb>(on_message), user_data);
   return sbox_status_ok;
 }
 void* SBOX_CDECL WkCloseEvent(sbox_worker w) {
@@ -244,8 +248,7 @@ void* SBOX_CDECL WkCloseEvent(sbox_worker w) {
 }
 
 sbox_worker_api MakeWorkerApi() {
-  sbox_worker_api api = {};
-  api.struct_size = sizeof(api);
+  sbox_worker_api api = SBOX_WORKER_API_INIT;
   api.get_plugin_data = &WkGetPluginData;
   api.acg_enabled = &WkAcgEnabled;
   api.post_message = &WkPostMessage;
@@ -701,7 +704,7 @@ sbox_status SBOX_CDECL BrokerConfigureAndSpawn(
     const void* configure_data,
     size_t configure_data_size,
     sbox_message_cb on_message,
-    void* callback_context,
+    void* user_data,
     sbox_broker_worker* out_worker) {
   if (!broker || !out_worker || (configure_data_size && !configure_data) ||
       configure_data_size > 64 * 1024) {
@@ -726,7 +729,7 @@ sbox_status SBOX_CDECL BrokerConfigureAndSpawn(
   auto worker = std::make_unique<sbox_broker_worker_s>();
   worker->broker = broker;
   worker->callback = on_message;
-  worker->callback_context = callback_context;
+  worker->callback_context = user_data;
   worker->session =
       sbox_broker_spawn(broker->self_path.c_str(), &sandbox.marshal.policy,
                         &OnBrokerWorkerMessage, worker.get());
@@ -784,8 +787,7 @@ sbox_status SBOX_CDECL BrokerWait(sbox_broker_worker worker,
 }
 
 sbox_broker_api MakeBrokerApi() {
-  sbox_broker_api api = {};
-  api.struct_size = sizeof(api);
+  sbox_broker_api api = SBOX_BROKER_API_INIT;
   api.configure_and_spawn = &BrokerConfigureAndSpawn;
   api.post_message = &BrokerPostMessage;
   api.close = &BrokerClose;
@@ -819,15 +821,14 @@ int RunBrokerPlugin(int argc,
     printf("[sbox] broker: immutable payload verification failed\n");
     return 3;
   }
-  sbox_broker_start start = {};
-  start.struct_size = sizeof(start);
+  sbox_broker_start start = SBOX_BROKER_START_INIT;
   start.mode = mode;
-  start.endpoint_name = endpoint.c_str();
+  start.endpoint_name = WideToSbox(endpoint.c_str());
   start.native_machine = container_file.machine();
   start.container_sha256 = container_file.sha256().data();
   start.plugin_sha256 = plugin_file.sha256().data();
-  start.container_final_path = container_file.final_path().c_str();
-  start.plugin_final_path = plugin_file.final_path().c_str();
+  start.container_final_path = WideToSbox(container_file.final_path().c_str());
+  start.plugin_final_path = WideToSbox(plugin_file.final_path().c_str());
   start.container_file_token = &container_file;
   start.plugin_file_token = &plugin_file;
   if (mode == sbox_broker_mode_dedicated) {

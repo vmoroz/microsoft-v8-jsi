@@ -8,10 +8,10 @@ void SBOX_CDECL Shutdown(sbox_worker) {}
 const sbox_plugin_api kAbi4 = {sizeof(sbox_plugin_api), 4u, Configure, Broker, Worker, Worker, Shutdown};
 }
 extern "C" __declspec(dllexport) sbox_status SBOX_CDECL sbox_plugin_main(
-    uint32_t host_abi_version, const sbox_plugin_api** out) {
-  if (!out) return sbox_status_invalid_arg;
+    uint32_t host_abi_version, const sbox_plugin_api** out_plugin) {
+  if (!out_plugin) return sbox_status_invalid_arg;
   if (host_abi_version != 4u) return sbox_status_version_mismatch;
-  *out = &kAbi4;
+  *out_plugin = &kAbi4;
   return sbox_status_ok;
 }
 #else
@@ -22,7 +22,7 @@ extern "C" __declspec(dllexport) sbox_status SBOX_CDECL sbox_plugin_main(
 
 extern "C" __declspec(dllexport) sbox_status SBOX_CDECL sbox_plugin_main(
     uint32_t /*host_abi_version*/,
-    const sbox_plugin_api** out) {
+    const sbox_plugin_api** out_plugin) {
   static const sbox_plugin_api kInvalid = {sizeof(sbox_plugin_api),
                                        1u,  // not SBOX_ABI_VERSION
                                        nullptr,
@@ -30,8 +30,8 @@ extern "C" __declspec(dllexport) sbox_status SBOX_CDECL sbox_plugin_main(
                                        nullptr,
                                        nullptr,
                                        nullptr};
-  if (out)
-    *out = &kInvalid;
+  if (out_plugin)
+    *out_plugin = &kInvalid;
   return sbox_status_ok;
 }
 

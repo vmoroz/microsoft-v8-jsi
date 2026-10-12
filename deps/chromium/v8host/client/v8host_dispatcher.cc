@@ -323,7 +323,7 @@ v8host_status SessionDispatch::SetCallbacks(const v8host_callbacks* callbacks) {
 
   v8host_callbacks copy = {};
   copy.struct_size = sizeof(v8host_callbacks);
-  copy.context = callbacks->context;
+  copy.user_data = callbacks->user_data;
   copy.on_session_state = callbacks->on_session_state;
   copy.on_run_event = callbacks->on_run_event;
   copy.on_relay_message = callbacks->on_relay_message;
@@ -483,27 +483,30 @@ void SessionDispatch::Invoke(const Event& event) {
   switch (event.kind) {
     case EventKind::kSessionState:
       if (event.table.on_session_state) {
-        event.table.on_session_state(event.table.context, handle_, event.code,
-                                     event.status);
+        event.table.on_session_state(
+            event.table.user_data, handle_,
+            static_cast<v8host_session_state>(event.code), event.status);
       }
       break;
     case EventKind::kRunEvent:
       if (event.table.on_run_event) {
-        event.table.on_run_event(event.table.context, event.run, event.code,
+        event.table.on_run_event(event.table.user_data, event.run,
+                                 static_cast<v8host_run_event>(event.code),
                                  event.status);
       }
       break;
     case EventKind::kRelay:
       if (event.table.on_relay_message) {
         event.table.on_relay_message(
-            event.table.context, event.run, event.code,
+            event.table.user_data, event.run,
+            static_cast<v8host_message_kind>(event.code),
             event.data.empty() ? nullptr : event.data.data(),
             event.data.size());
       }
       break;
     case EventKind::kDisconnect:
       if (event.table.on_broker_disconnect)
-        event.table.on_broker_disconnect(event.table.context);
+        event.table.on_broker_disconnect(event.table.user_data);
       break;
   }
 }

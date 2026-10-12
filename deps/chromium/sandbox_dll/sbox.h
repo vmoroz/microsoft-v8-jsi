@@ -28,27 +28,44 @@
 
 #include "sbox_stela.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 // Pin the calling convention NOW (Node-API's NAPI_CDECL lesson): every export
 // AND every function pointer is SBOX_CDECL, so a plugin built with a different
 // toolchain still agrees on the ABI. You cannot pass function pointers across a
 // DLL boundary without a fixed convention.
 #ifndef SBOX_CDECL
+#ifdef _WIN32
 #define SBOX_CDECL __cdecl
+#else
+#define SBOX_CDECL
+#endif
 #endif
 
 // Defined by the plugin DLL's build to export sbox_plugin_main; empty for the
 // host EXE (which only CALLS the resolved pointer, never exports it).
+#ifndef SBOX_API
 #ifdef SBOX_IMPL
+#ifdef _WIN32
 #define SBOX_API __declspec(dllexport)
+#else
+#define SBOX_API __attribute__((visibility("default")))
+#endif
 #else
 #define SBOX_API
 #endif
+#endif
 
 #define SBOX_ABI_VERSION 5u
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// A UTF-16 code unit. Every string in this ABI is NUL-terminated UTF-16.
+#ifdef __cplusplus
+typedef char16_t sbox_char16;
+#else
+typedef uint16_t sbox_char16;
+#endif
 
 // Opaque, typed handles (Node-API style — never void*).
 typedef struct sbox_config_s* sbox_config;  // broker: the policy builder
@@ -122,26 +139,31 @@ SBOX_ENUM(int32_t, sbox_token_level){
     sbox_token_level_restricted_same_access = 4, ///< all SIDs; least restrictive
 };
 
-typedef void(SBOX_CDECL* sbox_message_cb)(void* ctx, sbox_msg_kind kind,
-                                         const void* data, size_t len);
+typedef void(SBOX_CDECL* sbox_message_cb)(void* user_data,
+                                          sbox_msg_kind kind,
+                                          const void* data,
+                                          size_t size);
 
 // Host-owned identity storage borrowed only for broker_run. The opaque tokens
 // are never serialized and must not be closed by the plugin.
 typedef struct sbox_broker_start {
   uint32_t struct_size;
-  uint32_t mode;
-  const wchar_t* endpoint_name;
+  sbox_broker_mode mode;
+  const sbox_char16* endpoint_name;
   uint16_t native_machine;
   uint16_t reserved;
   const uint8_t* container_sha256;
   const uint8_t* plugin_sha256;
-  const wchar_t* container_final_path;
-  const wchar_t* plugin_final_path;
+  const sbox_char16* container_final_path;
+  const sbox_char16* plugin_final_path;
   const void* container_file_token;
   const void* plugin_file_token;
   const uint8_t* dedicated_nonce;
   size_t dedicated_nonce_size;
 } sbox_broker_start;
+#define SBOX_BROKER_START_INIT                                              \
+  {sizeof(sbox_broker_start), sbox_broker_mode_dedicated, NULL, 0, 0, NULL, \
+   NULL, NULL, NULL, NULL, NULL, NULL, 0}
 
 // configure_and_spawn copies configure_data before the call returns. Message
 // buffers are borrowed only for callback duration. After a successful spawn,
@@ -161,16 +183,17 @@ typedef struct sbox_broker_api {
       const void* configure_data,
       size_t configure_data_size,
       sbox_message_cb on_message,
-      void* callback_context,
+      void* user_data,
       sbox_broker_worker* out_worker);
   sbox_status(SBOX_CDECL* post_message)(sbox_broker_worker worker,
-                                       sbox_msg_kind kind,
-                                       const void* data,
-                                       size_t size);
+                                        sbox_msg_kind kind,
+                                        const void* data,
+                                        size_t size);
   sbox_status(SBOX_CDECL* close)(sbox_broker_worker worker);
   sbox_status(SBOX_CDECL* wait)(sbox_broker_worker worker,
-                               int32_t* out_exit_code);
+                                int32_t* out_exit_code);
 } sbox_broker_api;
+#define SBOX_BROKER_API_INIT {sizeof(sbox_broker_api), NULL, NULL, NULL, NULL}
 
 // --- sbox.exe -> plugin, BROKER role: services configure() uses to describe
 // the sandbox. sbox speaks ACG (a mitigation), never JIT. Every setter returns
@@ -179,43 +202,64 @@ typedef struct sbox_broker_api {
 // <=4096 plugin-data bytes. ---
 typedef struct sbox_config_api {
   uint32_t struct_size;  // sizeof(sbox_config_api); lets the plugin version-check
-  sbox_status (SBOX_CDECL* set_acg)(sbox_config, int enable);  // Arbitrary Code Guard
-  sbox_status (SBOX_CDECL* set_integrity)(sbox_config, int initial, int delayed);
-  sbox_status (SBOX_CDECL* add_file_rule)(sbox_config, const wchar_t* pattern,
-                                         int readonly);
-  sbox_status (SBOX_CDECL* add_capability)(sbox_config,
-                                          const wchar_t* capability_sid);
-  sbox_status (SBOX_CDECL* set_app_container)(sbox_config, int enable, int lpac,
-                                             const wchar_t* profile);
+  // Arbitrary Code Guard.
+  sbox_status(SBOX_CDECL* set_acg)(sbox_config config, bool enabled);
+  sbox_status(SBOX_CDECL* set_integrity)(sbox_config config,
+                                         sbox_integrity_level initial,
+                                         sbox_integrity_level delayed);
+  sbox_status(SBOX_CDECL* add_file_rule)(sbox_config config,
+                                         const sbox_char16* pattern,
+                                         bool readonly);
+  sbox_status(SBOX_CDECL* add_capability)(sbox_config config,
+                                          const sbox_char16* capability_sid);
+  sbox_status(SBOX_CDECL* set_app_container)(sbox_config config,
+                                             bool enabled,
+                                             bool lpac,
+                                             const sbox_char16* profile);
   // DLLs the worker will LoadLibrary pre-lockdown. sbox verifies each (app-dir
   // filename only, Authenticode). The plugin DLL itself is implicit.
-  sbox_status (SBOX_CDECL* allow_engine_dll)(sbox_config, const wchar_t* filename);
+  sbox_status(SBOX_CDECL* allow_engine_dll)(sbox_config config,
+                                            const sbox_char16* filename);
   // Opaque app-knowledge blob carried broker->worker; sbox NEVER interprets it.
   // The plugin encodes its own run profile here (e.g. jitless engine choice,
   // snapshot path) and reads it back in warmup via sbox_worker_api.get_plugin_data.
-  sbox_status (SBOX_CDECL* set_plugin_data)(sbox_config, const void* data, size_t len);
-  // Restricted-token levels (sbox_token_level) for ordinary (non-AppContainer)
-  // mode: the worker's initial token and the lowered lockdown token. Appended
-  // last to keep the vtable append-only across the ABI bump.
-  sbox_status (SBOX_CDECL* set_tokens)(sbox_config, int initial_token,
-                                      int lockdown_token);
+  sbox_status(SBOX_CDECL* set_plugin_data)(sbox_config config,
+                                           const void* data,
+                                           size_t size);
+  // Restricted-token levels for ordinary (non-AppContainer) mode: the worker's
+  // initial token and the lowered lockdown token. Appended last to keep the
+  // vtable append-only across the ABI bump.
+  sbox_status(SBOX_CDECL* set_tokens)(sbox_config config,
+                                      sbox_token_level initial_token,
+                                      sbox_token_level lockdown_token);
 } sbox_config_api;
+#define SBOX_CONFIG_API_INIT \
+  {sizeof(sbox_config_api), NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL}
 
 // --- sbox.exe -> plugin, WORKER role: services warmup()/run() use. ---
 typedef struct sbox_worker_api {
   uint32_t struct_size;  // sizeof(sbox_worker_api)
   // the broker-set opaque blob (app knowledge); valid for the worker lifetime.
-  sbox_status (SBOX_CDECL* get_plugin_data)(sbox_worker, const void** data,
-                                           size_t* len);
-  int (SBOX_CDECL* acg_enabled)(sbox_worker);  // 1 if ACG is/will be armed
+  sbox_status(SBOX_CDECL* get_plugin_data)(sbox_worker worker,
+                                           const void** out_data,
+                                           size_t* out_size);
+  // true if ACG is/will be armed.
+  bool(SBOX_CDECL* acg_enabled)(sbox_worker worker);
   // WebView2-style duplex message channel (opaque frames; host-untrusted input).
-  sbox_status (SBOX_CDECL* post_message)(sbox_worker, sbox_msg_kind,
-                                        const void* data, size_t len);
-  void* (SBOX_CDECL* inbound_event)(sbox_worker);  // HANDLE to wait on
-  sbox_status (SBOX_CDECL* drain_messages)(sbox_worker, sbox_message_cb,
-                                          void* ctx);
-  void* (SBOX_CDECL* close_event)(sbox_worker);  // HANDLE: host asked to close
+  sbox_status(SBOX_CDECL* post_message)(sbox_worker worker,
+                                        sbox_msg_kind kind,
+                                        const void* data,
+                                        size_t size);
+  // HANDLE to wait on.
+  void*(SBOX_CDECL* inbound_event)(sbox_worker worker);
+  sbox_status(SBOX_CDECL* drain_messages)(sbox_worker worker,
+                                          sbox_message_cb on_message,
+                                          void* user_data);
+  // HANDLE: host asked to close.
+  void*(SBOX_CDECL* close_event)(sbox_worker worker);
 } sbox_worker_api;
+#define SBOX_WORKER_API_INIT \
+  {sizeof(sbox_worker_api), NULL, NULL, NULL, NULL, NULL, NULL}
 
 // --- the plugin interface (plugin implements; sbox.exe calls by role) ---
 typedef struct sbox_plugin_api {
@@ -223,23 +267,26 @@ typedef struct sbox_plugin_api {
   uint32_t abi_version;  // == SBOX_ABI_VERSION the plugin was built against
   // BROKER: describe the sandbox the worker will run in.
   // configure_data is copied host storage valid only for this call.
-  sbox_status (SBOX_CDECL* configure)(sbox_config cfg,
+  sbox_status(SBOX_CDECL* configure)(sbox_config config,
                                      const sbox_config_api* api,
                                      const void* configure_data,
                                      size_t configure_data_size);
   // Blocking coordinator entry. It must stop accepts and join every task and
   // broker worker before returning.
-  sbox_status (SBOX_CDECL* broker_run)(sbox_broker broker,
+  sbox_status(SBOX_CDECL* broker_run)(sbox_broker broker,
                                       const sbox_broker_api* api,
                                       const sbox_broker_start* start);
   // WORKER (driven in order by sbox.exe):
-  sbox_status (SBOX_CDECL* warmup)(sbox_worker w,
-                                  const sbox_worker_api* api);  // PRE-lockdown
+  // PRE-lockdown.
+  sbox_status(SBOX_CDECL* warmup)(sbox_worker worker,
+                                  const sbox_worker_api* api);
   //              --- sbox.exe lowers the token here (ACG armed) ---
-  sbox_status (SBOX_CDECL* run)(sbox_worker w,
-                               const sbox_worker_api* api);  // POST-lockdown
-  void (SBOX_CDECL* shutdown)(sbox_worker w);
+  // POST-lockdown.
+  sbox_status(SBOX_CDECL* run)(sbox_worker worker, const sbox_worker_api* api);
+  void(SBOX_CDECL* shutdown)(sbox_worker worker);
 } sbox_plugin_api;
+#define SBOX_PLUGIN_API_INIT \
+  {sizeof(sbox_plugin_api), 0, NULL, NULL, NULL, NULL, NULL}
 
 // The plugin's single required export (cf. Node-API napi_register_module_v1).
 // sbox.exe resolves it by name from the --plugin DLL — no import lib, so the
@@ -247,10 +294,11 @@ typedef struct sbox_plugin_api {
 // SBOX_ABI_VERSION. The returned sbox_plugin_api is owned by the plugin (typically a
 // file-scope static) and must outlive every call sbox.exe makes through it.
 #define SBOX_PLUGIN_ENTRY "sbox_plugin_main"
-typedef sbox_status(SBOX_CDECL* sbox_plugin_main_fn)(uint32_t host_abi_version,
-                                                    const sbox_plugin_api** out);
-SBOX_API sbox_status SBOX_CDECL sbox_plugin_main(uint32_t host_abi_version,
-                                                   const sbox_plugin_api** out);
+typedef sbox_status(SBOX_CDECL* sbox_plugin_main_fn)(
+    uint32_t host_abi_version,
+    const sbox_plugin_api** out_plugin);
+SBOX_API sbox_status SBOX_CDECL
+sbox_plugin_main(uint32_t host_abi_version, const sbox_plugin_api** out_plugin);
 
 #ifdef __cplusplus
 }
