@@ -78,10 +78,11 @@ extern "C" {
  * append-only with behavioral pinning. The consumer's compiled-against value is
  * passed to the engine's create function (e.g. v8_jsi_abi_runtime_create), which pins
  * the runtime to it or fails if it exceeds the implementation's max (Model B).
+ * Version 2 is the first status-based ABI; version 1 is no longer accepted.
  *==========================================================================*/
 
 /// The current JSI ABI version.
-#define JSI_ABI_VERSION 1u
+#define JSI_ABI_VERSION 2u
 
 /*==========================================================================
  * Forward Declarations

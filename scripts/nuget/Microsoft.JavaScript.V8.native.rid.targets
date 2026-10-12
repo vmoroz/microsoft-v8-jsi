@@ -40,7 +40,7 @@
        V8JsiRuntime.cpp holds makeV8Runtime + the V8ScriptCache and V8TaskRunner
        adapters. JsiAbiRuntime.cpp is the C++ wrapper that implements
        jsi::Runtime over the JSI ABI vtable. Both compile against v8jsi.dll's
-       stable C exports (v8_jsi_config_*, get_jsi_abi_v8_vtable, etc.). -->
+       C exports (v8_jsi_abi_runtime_create, v8_jsi_abi_config_set_*, etc.). -->
   <ItemGroup Condition=" '$(V8JsiRuntimeIdentifier)' == '$rid$' AND '$(V8JsiAddConsumerSourceTUs)' == 'True' ">
     <ClCompile Include="$(MSBuildThisFileDirectory)jsi\jsi\jsi.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)jsi\public\V8JsiRuntime.cpp" />

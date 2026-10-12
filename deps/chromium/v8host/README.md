@@ -31,7 +31,7 @@ the `LowerToken` boundary and exposed as the plugin vtable:
   path from the app dir (`v8jsisb.dll` jitless for Untrusted, `v8jsi.dll` for
   Trusted), sets `--jitless` when the profile says so, optionally loads and
   prechecks the startup snapshot, reads the guest JS, creates the JSI runtime
-  (`makeJsiAbiRuntime` over `v8_create_runtime`), and installs the `host` object.
+  (`makeJsiAbiRuntime` over `v8_jsi_abi_runtime_create`), and installs the `host` object.
   All codegen (engine load, snapshot deserialize, runtime create) happens
   **here**, because ACG forbids it after `lower_token`.
 - **`run` (post-lockdown):** proves ACG is in force with a blocked executable

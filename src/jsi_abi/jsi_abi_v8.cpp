@@ -3047,8 +3047,10 @@ V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_runtime_create(
     return jsi_status_invalid_arg;
   *out_runtime = nullptr;
 
-  // Model B version negotiation: refuse a version newer than we implement.
-  if (abi_version > JSI_ABI_VERSION)
+  // Model B version negotiation: refuse a version newer than we implement,
+  // and version 1, which predates the status-based ABI.
+  constexpr uint32_t kMinAbiVersion = 2;
+  if (abi_version < kMinAbiVersion || abi_version > JSI_ABI_VERSION)
     return jsi_status_version_mismatch;
 
   jsi_runtime *rt = nullptr;

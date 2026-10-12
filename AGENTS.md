@@ -107,9 +107,13 @@ test library.
 ### ABI layer (`src/jsi_abi/`)
 The binary-stable C ABI for JSI (see "ABI architecture" below).
 - `jsi_abi.h` — engine-agnostic C ABI header (shared with hermes-windows)
-- `jsi_abi_helpers.h` — C++ helpers for the OrError encodings (shared)
+- `jsi_abi_stela.h` — the `JSI_ABI_*` annotation macros `jsi_abi.h` uses
+- `jsi_abi_helpers.h` — C++ helpers for creating handles and checking value kinds
+  (shared)
 - `jsi_abi_v8.cpp` — V8 implementation of the ABI (exception-free)
-- `v8_jsi_config.h` — V8-specific config + `v8_create_runtime` / `v8_jsi_set_v8_flags`
+- `v8_jsi_abi.h` — V8-specific exports: `v8_jsi_abi_runtime_create`, the
+  `v8_jsi_abi_config_set_*` setters, `v8_jsi_abi_set_v8_flags`, and the
+  startup-snapshot functions
 - `JsiAbiRuntime.{h,cpp}` — C++ wrapper implementing `jsi::Runtime` over the ABI
   (shared with hermes-windows; uses exceptions for JSI compatibility)
 - `v8_node_api_attach.h` — seam that attaches a Node-API surface to a `jsi_runtime`
@@ -141,29 +145,34 @@ The binary-stable C ABI for JSI (see "ABI architecture" below).
 The ABI gives JSI a stable C interface so a single `v8jsi.dll` can serve
 consumers compiled with different toolchains.
 
-- **Creation is a flat function.** `v8_create_runtime(uint32_t
-  requested_abi_version, jsi_configure_runtime_cb configure, void *configure_data)`
-  — there is no factory vtable. It returns a `jsi_runtime*` (refcount 1) or NULL.
-- **Versioning is out of band (Model B).** `JSI_ABI_VERSION` is a single
-  monotonic integer; the consumer passes the version it compiled against and the
-  implementation pins to it or fails if it exceeds the implementation's max. The
+- **Creation is a flat function.** `v8_jsi_abi_runtime_create(uint32_t
+  abi_version, jsi_configure_runtime_cb configure, void *user_data,
+  jsi_runtime **out_runtime)` — there is no factory vtable. It returns a
+  `jsi_status` and sets `*out_runtime` to a `jsi_runtime*` (refcount 1), or NULL
+  on failure.
+- **Versioning is out of band (Model B).** `JSI_ABI_VERSION` (currently 2) is a
+  single monotonic integer; the consumer passes the version it compiled against
+  and the implementation pins to it, or fails with `jsi_status_version_mismatch`
+  if it exceeds the implementation's max or predates version 2. The
   C++ wrapper `makeJsiAbiRuntime` injects this for free. Vtables hold only
   function pointers (no version/reserved fields); an optional `get_abi_version()`
   reports the implementation's max.
 - **Configuration uses a factory-owned pull-callback.** The factory allocates the
   opaque `jsi_config`, hands it to the consumer's `configure` callback to populate
-  via the typed `v8_jsi_config_*` setters, then frees it — the handle never
-  escapes the callback. Consumers do not allocate or free the config.
+  via the typed `v8_jsi_abi_config_set_*` setters, then frees it — the handle
+  never escapes the callback. Consumers do not allocate or free the config. The
+  first failing setter poisons the config, and creation then fails with its
+  status.
 - **Optional capabilities go through `query_interface`** (COM-style, two outputs:
   vtable + instance) with immutable interface IDs. No optional interfaces are
   registered yet; it is the extension seam.
 - **Process-global V8 engine flags** (`sparkplug`, `jitless`, …) are set via the
-  process-level `v8_jsi_set_v8_flags` (forwarded to `V8::SetFlagsFromCommandLine`),
+  process-level `v8_jsi_abi_set_v8_flags` (forwarded to `V8::SetFlagsFromCommandLine`),
   not per-runtime config, because V8 reads them only at first process init.
 
 The V8 implementation (`jsi_abi_v8.cpp`) is **exception-free** to match
 V8/Node.js style: it uses a `TryCatch` wrapper and V8's `Maybe`/`MaybeLocal`
-patterns, returns `jsi_error_*` codes, and can compile with exceptions disabled.
+patterns, returns `jsi_status` codes, and can compile with exceptions disabled.
 
 `makeV8Runtime` (the public JSI entry point) is itself ABI-backed — it builds a
 runtime through the same ABI path as the Node-API surface.

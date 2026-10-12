@@ -702,6 +702,7 @@ function packNuGet(outputPath: string, platforms: string[], configurations: stri
   // for runtime configuration and the dual-API attach seam respectively.
   for (const file of [
     "jsi_abi.h",
+    "jsi_abi_stela.h",
     "jsi_abi_helpers.h",
     "JsiAbiRuntime.h",
     "JsiAbiRuntime.cpp",

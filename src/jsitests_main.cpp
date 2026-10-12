@@ -697,6 +697,14 @@ TEST(JsiAbiCreate, StatusAndOutput) {
       v8_jsi_abi_runtime_create(JSI_ABI_VERSION + 1, nullptr, nullptr, &rt), jsi_status_version_mismatch);
   EXPECT_EQ(rt, nullptr);
 
+  // Versions before 2 are rejected.
+  EXPECT_EQ(JSI_ABI_VERSION, 2u);
+  for (uint32_t old_version : {0u, 1u}) {
+    rt = reinterpret_cast<jsi_runtime *>(uintptr_t{1});
+    EXPECT_EQ(v8_jsi_abi_runtime_create(old_version, nullptr, nullptr, &rt), jsi_status_version_mismatch);
+    EXPECT_EQ(rt, nullptr);
+  }
+
   // A configure callback failure is returned as is.
   rt = reinterpret_cast<jsi_runtime *>(uintptr_t{1});
   jsi_configure_runtime_cb failing = [](void *, jsi_config) -> jsi_status { return jsi_status_native_error; };
