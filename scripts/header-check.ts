@@ -43,11 +43,7 @@ interface Header {
 const HEADERS: readonly Header[] = [
   { root: "deps/chromium/sandbox_dll", include: "sbox.h" },
   { root: "deps/chromium/sandbox_dll", include: "sbox_stela.h" },
-  {
-    root: "src/public",
-    include: "v8host_client.h",
-    pending: "includes <wchar.h>; the sbox.h + v8host_client.h migration fixes it",
-  },
+  { root: "src/public", include: "v8host_client.h" },
   { root: "src/public", include: "v8host_stela.h" },
   {
     root: "src",
