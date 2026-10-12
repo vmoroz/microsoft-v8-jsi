@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -362,11 +363,8 @@ class JsiAbiRuntime : public facebook::jsi::Runtime {
   [[noreturn]] void throwError(jsi_status err);
   void checkStatus(jsi_status err);
 
-  template <typename OrError>
-  void checkResult(const OrError &result);
-
-  template <typename T, typename Fn>
-  T abiRethrow(T (*wrapErr)(jsi_status), Fn fn);
+  template <typename Fn>
+  jsi_status abiRethrow(Fn fn);
 
   const jsi_runtime_api *api_;
   jsi_runtime *abiRt_;
@@ -435,27 +433,29 @@ class JsiAbiRuntime::HostFunctionWrapper : public jsi_host_function {
     delete static_cast<HostFunctionWrapper *>(self);
   }
 
-  static jsi_value_or_error JSI_ABI_CDECL call(
+  static jsi_status JSI_ABI_CDECL call(
       jsi_host_function *self,
       jsi_runtime * /*abiRt*/,
       const jsi_value *thisArg,
       const jsi_value *args,
-      size_t argCount) {
+      size_t argCount,
+      jsi_value *outValue) {
+    *outValue = abi::create_undefined_value();
     auto *wrapper = static_cast<HostFunctionWrapper *>(self);
     auto &rtw = wrapper->rtw_;
-    return rtw.abiRethrow(
-        abi::create_value_or_error, [&]() -> jsi_value_or_error {
-          facebook::jsi::Value jsThis = rtw.cloneToJSIValue(*thisArg);
-          std::vector<facebook::jsi::Value> jsArgs;
-          jsArgs.reserve(argCount);
-          for (size_t i = 0; i < argCount; ++i)
-            jsArgs.push_back(rtw.cloneToJSIValue(args[i]));
+    return rtw.abiRethrow([&]() -> jsi_status {
+      facebook::jsi::Value jsThis = rtw.cloneToJSIValue(*thisArg);
+      std::vector<facebook::jsi::Value> jsArgs;
+      jsArgs.reserve(argCount);
+      for (size_t i = 0; i < argCount; ++i)
+        jsArgs.push_back(rtw.cloneToJSIValue(args[i]));
 
-          facebook::jsi::Value result =
-              wrapper->hf_(rtw, jsThis, jsArgs.data(), argCount);
+      facebook::jsi::Value result =
+          wrapper->hf_(rtw, jsThis, jsArgs.data(), argCount);
 
-          return abi::create_value_or_error(rtw.cloneToABIValue(result));
-        });
+      *outValue = rtw.cloneToABIValue(result);
+      return jsi_status_ok;
+    });
   }
 };
 
@@ -508,19 +508,21 @@ class JsiAbiRuntime::HostObjectWrapper : public jsi_host_object {
     delete static_cast<HostObjectWrapper *>(self);
   }
 
-  static jsi_value_or_error JSI_ABI_CDECL get(
+  static jsi_status JSI_ABI_CDECL get(
       jsi_host_object *self,
       jsi_runtime * /*abiRt*/,
-      jsi_propnameid name) {
+      jsi_propnameid name,
+      jsi_value *outValue) {
+    *outValue = abi::create_undefined_value();
     auto *wrapper = static_cast<HostObjectWrapper *>(self);
     auto &rtw = wrapper->rtw_;
-    return rtw.abiRethrow(
-        abi::create_value_or_error, [&]() -> jsi_value_or_error {
-          facebook::jsi::PropNameID jsiName =
-              rtw.cloneToJSIPropNameID(name);
-          facebook::jsi::Value result = wrapper->ho_->get(rtw, jsiName);
-          return abi::create_value_or_error(rtw.cloneToABIValue(result));
-        });
+    return rtw.abiRethrow([&]() -> jsi_status {
+      facebook::jsi::PropNameID jsiName =
+          rtw.cloneToJSIPropNameID(name);
+      facebook::jsi::Value result = wrapper->ho_->get(rtw, jsiName);
+      *outValue = rtw.cloneToABIValue(result);
+      return jsi_status_ok;
+    });
   }
 
   static jsi_status JSI_ABI_CDECL set(
@@ -530,35 +532,33 @@ class JsiAbiRuntime::HostObjectWrapper : public jsi_host_object {
       const jsi_value *value) {
     auto *wrapper = static_cast<HostObjectWrapper *>(self);
     auto &rtw = wrapper->rtw_;
-    return rtw.abiRethrow(
-        abi::identity_error,
-        [&]() -> jsi_status {
-          facebook::jsi::PropNameID jsiName =
-              rtw.cloneToJSIPropNameID(name);
-          facebook::jsi::Value jsiVal = rtw.cloneToJSIValue(*value);
-          wrapper->ho_->set(rtw, jsiName, jsiVal);
-          return jsi_status_ok;
-        });
+    return rtw.abiRethrow([&]() -> jsi_status {
+      facebook::jsi::PropNameID jsiName =
+          rtw.cloneToJSIPropNameID(name);
+      facebook::jsi::Value jsiVal = rtw.cloneToJSIValue(*value);
+      wrapper->ho_->set(rtw, jsiName, jsiVal);
+      return jsi_status_ok;
+    });
   }
 
-  static jsi_propnameid_list_or_error JSI_ABI_CDECL getOwnKeys(
+  static jsi_status JSI_ABI_CDECL getOwnKeys(
       jsi_host_object *self,
-      jsi_runtime * /*abiRt*/) {
+      jsi_runtime * /*abiRt*/,
+      jsi_propnameid_list **outList) {
+    *outList = nullptr;
     auto *wrapper = static_cast<HostObjectWrapper *>(self);
     auto &rtw = wrapper->rtw_;
-    return rtw.abiRethrow(
-        abi::create_propnameid_list_or_error,
-        [&]() -> jsi_propnameid_list_or_error {
-          auto names = wrapper->ho_->getPropertyNames(rtw);
-          std::vector<jsi_propnameid> abiProps;
-          abiProps.reserve(names.size());
-          for (auto &n : names) {
-            abiProps.push_back({rtw.getABIPointer(getPointerValue(n))});
-          }
-          auto *list = new PropNameIDListWrapper(
-              std::move(names), std::move(abiProps));
-          return abi::create_propnameid_list_or_error(list);
-        });
+    return rtw.abiRethrow([&]() -> jsi_status {
+      auto names = wrapper->ho_->getPropertyNames(rtw);
+      std::vector<jsi_propnameid> abiProps;
+      abiProps.reserve(names.size());
+      for (auto &n : names) {
+        abiProps.push_back({rtw.getABIPointer(getPointerValue(n))});
+      }
+      *outList = new PropNameIDListWrapper(
+          std::move(names), std::move(abiProps));
+      return jsi_status_ok;
+    });
   }
 };
 
@@ -763,7 +763,7 @@ facebook::jsi::Value JsiAbiRuntime::intoJSIValue(jsi_value val) {
 //==============================================================================
 
 void JsiAbiRuntime::throwError(jsi_status err) {
-  if (err == jsi_status_js_error) {
+  if ((err & 0xF000) == 0x4000) {
     jsi_value jsErr = api_->get_and_clear_js_error_value(abiRt_);
     facebook::jsi::Value errVal = intoJSIValue(jsErr);
 
@@ -775,44 +775,45 @@ void JsiAbiRuntime::throwError(jsi_status err) {
     activeJSError_ = true;
     throw facebook::jsi::JSError(*this, std::move(errVal));
   }
-  if (err == jsi_status_native_error) {
-    StringByteBuffer gb;
-    api_->get_and_clear_native_exception_message(abiRt_, &gb);
-    throw facebook::jsi::JSINativeException(std::move(gb).get());
+  StringByteBuffer gb;
+  api_->get_and_clear_native_exception_message(abiRt_, &gb);
+  std::string message = std::move(gb).get();
+  if (message.empty()) {
+    char fallback[48];
+    std::snprintf(
+        fallback,
+        sizeof(fallback),
+        "JSI ABI call failed with status 0x%04X",
+        static_cast<unsigned int>(err));
+    message = fallback;
   }
-  throw facebook::jsi::JSINativeException("Unknown ABI error");
+  throw facebook::jsi::JSINativeException(std::move(message));
 }
 
 void JsiAbiRuntime::checkStatus(jsi_status err) {
-  throwError(err);
+  if (err != jsi_status_ok)
+    throwError(err);
 }
 
-template <typename OrError>
-void JsiAbiRuntime::checkResult(const OrError &result) {
-  if (abi::is_error(result)) {
-    throwError(abi::get_error(result));
-  }
-}
-
-template <typename T, typename Fn>
-T JsiAbiRuntime::abiRethrow(T (*wrapErr)(jsi_status), Fn fn) {
+template <typename Fn>
+jsi_status JsiAbiRuntime::abiRethrow(Fn fn) {
   try {
     return fn();
   } catch (const facebook::jsi::JSError &e) {
     jsi_value errVal = cloneToABIValue(e.value());
     api_->set_js_error_value(abiRt_, &errVal);
     abi::release_value(errVal);
-    return wrapErr(jsi_status_js_error);
+    return jsi_status_js_error;
   } catch (const std::exception &e) {
     auto *msg = e.what();
     api_->set_native_exception_message_utf8(
-        abiRt_, reinterpret_cast<const uint8_t *>(msg), strlen(msg));
-    return wrapErr(jsi_status_native_error);
+        abiRt_, msg, strlen(msg));
+    return jsi_status_native_error;
   } catch (...) {
     const char *msg = "Unknown exception in host callback";
     api_->set_native_exception_message_utf8(
-        abiRt_, reinterpret_cast<const uint8_t *>(msg), strlen(msg));
-    return wrapErr(jsi_status_native_error);
+        abiRt_, msg, strlen(msg));
+    return jsi_status_native_error;
   }
 }
 
@@ -842,11 +843,10 @@ facebook::jsi::Value JsiAbiRuntime::evaluateJavaScript(
     const std::shared_ptr<const facebook::jsi::Buffer> &buffer,
     const std::string &sourceURL) {
   auto *abiBuf = new BufferWrapper(buffer);
-  auto result = api_->evaluate_javascript_source(
-      abiRt_, abiBuf, sourceURL.c_str(), sourceURL.size());
-  if (abi::is_error(result))
-    throwError(abi::get_error(result));
-  return intoJSIValue(abi::get_value(result));
+  jsi_value result = abi::create_undefined_value();
+  checkStatus(api_->evaluate_javascript_source(
+      abiRt_, abiBuf, sourceURL.c_str(), sourceURL.size(), &result));
+  return intoJSIValue(result);
 }
 
 std::shared_ptr<const facebook::jsi::PreparedJavaScript>
@@ -854,11 +854,11 @@ JsiAbiRuntime::prepareJavaScript(
     const std::shared_ptr<const facebook::jsi::Buffer> &buffer,
     std::string sourceURL) {
   auto *abiBuf = new BufferWrapper(buffer);
-  auto result = api_->prepare_javascript(
-      abiRt_, abiBuf, sourceURL.c_str(), sourceURL.size());
-  checkResult(result);
+  jsi_prepared_javascript *prepared = nullptr;
+  checkStatus(api_->prepare_javascript(
+      abiRt_, abiBuf, sourceURL.c_str(), sourceURL.size(), &prepared));
   auto wrapper = std::make_shared<PreparedJSWrapper>();
-  wrapper->prepared = abi::get_prepared_javascript(result);
+  wrapper->prepared = prepared;
   wrapper->api = api_;
   wrapper->rt = abiRt_;
   return wrapper;
@@ -869,10 +869,10 @@ facebook::jsi::Value JsiAbiRuntime::evaluatePreparedJavaScript(
   auto *wrapper = static_cast<const PreparedJSWrapper *>(js.get());
   // Pass the prepared handle by pointer (borrow); the wrapper retains
   // ownership and releases on destruction.
-  auto result = api_->evaluate_prepared_javascript(abiRt_, wrapper->prepared);
-  if (abi::is_error(result))
-    throwError(abi::get_error(result));
-  return intoJSIValue(abi::get_value(result));
+  jsi_value result = abi::create_undefined_value();
+  checkStatus(api_->evaluate_prepared_javascript(
+      abiRt_, wrapper->prepared, &result));
+  return intoJSIValue(result);
 }
 
 //==============================================================================
@@ -881,17 +881,17 @@ facebook::jsi::Value JsiAbiRuntime::evaluatePreparedJavaScript(
 
 #if JSI_VERSION >= 4
 bool JsiAbiRuntime::drainMicrotasks(int maxMicrotasksHint) {
-  auto result = api_->drain_microtasks(abiRt_, maxMicrotasksHint);
-  checkResult(result);
-  return abi::get_bool(result);
+  bool drained = false;
+  checkStatus(
+      api_->drain_microtasks(abiRt_, maxMicrotasksHint, &drained));
+  return drained;
 }
 #endif
 
 #if JSI_VERSION >= 12
 void JsiAbiRuntime::queueMicrotask(
     const facebook::jsi::Function &callback) {
-  auto result = api_->queue_microtask(abiRt_, toABIFunction(callback));
-  checkResult(result);
+  checkStatus(api_->queue_microtask(abiRt_, toABIFunction(callback)));
 }
 #endif
 
@@ -965,29 +965,30 @@ facebook::jsi::PropNameID JsiAbiRuntime::createPropNameIDFromAscii(
 facebook::jsi::PropNameID JsiAbiRuntime::createPropNameIDFromUtf8(
     const uint8_t *utf8,
     size_t length) {
-  auto result = api_->create_propnameid_utf8(abiRt_, utf8, length);
-  checkResult(result);
+  jsi_propnameid result{};
+  checkStatus(api_->create_propnameid_utf8(
+      abiRt_, reinterpret_cast<const char *>(utf8), length, &result));
   return make<facebook::jsi::PropNameID>(
-      new ManagedPointerHolder(abi::get_propnameid(result).pointer));
+      new ManagedPointerHolder(result.pointer));
 }
 
 facebook::jsi::PropNameID JsiAbiRuntime::createPropNameIDFromString(
     const facebook::jsi::String &str) {
-  auto result =
-      api_->create_propnameid_from_string(abiRt_, toABIString(str));
-  checkResult(result);
+  jsi_propnameid result{};
+  checkStatus(api_->create_propnameid_from_string(
+      abiRt_, toABIString(str), &result));
   return make<facebook::jsi::PropNameID>(
-      new ManagedPointerHolder(abi::get_propnameid(result).pointer));
+      new ManagedPointerHolder(result.pointer));
 }
 
 #if JSI_VERSION >= 5
 facebook::jsi::PropNameID JsiAbiRuntime::createPropNameIDFromSymbol(
     const facebook::jsi::Symbol &sym) {
-  auto result =
-      api_->create_propnameid_from_symbol(abiRt_, toABISymbol(sym));
-  checkResult(result);
+  jsi_propnameid result{};
+  checkStatus(api_->create_propnameid_from_symbol(
+      abiRt_, toABISymbol(sym), &result));
   return make<facebook::jsi::PropNameID>(
-      new ManagedPointerHolder(abi::get_propnameid(result).pointer));
+      new ManagedPointerHolder(result.pointer));
 }
 #endif
 
@@ -1021,17 +1022,17 @@ std::string JsiAbiRuntime::symbolToString(
 
 #if JSI_VERSION >= 8
 facebook::jsi::BigInt JsiAbiRuntime::createBigIntFromInt64(int64_t val) {
-  auto result = api_->create_bigint_from_int64(abiRt_, val);
-  checkResult(result);
+  jsi_bigint result{};
+  checkStatus(api_->create_bigint_from_int64(abiRt_, val, &result));
   return make<facebook::jsi::BigInt>(
-      new ManagedPointerHolder(abi::get_bigint(result).pointer));
+      new ManagedPointerHolder(result.pointer));
 }
 
 facebook::jsi::BigInt JsiAbiRuntime::createBigIntFromUint64(uint64_t val) {
-  auto result = api_->create_bigint_from_uint64(abiRt_, val);
-  checkResult(result);
+  jsi_bigint result{};
+  checkStatus(api_->create_bigint_from_uint64(abiRt_, val, &result));
   return make<facebook::jsi::BigInt>(
-      new ManagedPointerHolder(abi::get_bigint(result).pointer));
+      new ManagedPointerHolder(result.pointer));
 }
 
 bool JsiAbiRuntime::bigintIsInt64(const facebook::jsi::BigInt &bi) {
@@ -1049,11 +1050,11 @@ uint64_t JsiAbiRuntime::truncate(const facebook::jsi::BigInt &bi) {
 facebook::jsi::String JsiAbiRuntime::bigintToString(
     const facebook::jsi::BigInt &bi,
     int radix) {
-  auto result = api_->bigint_to_string(
-      abiRt_, toABIBigInt(bi), static_cast<uint32_t>(radix));
-  checkResult(result);
+  jsi_string result{};
+  checkStatus(api_->bigint_to_string(
+      abiRt_, toABIBigInt(bi), static_cast<uint32_t>(radix), &result));
   return make<facebook::jsi::String>(
-      new ManagedPointerHolder(abi::get_string(result).pointer));
+      new ManagedPointerHolder(result.pointer));
 }
 #endif
 
@@ -1071,10 +1072,11 @@ facebook::jsi::String JsiAbiRuntime::createStringFromAscii(
 facebook::jsi::String JsiAbiRuntime::createStringFromUtf8(
     const uint8_t *utf8,
     size_t length) {
-  auto result = api_->create_string_utf8(abiRt_, utf8, length);
-  checkResult(result);
+  jsi_string result{};
+  checkStatus(api_->create_string_utf8(
+      abiRt_, reinterpret_cast<const char *>(utf8), length, &result));
   return make<facebook::jsi::String>(
-      new ManagedPointerHolder(abi::get_string(result).pointer));
+      new ManagedPointerHolder(result.pointer));
 }
 
 std::string JsiAbiRuntime::utf8(const facebook::jsi::String &str) {
@@ -1088,19 +1090,20 @@ std::string JsiAbiRuntime::utf8(const facebook::jsi::String &str) {
 //==============================================================================
 
 facebook::jsi::Object JsiAbiRuntime::createObject() {
-  auto result = api_->create_object(abiRt_);
-  checkResult(result);
+  jsi_object result{};
+  checkStatus(api_->create_object(abiRt_, &result));
   return make<facebook::jsi::Object>(
-      new ManagedPointerHolder(abi::get_object(result).pointer));
+      new ManagedPointerHolder(result.pointer));
 }
 
 facebook::jsi::Object JsiAbiRuntime::createObject(
     std::shared_ptr<facebook::jsi::HostObject> ho) {
   auto *wrapper = new HostObjectWrapper(*this, std::move(ho));
-  auto result = api_->create_object_from_host_object(abiRt_, wrapper);
-  checkResult(result);
+  jsi_object result{};
+  checkStatus(api_->create_object_from_host_object(
+      abiRt_, wrapper, &result));
   return make<facebook::jsi::Object>(
-      new ManagedPointerHolder(abi::get_object(result).pointer));
+      new ManagedPointerHolder(result.pointer));
 }
 
 std::shared_ptr<facebook::jsi::HostObject> JsiAbiRuntime::getHostObject(
@@ -1139,8 +1142,8 @@ void JsiAbiRuntime::setNativeState(
     const facebook::jsi::Object &obj,
     std::shared_ptr<facebook::jsi::NativeState> state) {
   auto *wrapper = new NativeStateWrapper(std::move(state));
-  auto result = api_->set_native_state(abiRt_, toABIObject(obj), wrapper);
-  checkResult(result);
+  checkStatus(api_->set_native_state(
+      abiRt_, toABIObject(obj), wrapper));
 }
 #endif
 
@@ -1153,17 +1156,16 @@ void JsiAbiRuntime::setPrototypeOf(
     const facebook::jsi::Object &object,
     const facebook::jsi::Value &prototype) {
   jsi_value proto = toABIValue(prototype);
-  auto result =
-      api_->set_prototype_of(abiRt_, toABIObject(object), &proto);
-  checkResult(result);
+  checkStatus(
+      api_->set_prototype_of(abiRt_, toABIObject(object), &proto));
 }
 
 facebook::jsi::Value JsiAbiRuntime::getPrototypeOf(
     const facebook::jsi::Object &object) {
-  auto result = api_->get_prototype_of(abiRt_, toABIObject(object));
-  if (abi::is_error(result))
-    throwError(abi::get_error(result));
-  return intoJSIValue(abi::get_value(result));
+  jsi_value result = abi::create_undefined_value();
+  checkStatus(
+      api_->get_prototype_of(abiRt_, toABIObject(object), &result));
+  return intoJSIValue(result);
 }
 #endif
 
@@ -1174,11 +1176,10 @@ facebook::jsi::Value JsiAbiRuntime::getPrototypeOf(
 facebook::jsi::Value JsiAbiRuntime::getProperty(
     const facebook::jsi::Object &obj,
     const facebook::jsi::PropNameID &name) {
-  auto result = api_->get_object_property_from_propnameid(
-      abiRt_, toABIObject(obj), toABIPropNameID(name));
-  if (abi::is_error(result))
-    throwError(abi::get_error(result));
-  return intoJSIValue(abi::get_value(result));
+  jsi_value result = abi::create_undefined_value();
+  checkStatus(api_->get_object_property_from_propnameid(
+      abiRt_, toABIObject(obj), toABIPropNameID(name), &result));
+  return intoJSIValue(result);
 }
 
 facebook::jsi::Value JsiAbiRuntime::getProperty(
@@ -1186,20 +1187,19 @@ facebook::jsi::Value JsiAbiRuntime::getProperty(
     const facebook::jsi::String &name) {
   jsi_value key =
       abi::create_string_value(getABIPointer(getPointerValue(name)));
-  auto result = api_->get_object_property_from_value(
-      abiRt_, toABIObject(obj), &key);
-  if (abi::is_error(result))
-    throwError(abi::get_error(result));
-  return intoJSIValue(abi::get_value(result));
+  jsi_value result = abi::create_undefined_value();
+  checkStatus(api_->get_object_property_from_value(
+      abiRt_, toABIObject(obj), &key, &result));
+  return intoJSIValue(result);
 }
 
 bool JsiAbiRuntime::hasProperty(
     const facebook::jsi::Object &obj,
     const facebook::jsi::PropNameID &name) {
-  auto result = api_->has_object_property_from_propnameid(
-      abiRt_, toABIObject(obj), toABIPropNameID(name));
-  checkResult(result);
-  return abi::get_bool(result);
+  bool result = false;
+  checkStatus(api_->has_object_property_from_propnameid(
+      abiRt_, toABIObject(obj), toABIPropNameID(name), &result));
+  return result;
 }
 
 bool JsiAbiRuntime::hasProperty(
@@ -1207,10 +1207,10 @@ bool JsiAbiRuntime::hasProperty(
     const facebook::jsi::String &name) {
   jsi_value key =
       abi::create_string_value(getABIPointer(getPointerValue(name)));
-  auto result = api_->has_object_property_from_value(
-      abiRt_, toABIObject(obj), &key);
-  checkResult(result);
-  return abi::get_bool(result);
+  bool result = false;
+  checkStatus(api_->has_object_property_from_value(
+      abiRt_, toABIObject(obj), &key, &result));
+  return result;
 }
 
 void JsiAbiRuntime::setPropertyValue(
@@ -1218,9 +1218,8 @@ void JsiAbiRuntime::setPropertyValue(
     const facebook::jsi::PropNameID &name,
     const facebook::jsi::Value &value) {
   jsi_value val = toABIValue(value);
-  auto result = api_->set_object_property_from_propnameid(
-      abiRt_, toABIObject(obj), toABIPropNameID(name), &val);
-  checkResult(result);
+  checkStatus(api_->set_object_property_from_propnameid(
+      abiRt_, toABIObject(obj), toABIPropNameID(name), &val));
 }
 
 void JsiAbiRuntime::setPropertyValue(
@@ -1230,9 +1229,8 @@ void JsiAbiRuntime::setPropertyValue(
   jsi_value key =
       abi::create_string_value(getABIPointer(getPointerValue(name)));
   jsi_value val = toABIValue(value);
-  auto result = api_->set_object_property_from_value(
-      abiRt_, toABIObject(obj), &key, &val);
-  checkResult(result);
+  checkStatus(api_->set_object_property_from_value(
+      abiRt_, toABIObject(obj), &key, &val));
 }
 
 //==============================================================================
@@ -1266,10 +1264,11 @@ bool JsiAbiRuntime::isHostFunction(
 
 facebook::jsi::Array JsiAbiRuntime::getPropertyNames(
     const facebook::jsi::Object &obj) {
-  auto result = api_->get_object_property_names(abiRt_, toABIObject(obj));
-  checkResult(result);
+  jsi_array result{};
+  checkStatus(
+      api_->get_object_property_names(abiRt_, toABIObject(obj), &result));
   return make<facebook::jsi::Object>(
-             new ManagedPointerHolder(abi::get_array(result).pointer))
+             new ManagedPointerHolder(result.pointer))
       .getArray(*this);
 }
 
@@ -1279,10 +1278,11 @@ facebook::jsi::Array JsiAbiRuntime::getPropertyNames(
 
 facebook::jsi::WeakObject JsiAbiRuntime::createWeakObject(
     const facebook::jsi::Object &obj) {
-  auto result = api_->create_weak_object(abiRt_, toABIObject(obj));
-  checkResult(result);
+  jsi_weak_object result{};
+  checkStatus(api_->create_weak_object(
+      abiRt_, toABIObject(obj), &result));
   return make<facebook::jsi::WeakObject>(
-      new ManagedPointerHolder(abi::get_weak_object(result).pointer));
+      new ManagedPointerHolder(result.pointer));
 }
 
 facebook::jsi::Value JsiAbiRuntime::lockWeakObject(
@@ -1296,10 +1296,10 @@ facebook::jsi::Value JsiAbiRuntime::lockWeakObject(
 //==============================================================================
 
 facebook::jsi::Array JsiAbiRuntime::createArray(size_t length) {
-  auto result = api_->create_array(abiRt_, length);
-  checkResult(result);
+  jsi_array result{};
+  checkStatus(api_->create_array(abiRt_, length, &result));
   return make<facebook::jsi::Object>(
-             new ManagedPointerHolder(abi::get_array(result).pointer))
+             new ManagedPointerHolder(result.pointer))
       .getArray(*this);
 }
 
@@ -1307,12 +1307,11 @@ facebook::jsi::Array JsiAbiRuntime::createArray(size_t length) {
 facebook::jsi::ArrayBuffer JsiAbiRuntime::createArrayBuffer(
     std::shared_ptr<facebook::jsi::MutableBuffer> buffer) {
   auto *abiBuf = new MutableBufferWrapper(std::move(buffer));
-  auto result =
-      api_->create_arraybuffer_from_external_data(abiRt_, abiBuf);
-  checkResult(result);
+  jsi_arraybuffer result{};
+  checkStatus(api_->create_arraybuffer_from_external_data(
+      abiRt_, abiBuf, &result));
   return make<facebook::jsi::Object>(
-             new ManagedPointerHolder(
-                 abi::get_arraybuffer(result).pointer))
+             new ManagedPointerHolder(result.pointer))
       .getArrayBuffer(*this);
 }
 #endif
@@ -1322,27 +1321,26 @@ size_t JsiAbiRuntime::size(const facebook::jsi::Array &arr) {
 }
 
 size_t JsiAbiRuntime::size(const facebook::jsi::ArrayBuffer &ab) {
-  auto result = api_->get_arraybuffer_size(abiRt_, toABIArrayBuffer(ab));
-  if (abi::is_error(result))
-    throwError(abi::get_error(result));
-  return abi::get_size(result);
+  size_t result = 0;
+  checkStatus(api_->get_arraybuffer_size(
+      abiRt_, toABIArrayBuffer(ab), &result));
+  return result;
 }
 
 uint8_t *JsiAbiRuntime::data(const facebook::jsi::ArrayBuffer &ab) {
-  auto result = api_->get_arraybuffer_data(abiRt_, toABIArrayBuffer(ab));
-  if (abi::is_error(result))
-    throwError(abi::get_error(result));
-  return abi::get_uint8_ptr(result);
+  uint8_t *result = nullptr;
+  checkStatus(api_->get_arraybuffer_data(
+      abiRt_, toABIArrayBuffer(ab), &result));
+  return result;
 }
 
 facebook::jsi::Value JsiAbiRuntime::getValueAtIndex(
     const facebook::jsi::Array &arr,
     size_t i) {
-  auto result =
-      api_->get_array_element(abiRt_, toABIObject(arr), i);
-  if (abi::is_error(result))
-    throwError(abi::get_error(result));
-  return intoJSIValue(abi::get_value(result));
+  jsi_value result = abi::create_undefined_value();
+  checkStatus(
+      api_->get_array_element(abiRt_, toABIObject(arr), i, &result));
+  return intoJSIValue(result);
 }
 
 void JsiAbiRuntime::setValueAtIndexImpl(
@@ -1350,9 +1348,8 @@ void JsiAbiRuntime::setValueAtIndexImpl(
     size_t i,
     const facebook::jsi::Value &value) {
   jsi_value val = toABIValue(value);
-  auto result =
-      api_->set_array_element(abiRt_, toABIObject(arr), i, &val);
-  checkResult(result);
+  checkStatus(
+      api_->set_array_element(abiRt_, toABIObject(arr), i, &val));
 }
 
 //==============================================================================
@@ -1364,12 +1361,11 @@ facebook::jsi::Function JsiAbiRuntime::createFunctionFromHostFunction(
     unsigned int paramCount,
     facebook::jsi::HostFunctionType func) {
   auto *wrapper = new HostFunctionWrapper(*this, std::move(func));
-  auto result = api_->create_function_from_host_function(
-      abiRt_, toABIPropNameID(name), paramCount, wrapper);
-  checkResult(result);
+  jsi_function result{};
+  checkStatus(api_->create_function_from_host_function(
+      abiRt_, toABIPropNameID(name), paramCount, wrapper, &result));
   return make<facebook::jsi::Object>(
-             new ManagedPointerHolder(
-                 abi::get_function(result).pointer))
+             new ManagedPointerHolder(result.pointer))
       .getFunction(*this);
 }
 
@@ -1382,11 +1378,15 @@ facebook::jsi::Value JsiAbiRuntime::call(
   for (size_t i = 0; i < count; ++i)
     abiArgs[i] = toABIValue(args[i]);
   jsi_value abiThis = toABIValue(jsThis);
-  auto result = api_->call(
-      abiRt_, toABIFunction(fn), &abiThis, abiArgs.data(), count);
-  if (abi::is_error(result))
-    throwError(abi::get_error(result));
-  return intoJSIValue(abi::get_value(result));
+  jsi_value result = abi::create_undefined_value();
+  checkStatus(api_->call(
+      abiRt_,
+      toABIFunction(fn),
+      &abiThis,
+      abiArgs.data(),
+      count,
+      &result));
+  return intoJSIValue(result);
 }
 
 facebook::jsi::Value JsiAbiRuntime::callAsConstructor(
@@ -1396,11 +1396,10 @@ facebook::jsi::Value JsiAbiRuntime::callAsConstructor(
   std::vector<jsi_value> abiArgs(count);
   for (size_t i = 0; i < count; ++i)
     abiArgs[i] = toABIValue(args[i]);
-  auto result = api_->call_as_constructor(
-      abiRt_, toABIFunction(fn), abiArgs.data(), count);
-  if (abi::is_error(result))
-    throwError(abi::get_error(result));
-  return intoJSIValue(abi::get_value(result));
+  jsi_value result = abi::create_undefined_value();
+  checkStatus(api_->call_as_constructor(
+      abiRt_, toABIFunction(fn), abiArgs.data(), count, &result));
+  return intoJSIValue(result);
 }
 
 //==============================================================================
@@ -1440,10 +1439,10 @@ bool JsiAbiRuntime::strictEquals(
 bool JsiAbiRuntime::instanceOf(
     const facebook::jsi::Object &o,
     const facebook::jsi::Function &f) {
-  auto result =
-      api_->instance_of(abiRt_, toABIObject(o), toABIFunction(f));
-  checkResult(result);
-  return abi::get_bool(result);
+  bool result = false;
+  checkStatus(api_->instance_of(
+      abiRt_, toABIObject(o), toABIFunction(f), &result));
+  return result;
 }
 
 //==============================================================================
@@ -1454,9 +1453,8 @@ bool JsiAbiRuntime::instanceOf(
 void JsiAbiRuntime::setExternalMemoryPressure(
     const facebook::jsi::Object &obj,
     size_t amount) {
-  auto result = api_->set_object_external_memory_pressure(
-      abiRt_, toABIObject(obj), amount);
-  checkResult(result);
+  checkStatus(api_->set_object_external_memory_pressure(
+      abiRt_, toABIObject(obj), amount));
 }
 #endif
 
@@ -1466,12 +1464,13 @@ void JsiAbiRuntime::setExternalMemoryPressure(
 
 facebook::jsi::Runtime::ScopeState *JsiAbiRuntime::pushScope() {
   void *scope = nullptr;
-  api_->push_scope(abiRt_, &scope);
+  checkStatus(api_->push_scope(abiRt_, &scope));
   return reinterpret_cast<ScopeState *>(scope);
 }
 
 void JsiAbiRuntime::popScope(ScopeState *state) {
-  api_->pop_scope(abiRt_, reinterpret_cast<void *>(state));
+  checkStatus(
+      api_->pop_scope(abiRt_, reinterpret_cast<void *>(state)));
 }
 
 //==============================================================================

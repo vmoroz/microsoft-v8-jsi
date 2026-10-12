@@ -12,8 +12,8 @@
 ///
 /// This file implements the jsi_abi.h v2 interface using V8 directly via
 /// v8_core.h. It follows the Hermes ABI patterns: jsi_runtime inheritance,
-/// jsi_pointer-based handles, *_or_error return types, and separate JS/native
-/// error storage.
+/// jsi_pointer-based handles, status returns with out parameters, and separate
+/// JS/native error storage.
 ///
 /// Error Handling Design
 /// =====================
@@ -145,6 +145,24 @@ struct jsi_config_s {
 };
 
 namespace {
+
+static size_t resolveUtf8Length(const char *value, size_t length) {
+  return length == JSI_ABI_AUTO_LENGTH ? (value ? std::strlen(value) : 0)
+                                       : length;
+}
+
+// The ABI owns a jsi_buffer passed to it, including on early failure.
+static jsi_status releaseBufferAndFail(jsi_buffer *buffer, jsi_status status) {
+  if (buffer && buffer->api && buffer->api->release)
+    buffer->api->release(buffer);
+  return status;
+}
+
+static size_t resolveUtf16Length(const jsi_char16 *value, size_t length) {
+  return length == JSI_ABI_AUTO_LENGTH
+      ? (value ? std::char_traits<jsi_char16>::length(value) : 0)
+      : length;
+}
 
 //==============================================================================
 // Forward Declarations
@@ -642,14 +660,15 @@ struct AbiHostObjectProxy {
 
     jsi_propnameid propNameId{new PropNameIdHandle(isolate, v8PropName)};
 
-    jsi_value_or_error result = proxy->hostObject->api->get(
-        proxy->hostObject, proxy->runtime, propNameId);
+    jsi_value result = abi::create_undefined_value();
+    jsi_status status = proxy->hostObject->api->get(
+        proxy->hostObject, proxy->runtime, propNameId, &result);
 
     propNameId.pointer->api->invalidate(propNameId.pointer);
 
-    if (abi::is_error(result)) {
+    if (status != jsi_status_ok) {
       auto *state = getState(proxy->runtime);
-      if (abi::get_error(result) == jsi_status_js_error) {
+      if (status == jsi_status_js_error) {
         jsi_value jsErr = state->pendingJSError;
         if (abi::is_pointer_value(jsErr)) {
           isolate->ThrowException(toV8Value(isolate, &jsErr));
@@ -666,9 +685,8 @@ struct AbiHostObjectProxy {
       return v8::Intercepted::kYes;
     }
 
-    jsi_value val = abi::get_value(result);
-    info.GetReturnValue().Set(toV8Value(isolate, &val));
-    abi::release_value(val);
+    info.GetReturnValue().Set(toV8Value(isolate, &result));
+    abi::release_value(result);
     return v8::Intercepted::kYes;
   }
 
@@ -690,9 +708,9 @@ struct AbiHostObjectProxy {
     propNameId.pointer->api->invalidate(propNameId.pointer);
     abi::release_value(jsiValue);
 
-    if (abi::is_error(result)) {
+    if (result != jsi_status_ok) {
       auto *state = getState(proxy->runtime);
-      if (abi::get_error(result) == jsi_status_js_error &&
+      if (result == jsi_status_js_error &&
           abi::is_pointer_value(state->pendingJSError)) {
         isolate->ThrowException(toV8Value(isolate, &state->pendingJSError));
         state->pendingJSError = abi::create_undefined_value();
@@ -740,16 +758,15 @@ struct AbiHostObjectProxy {
     v8::Isolate *isolate = info.GetIsolate();
     v8::Local<v8::Context> context = isolate->GetCurrentContext();
 
-    jsi_propnameid_list_or_error listResult =
-        proxy->hostObject->api->get_own_keys(proxy->hostObject,
-                                                 proxy->runtime);
+    jsi_propnameid_list *list = nullptr;
+    jsi_status status = proxy->hostObject->api->get_own_keys(
+        proxy->hostObject, proxy->runtime, &list);
 
-    if (abi::is_error(listResult)) {
+    if (status != jsi_status_ok) {
       info.GetReturnValue().Set(v8::Array::New(isolate));
       return;
     }
 
-    jsi_propnameid_list *list = abi::get_propnameid_list(listResult);
     v8::Local<v8::Array> result =
         v8::Array::New(isolate, static_cast<int>(list->size));
     for (size_t i = 0; i < list->size; i++) {
@@ -1207,17 +1224,19 @@ void JSI_ABI_CDECL HostFunctionCallbackTrampoline(
 
   jsi_value thisVal = createJsiValue(isolate, info.This());
 
-  jsi_value_or_error result = ctx->hostFunction->api->call(
-      ctx->hostFunction, ctx->runtime, &thisVal, args.data(), args.size());
+  jsi_value result = abi::create_undefined_value();
+  jsi_status status = ctx->hostFunction->api->call(
+      ctx->hostFunction, ctx->runtime, &thisVal, args.data(), args.size(),
+      &result);
 
   for (auto &arg : args)
     abi::release_value(arg);
   abi::release_value(thisVal);
 
-  if (abi::is_error(result)) {
+  if (status != jsi_status_ok) {
     auto *state = getState(ctx->runtime);
-    jsi_status err = abi::get_error(result);
-    if (err == jsi_status_js_error && abi::is_pointer_value(state->pendingJSError)) {
+    if (status == jsi_status_js_error &&
+        abi::is_pointer_value(state->pendingJSError)) {
       isolate->ThrowException(toV8Value(isolate, &state->pendingJSError));
       abi::release_value(state->pendingJSError);
       state->pendingJSError = abi::create_undefined_value();
@@ -1233,9 +1252,8 @@ void JSI_ABI_CDECL HostFunctionCallbackTrampoline(
     return;
   }
 
-  jsi_value val = abi::get_value(result);
-  info.GetReturnValue().Set(toV8Value(isolate, &val));
-  abi::release_value(val);
+  info.GetReturnValue().Set(toV8Value(isolate, &result));
+  abi::release_value(result);
 }
 
 //==============================================================================
@@ -1264,8 +1282,13 @@ NativeStateWrapper *getNativeStateWrapper(JsiRuntimeState *state,
 //------------------------------------------------------------------------------
 
 jsi_status JSI_ABI_CDECL jsi_query_interface(
-    jsi_runtime *rt, const jsi_interface_id * /*iid*/,
-    const void ** /*vtable_out*/, void ** /*instance_out*/) {
+    jsi_runtime *rt, const jsi_interface_id *iid, const void **out_api,
+    void **out_instance) {
+  if (!out_api || !out_instance)
+    return jsi_status_invalid_arg;
+  *out_api = nullptr;
+  *out_instance = nullptr;
+  (void)iid;
   // No optional interfaces are currently supported. query_interface is
   // retained as the COM-style extension seam for future engine-specific
   // interfaces; callers must handle the not-supported result.
@@ -1280,7 +1303,8 @@ jsi_status JSI_ABI_CDECL jsi_query_interface(
 // Report the implementation's max supported ABI version (Node-API
 // napi_get_version analog). The create-time negotiation in v8_jsi_abi_runtime_create is
 // what actually gates; this is a feature-probe.
-uint32_t JSI_ABI_CDECL jsi_get_abi_version(jsi_runtime * /*rt*/) {
+uint32_t JSI_ABI_CDECL jsi_get_abi_version(jsi_runtime *rt) {
+  (void)rt;
   return JSI_ABI_VERSION;
 }
 
@@ -1313,9 +1337,9 @@ jsi_value JSI_ABI_CDECL jsi_get_and_clear_js_error_value(jsi_runtime *rt) {
 }
 
 void JSI_ABI_CDECL jsi_get_and_clear_native_exception_message(
-    jsi_runtime *rt, jsi_growable_buffer *buf) {
+    jsi_runtime *rt, jsi_growable_buffer *buffer) {
   auto *state = getState(rt);
-  writeToBuf(buf, state->nativeExceptionMessage);
+  writeToBuf(buffer, state->nativeExceptionMessage);
   state->nativeExceptionMessage.clear();
   state->nativeExceptionMessage.shrink_to_fit();
 }
@@ -1333,11 +1357,12 @@ void JSI_ABI_CDECL jsi_set_js_error_value(jsi_runtime *rt,
   }
 }
 
-void JSI_ABI_CDECL jsi_set_native_exception_message(jsi_runtime *rt,
-                                                  const uint8_t *utf8,
-                                                  size_t length) {
-  getState(rt)->nativeExceptionMessage.assign(
-      reinterpret_cast<const char *>(utf8), length);
+void JSI_ABI_CDECL jsi_set_native_exception_message_utf8(
+    jsi_runtime *rt, const char *value, size_t length) {
+  length = resolveUtf8Length(value, length);
+  if (!value)
+    length = 0;
+  getState(rt)->nativeExceptionMessage.assign(value ? value : "", length);
 }
 
 //------------------------------------------------------------------------------
@@ -1384,28 +1409,36 @@ jsi_bigint JSI_ABI_CDECL jsi_clone_bigint(jsi_runtime *rt, jsi_bigint bigint) {
 // Description & Capabilities
 //------------------------------------------------------------------------------
 
-void JSI_ABI_CDECL jsi_get_description(jsi_runtime * /*rt*/,
-                                    jsi_growable_buffer *buf) {
+void JSI_ABI_CDECL jsi_get_description(jsi_runtime *rt,
+                                    jsi_growable_buffer *buffer) {
+  (void)rt;
   const char *v8_version = v8::V8::GetVersion();
   std::string desc = std::string("V8Runtime [") + v8_version + "]";
-  writeToBuf(buf, desc);
+  writeToBuf(buffer, desc);
 }
 
-bool JSI_ABI_CDECL jsi_is_inspectable(jsi_runtime * /*rt*/) { return false; }
+bool JSI_ABI_CDECL jsi_is_inspectable(jsi_runtime *rt) {
+  (void)rt;
+  return false;
+}
 
 //------------------------------------------------------------------------------
 // Handle Scopes
 //------------------------------------------------------------------------------
 
-jsi_status JSI_ABI_CDECL jsi_push_scope(jsi_runtime * /*rt*/,
-                                            void **scope) {
-  if (scope)
-    *scope = reinterpret_cast<void *>(1);
+jsi_status JSI_ABI_CDECL jsi_push_scope(jsi_runtime *rt,
+                                            void **out_scope) {
+  if (!out_scope)
+    return jsi_status_invalid_arg;
+  *out_scope = nullptr;
+  (void)rt;
+  *out_scope = reinterpret_cast<void *>(1);
   return jsi_status_ok;
 }
 
-jsi_status JSI_ABI_CDECL jsi_pop_scope(jsi_runtime * /*rt*/,
-                                           void * /*scope*/) {
+jsi_status JSI_ABI_CDECL jsi_pop_scope(jsi_runtime *rt, void *scope) {
+  (void)rt;
+  (void)scope;
   return jsi_status_ok;
 }
 
@@ -1413,9 +1446,16 @@ jsi_status JSI_ABI_CDECL jsi_pop_scope(jsi_runtime * /*rt*/,
 // Script Evaluation
 //------------------------------------------------------------------------------
 
-jsi_value_or_error JSI_ABI_CDECL jsi_evaluate_javascript_source(
-    jsi_runtime *rt, jsi_buffer *buf, const char *source_url,
-    size_t source_url_len) {
+jsi_status JSI_ABI_CDECL jsi_evaluate_javascript_source(
+    jsi_runtime *rt, jsi_buffer *buffer, const char *source_url,
+    size_t source_url_length, jsi_value *out_value) {
+  if (!out_value)
+    return releaseBufferAndFail(buffer, jsi_status_invalid_arg);
+  *out_value = abi::create_undefined_value();
+  source_url_length = resolveUtf8Length(source_url, source_url_length);
+  if (!source_url && source_url_length != 0)
+    return releaseBufferAndFail(buffer, jsi_status_invalid_arg);
+  source_url = source_url ? source_url : "";
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Isolate *isolate = state->isolate;
@@ -1423,82 +1463,92 @@ jsi_value_or_error JSI_ABI_CDECL jsi_evaluate_javascript_source(
 
   v8::Local<v8::String> sourceStr;
   if (!v8::String::NewFromUtf8(isolate,
-                                reinterpret_cast<const char *>(buf->data),
+                                reinterpret_cast<const char *>(buffer->data),
                                 v8::NewStringType::kNormal,
-                                static_cast<int>(buf->size))
+                                static_cast<int>(buffer->size))
            .ToLocal(&sourceStr)) {
-    if (buf->api && buf->api->release)
-      buf->api->release(buf);
+    if (buffer->api && buffer->api->release)
+      buffer->api->release(buffer);
     state->setNativeError("Failed to create source string");
-    return abi::create_value_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
 
   v8::Local<v8::String> urlV8Str;
-  if (!v8::String::NewFromUtf8(isolate, source_url, v8::NewStringType::kNormal,
-                                static_cast<int>(source_url_len))
+  if (!v8::String::NewFromUtf8(isolate, source_url,
+                                v8::NewStringType::kNormal,
+                                static_cast<int>(source_url_length))
            .ToLocal(&urlV8Str)) {
-    if (buf->api && buf->api->release)
-      buf->api->release(buf);
+    if (buffer->api && buffer->api->release)
+      buffer->api->release(buffer);
     state->setNativeError("Failed to create source URL string");
-    return abi::create_value_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
 
-  if (buf->api && buf->api->release)
-    buf->api->release(buf);
+  if (buffer->api && buffer->api->release)
+    buffer->api->release(buffer);
 
   v8::ScriptOrigin origin(urlV8Str);
 
   v8::Local<v8::Script> compiled;
   if (!v8::Script::Compile(state->getContextLocal(), sourceStr, &origin)
            .ToLocal(&compiled))
-    return abi::create_value_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
 
   v8::Local<v8::Value> resultValue;
   if (!compiled->Run(state->getContextLocal()).ToLocal(&resultValue))
-    return abi::create_value_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
 
-  return abi::create_value_or_error(createJsiValue(isolate, resultValue));
+  *out_value = createJsiValue(isolate, resultValue);
+  return jsi_status_ok;
 }
 
-jsi_prepared_javascript_or_error JSI_ABI_CDECL jsi_prepare_javascript(
-    jsi_runtime *rt, jsi_buffer *buf, const char *source_url,
-    size_t source_url_len) {
+jsi_status JSI_ABI_CDECL jsi_prepare_javascript(
+    jsi_runtime *rt, jsi_buffer *buffer, const char *source_url,
+    size_t source_url_length, jsi_prepared_javascript **out_prepared) {
+  if (!out_prepared)
+    return releaseBufferAndFail(buffer, jsi_status_invalid_arg);
+  *out_prepared = nullptr;
+  source_url_length = resolveUtf8Length(source_url, source_url_length);
+  if (!source_url && source_url_length != 0)
+    return releaseBufferAndFail(buffer, jsi_status_invalid_arg);
+  source_url = source_url ? source_url : "";
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Isolate *isolate = state->isolate;
   TryCatch try_catch(state);
 
   // compute MurmurHash3 over the source bytes for the cache key. Must
-  // happen before buf->release() since the buffer pointer becomes invalid.
+  // happen before buffer->release() since the buffer pointer becomes invalid.
   uint64_t source_hash = 0;
   if (state->script_cache_load_cb || state->script_cache_store_cb) {
-    murmurhash(buf->data, buf->size, source_hash);
+    murmurhash(buffer->data, buffer->size, source_hash);
   }
 
   v8::Local<v8::String> sourceStr;
   if (!v8::String::NewFromUtf8(isolate,
-                                reinterpret_cast<const char *>(buf->data),
+                                reinterpret_cast<const char *>(buffer->data),
                                 v8::NewStringType::kNormal,
-                                static_cast<int>(buf->size))
+                                static_cast<int>(buffer->size))
            .ToLocal(&sourceStr)) {
-    if (buf->api && buf->api->release)
-      buf->api->release(buf);
+    if (buffer->api && buffer->api->release)
+      buffer->api->release(buffer);
     state->setNativeError("Failed to create source string");
-    return abi::create_prepared_javascript_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
 
   v8::Local<v8::String> urlV8Str;
-  if (!v8::String::NewFromUtf8(isolate, source_url, v8::NewStringType::kNormal,
-                                static_cast<int>(source_url_len))
+  if (!v8::String::NewFromUtf8(isolate, source_url,
+                                v8::NewStringType::kNormal,
+                                static_cast<int>(source_url_length))
            .ToLocal(&urlV8Str)) {
-    if (buf->api && buf->api->release)
-      buf->api->release(buf);
+    if (buffer->api && buffer->api->release)
+      buffer->api->release(buffer);
     state->setNativeError("Failed to create source URL string");
-    return abi::create_prepared_javascript_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
 
-  if (buf->api && buf->api->release)
-    buf->api->release(buf);
+  if (buffer->api && buffer->api->release)
+    buffer->api->release(buffer);
 
   v8::ScriptOrigin origin(urlV8Str);
 
@@ -1555,7 +1605,7 @@ jsi_prepared_javascript_or_error JSI_ABI_CDECL jsi_prepare_javascript(
   }
 
   if (!compile_ok)
-    return abi::create_prepared_javascript_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
 
   v8::Local<v8::UnboundScript> unbound = compiled->GetUnboundScript();
 
@@ -1585,13 +1635,16 @@ jsi_prepared_javascript_or_error JSI_ABI_CDECL jsi_prepare_javascript(
     }
   }
 
-  return abi::create_prepared_javascript_or_error(
-      new PreparedScriptImpl(isolate, unbound));
+  *out_prepared = new PreparedScriptImpl(isolate, unbound);
+  return jsi_status_ok;
 }
 
-jsi_value_or_error JSI_ABI_CDECL
-jsi_evaluate_prepared_javascript(jsi_runtime *rt,
-                                  jsi_prepared_javascript *prepared) {
+jsi_status JSI_ABI_CDECL jsi_evaluate_prepared_javascript(
+    jsi_runtime *rt, jsi_prepared_javascript *prepared,
+    jsi_value *out_value) {
+  if (!out_value)
+    return jsi_status_invalid_arg;
+  *out_value = abi::create_undefined_value();
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Isolate *isolate = state->isolate;
@@ -1603,24 +1656,28 @@ jsi_evaluate_prepared_javascript(jsi_runtime *rt,
 
   v8::Local<v8::Value> resultValue;
   if (!script->Run(state->getContextLocal()).ToLocal(&resultValue))
-    return abi::create_value_or_error(jsi_status_js_error);
-
-  return abi::create_value_or_error(createJsiValue(isolate, resultValue));
+    return jsi_status_js_error;
+  *out_value = createJsiValue(isolate, resultValue);
+  return jsi_status_ok;
 }
 
 //------------------------------------------------------------------------------
 // Microtasks
 //------------------------------------------------------------------------------
 
-jsi_bool_or_error JSI_ABI_CDECL jsi_drain_microtasks(jsi_runtime *rt,
-                                                   int32_t /*max_hint*/) {
+jsi_status JSI_ABI_CDECL jsi_drain_microtasks(
+    jsi_runtime *rt, int32_t max_hint, bool *out_drained) {
+  if (!out_drained)
+    return jsi_status_invalid_arg;
+  *out_drained = false;
+  (void)max_hint;
   auto *state = getState(rt);
   V8Scope scope(state);
 
   if (state->isolate->GetMicrotasksPolicy() == v8::MicrotasksPolicy::kExplicit)
     state->isolate->PerformMicrotaskCheckpoint();
 
-  return abi::create_bool_or_error(false);
+  return jsi_status_ok;
 }
 
 jsi_status JSI_ABI_CDECL jsi_queue_microtask(jsi_runtime *rt,
@@ -1653,59 +1710,75 @@ jsi_object JSI_ABI_CDECL jsi_get_global_object(jsi_runtime *rt) {
 // String Operations
 //------------------------------------------------------------------------------
 
-jsi_string_or_error JSI_ABI_CDECL jsi_create_string_from_utf8(jsi_runtime *rt,
-                                                           const uint8_t *utf8,
-                                                           size_t len) {
+jsi_status JSI_ABI_CDECL jsi_create_string_from_utf8(
+    jsi_runtime *rt, const char *value, size_t length,
+    jsi_string *out_string) {
+  if (!out_string)
+    return jsi_status_invalid_arg;
+  *out_string = {};
+  length = resolveUtf8Length(value, length);
+  if (!value && length != 0)
+    return jsi_status_invalid_arg;
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::String> v8str;
   if (!v8::String::NewFromUtf8(state->isolate,
-                                reinterpret_cast<const char *>(utf8),
+                                value ? value : "",
                                 v8::NewStringType::kNormal,
-                                static_cast<int>(len))
+                                static_cast<int>(length))
            .ToLocal(&v8str)) {
     state->setNativeError("Failed to create string");
-    return abi::create_string_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
-  return abi::create_string_or_error(
+  *out_string = abi::create_string(
       static_cast<jsi_pointer *>(new StringHandle(state->isolate, v8str)));
+  return jsi_status_ok;
 }
 
-jsi_string_or_error JSI_ABI_CDECL jsi_create_string_from_utf16(
-    jsi_runtime *rt, const uint16_t *utf16, size_t len) {
+jsi_status JSI_ABI_CDECL jsi_create_string_from_utf16(
+    jsi_runtime *rt, const jsi_char16 *value, size_t length,
+    jsi_string *out_string) {
+  if (!out_string)
+    return jsi_status_invalid_arg;
+  *out_string = {};
+  length = resolveUtf16Length(value, length);
+  if (!value && length != 0)
+    return jsi_status_invalid_arg;
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::String> v8str;
-  if (!v8::String::NewFromTwoByte(state->isolate, utf16,
-                                   v8::NewStringType::kNormal,
-                                   static_cast<int>(len))
+  if (!v8::String::NewFromTwoByte(
+           state->isolate,
+           reinterpret_cast<const uint16_t *>(value ? value : u""),
+           v8::NewStringType::kNormal, static_cast<int>(length))
            .ToLocal(&v8str)) {
     state->setNativeError("Failed to create string");
-    return abi::create_string_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
-  return abi::create_string_or_error(
+  *out_string = abi::create_string(
       static_cast<jsi_pointer *>(new StringHandle(state->isolate, v8str)));
+  return jsi_status_ok;
 }
 
 void JSI_ABI_CDECL jsi_get_utf8_from_string(jsi_runtime *rt, jsi_string str,
-                                         jsi_growable_buffer *buf) {
+                                         jsi_growable_buffer *buffer) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Isolate *isolate = state->isolate;
   v8::Local<v8::String> v8str = toStringHandle(str)->get(state->isolate);
 
   size_t utf8_len = v8str->Utf8LengthV2(isolate);
-  if (buf->size < utf8_len)
-    buf->api->try_grow_to(buf, utf8_len);
-  if (buf->size >= utf8_len) {
-    v8str->WriteUtf8V2(isolate, reinterpret_cast<char *>(buf->data),
+  if (buffer->size < utf8_len)
+    buffer->api->try_grow_to(buffer, utf8_len);
+  if (buffer->size >= utf8_len) {
+    v8str->WriteUtf8V2(isolate, reinterpret_cast<char *>(buffer->data),
                         static_cast<int>(utf8_len));
-    buf->used = utf8_len;
+    buffer->used = utf8_len;
   }
 }
 
 void JSI_ABI_CDECL jsi_get_utf16_from_string(jsi_runtime *rt, jsi_string str,
-                                          jsi_growable_buffer *buf) {
+                                          jsi_growable_buffer *buffer) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Isolate *isolate = state->isolate;
@@ -1713,12 +1786,12 @@ void JSI_ABI_CDECL jsi_get_utf16_from_string(jsi_runtime *rt, jsi_string str,
 
   int len = v8str->Length();
   size_t bytes = static_cast<size_t>(len) * sizeof(uint16_t);
-  if (buf->size < bytes)
-    buf->api->try_grow_to(buf, bytes);
-  if (buf->size >= bytes) {
+  if (buffer->size < bytes)
+    buffer->api->try_grow_to(buffer, bytes);
+  if (buffer->size >= bytes) {
     v8str->WriteV2(isolate, 0, len,
-                    reinterpret_cast<uint16_t *>(buf->data));
-    buf->used = bytes;
+                    reinterpret_cast<uint16_t *>(buffer->data));
+    buffer->used = bytes;
   }
 }
 
@@ -1727,7 +1800,7 @@ void JSI_ABI_CDECL jsi_get_utf16_from_string(jsi_runtime *rt, jsi_string str,
 //------------------------------------------------------------------------------
 
 void JSI_ABI_CDECL jsi_get_utf8_from_symbol(jsi_runtime *rt, jsi_symbol sym,
-                                         jsi_growable_buffer *buf) {
+                                         jsi_growable_buffer *buffer) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Isolate *isolate = state->isolate;
@@ -1744,46 +1817,62 @@ void JSI_ABI_CDECL jsi_get_utf8_from_symbol(jsi_runtime *rt, jsi_symbol sym,
     result_str += desc;
   }
   result_str += ")";
-  writeToBuf(buf, result_str);
+  writeToBuf(buffer, result_str);
 }
 
 //------------------------------------------------------------------------------
 // PropNameID Operations
 //------------------------------------------------------------------------------
 
-jsi_propnameid_or_error JSI_ABI_CDECL jsi_create_propnameid_from_utf8(
-    jsi_runtime *rt, const uint8_t *utf8, size_t len) {
+jsi_status JSI_ABI_CDECL jsi_create_propnameid_from_utf8(
+    jsi_runtime *rt, const char *value, size_t length,
+    jsi_propnameid *out_propnameid) {
+  if (!out_propnameid)
+    return jsi_status_invalid_arg;
+  *out_propnameid = {};
+  length = resolveUtf8Length(value, length);
+  if (!value && length != 0)
+    return jsi_status_invalid_arg;
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::String> v8str;
   if (!v8::String::NewFromUtf8(state->isolate,
-                                reinterpret_cast<const char *>(utf8),
+                                value ? value : "",
                                 v8::NewStringType::kInternalized,
-                                static_cast<int>(len))
+                                static_cast<int>(length))
            .ToLocal(&v8str)) {
     state->setNativeError("Failed to create property name");
-    return abi::create_propnameid_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
-  return abi::create_propnameid_or_error(
+  *out_propnameid = abi::create_propnameid(
       static_cast<jsi_pointer *>(new PropNameIdHandle(state->isolate, v8str)));
+  return jsi_status_ok;
 }
 
-jsi_propnameid_or_error JSI_ABI_CDECL
-jsi_create_propnameid_from_string(jsi_runtime *rt, jsi_string str) {
+jsi_status JSI_ABI_CDECL jsi_create_propnameid_from_string(
+    jsi_runtime *rt, jsi_string str, jsi_propnameid *out_propnameid) {
+  if (!out_propnameid)
+    return jsi_status_invalid_arg;
+  *out_propnameid = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::String> v8str = toStringHandle(str)->get(state->isolate);
-  return abi::create_propnameid_or_error(
+  *out_propnameid = abi::create_propnameid(
       static_cast<jsi_pointer *>(new PropNameIdHandle(state->isolate, v8str)));
+  return jsi_status_ok;
 }
 
-jsi_propnameid_or_error JSI_ABI_CDECL
-jsi_create_propnameid_from_symbol(jsi_runtime *rt, jsi_symbol sym) {
+jsi_status JSI_ABI_CDECL jsi_create_propnameid_from_symbol(
+    jsi_runtime *rt, jsi_symbol sym, jsi_propnameid *out_propnameid) {
+  if (!out_propnameid)
+    return jsi_status_invalid_arg;
+  *out_propnameid = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::Symbol> v8sym = toSymbolHandle(sym)->get(state->isolate);
-  return abi::create_propnameid_or_error(
+  *out_propnameid = abi::create_propnameid(
       static_cast<jsi_pointer *>(new PropNameIdHandle(state->isolate, v8sym)));
+  return jsi_status_ok;
 }
 
 bool JSI_ABI_CDECL jsi_prop_name_id_equals(jsi_runtime *rt, jsi_propnameid a,
@@ -1797,7 +1886,7 @@ bool JSI_ABI_CDECL jsi_prop_name_id_equals(jsi_runtime *rt, jsi_propnameid a,
 
 void JSI_ABI_CDECL jsi_get_utf8_from_propnameid(jsi_runtime *rt,
                                              jsi_propnameid name,
-                                             jsi_growable_buffer *buf) {
+                                             jsi_growable_buffer *buffer) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Isolate *isolate = state->isolate;
@@ -1815,17 +1904,17 @@ void JSI_ABI_CDECL jsi_get_utf8_from_propnameid(jsi_runtime *rt,
   }
 
   if (v8str.IsEmpty()) {
-    buf->used = 0;
+    buffer->used = 0;
     return;
   }
 
   size_t utf8_len = v8str->Utf8LengthV2(isolate);
-  if (buf->size < utf8_len)
-    buf->api->try_grow_to(buf, utf8_len);
-  if (buf->size >= utf8_len) {
-    v8str->WriteUtf8V2(isolate, reinterpret_cast<char *>(buf->data),
+  if (buffer->size < utf8_len)
+    buffer->api->try_grow_to(buffer, utf8_len);
+  if (buffer->size >= utf8_len) {
+    v8str->WriteUtf8V2(isolate, reinterpret_cast<char *>(buffer->data),
                         static_cast<int>(utf8_len));
-    buf->used = utf8_len;
+    buffer->used = utf8_len;
   }
 }
 
@@ -1833,17 +1922,24 @@ void JSI_ABI_CDECL jsi_get_utf8_from_propnameid(jsi_runtime *rt,
 // Object Operations
 //------------------------------------------------------------------------------
 
-jsi_object_or_error JSI_ABI_CDECL jsi_create_object(jsi_runtime *rt) {
+jsi_status JSI_ABI_CDECL jsi_create_object(jsi_runtime *rt,
+                                           jsi_object *out_object) {
+  if (!out_object)
+    return jsi_status_invalid_arg;
+  *out_object = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::Object> obj = v8::Object::New(state->isolate);
-  return abi::create_object_or_error(
+  *out_object = abi::create_object(
       static_cast<jsi_pointer *>(new ObjectHandle(state->isolate, obj)));
+  return jsi_status_ok;
 }
 
-jsi_object_or_error JSI_ABI_CDECL
-jsi_create_object_with_prototype(jsi_runtime *rt,
-                                  const jsi_value *prototype) {
+jsi_status JSI_ABI_CDECL jsi_create_object_with_prototype(
+    jsi_runtime *rt, const jsi_value *prototype, jsi_object *out_object) {
+  if (!out_object)
+    return jsi_status_invalid_arg;
+  *out_object = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Isolate *isolate = state->isolate;
@@ -1856,17 +1952,22 @@ jsi_create_object_with_prototype(jsi_runtime *rt,
 
   v8::Local<v8::Object> obj =
       v8::Object::New(isolate, proto, nullptr, nullptr, 0);
-  return abi::create_object_or_error(
+  *out_object = abi::create_object(
       static_cast<jsi_pointer *>(new ObjectHandle(isolate, obj)));
+  return jsi_status_ok;
 }
 
-jsi_value_or_error JSI_ABI_CDECL jsi_get_prototype_of(jsi_runtime *rt,
-                                                    jsi_object obj) {
+jsi_status JSI_ABI_CDECL jsi_get_prototype_of(
+    jsi_runtime *rt, jsi_object obj, jsi_value *out_value) {
+  if (!out_value)
+    return jsi_status_invalid_arg;
+  *out_value = abi::create_undefined_value();
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::Object> v8obj = toObjectHandle(obj)->get(state->isolate);
   v8::Local<v8::Value> proto = v8obj->GetPrototypeV2();
-  return abi::create_value_or_error(createJsiValue(state->isolate, proto));
+  *out_value = createJsiValue(state->isolate, proto);
+  return jsi_status_ok;
 }
 
 jsi_status JSI_ABI_CDECL jsi_set_prototype_of(jsi_runtime *rt,
@@ -1893,8 +1994,11 @@ jsi_status JSI_ABI_CDECL jsi_set_prototype_of(jsi_runtime *rt,
   return jsi_status_ok;
 }
 
-jsi_bool_or_error JSI_ABI_CDECL jsi_has_object_property_from_propnameid(
-    jsi_runtime *rt, jsi_object obj, jsi_propnameid name) {
+jsi_status JSI_ABI_CDECL jsi_has_object_property_from_propnameid(
+    jsi_runtime *rt, jsi_object obj, jsi_propnameid name, bool *out_result) {
+  if (!out_result)
+    return jsi_status_invalid_arg;
+  *out_result = false;
   auto *state = getState(rt);
   V8Scope scope(state);
   TryCatch try_catch(state);
@@ -1904,12 +2008,17 @@ jsi_bool_or_error JSI_ABI_CDECL jsi_has_object_property_from_propnameid(
 
   v8::Maybe<bool> has = v8obj->Has(state->getContextLocal(), v8name);
   if (has.IsNothing())
-    return abi::create_bool_or_error(jsi_status_js_error);
-  return abi::create_bool_or_error(has.FromJust());
+    return jsi_status_js_error;
+  *out_result = has.FromJust();
+  return jsi_status_ok;
 }
 
-jsi_value_or_error JSI_ABI_CDECL jsi_get_object_property_from_propnameid(
-    jsi_runtime *rt, jsi_object obj, jsi_propnameid name) {
+jsi_status JSI_ABI_CDECL jsi_get_object_property_from_propnameid(
+    jsi_runtime *rt, jsi_object obj, jsi_propnameid name,
+    jsi_value *out_value) {
+  if (!out_value)
+    return jsi_status_invalid_arg;
+  *out_value = abi::create_undefined_value();
   auto *state = getState(rt);
   V8Scope scope(state);
   TryCatch try_catch(state);
@@ -1919,9 +2028,10 @@ jsi_value_or_error JSI_ABI_CDECL jsi_get_object_property_from_propnameid(
 
   v8::Local<v8::Value> val;
   if (!v8obj->Get(state->getContextLocal(), v8name).ToLocal(&val))
-    return abi::create_value_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
 
-  return abi::create_value_or_error(createJsiValue(state->isolate, val));
+  *out_value = createJsiValue(state->isolate, val);
+  return jsi_status_ok;
 }
 
 jsi_status JSI_ABI_CDECL jsi_set_object_property_from_propnameid(
@@ -1957,8 +2067,11 @@ jsi_status JSI_ABI_CDECL jsi_delete_property_from_propnameid(
   return jsi_status_ok;
 }
 
-jsi_bool_or_error JSI_ABI_CDECL jsi_has_object_property_from_value(
-    jsi_runtime *rt, jsi_object obj, const jsi_value *key) {
+jsi_status JSI_ABI_CDECL jsi_has_object_property_from_value(
+    jsi_runtime *rt, jsi_object obj, const jsi_value *key, bool *out_result) {
+  if (!out_result)
+    return jsi_status_invalid_arg;
+  *out_result = false;
   auto *state = getState(rt);
   V8Scope scope(state);
   TryCatch try_catch(state);
@@ -1968,12 +2081,17 @@ jsi_bool_or_error JSI_ABI_CDECL jsi_has_object_property_from_value(
 
   v8::Maybe<bool> has = v8obj->Has(state->getContextLocal(), v8key);
   if (has.IsNothing())
-    return abi::create_bool_or_error(jsi_status_js_error);
-  return abi::create_bool_or_error(has.FromJust());
+    return jsi_status_js_error;
+  *out_result = has.FromJust();
+  return jsi_status_ok;
 }
 
-jsi_value_or_error JSI_ABI_CDECL jsi_get_object_property_from_value(
-    jsi_runtime *rt, jsi_object obj, const jsi_value *key) {
+jsi_status JSI_ABI_CDECL jsi_get_object_property_from_value(
+    jsi_runtime *rt, jsi_object obj, const jsi_value *key,
+    jsi_value *out_value) {
+  if (!out_value)
+    return jsi_status_invalid_arg;
+  *out_value = abi::create_undefined_value();
   auto *state = getState(rt);
   V8Scope scope(state);
   TryCatch try_catch(state);
@@ -1983,9 +2101,10 @@ jsi_value_or_error JSI_ABI_CDECL jsi_get_object_property_from_value(
 
   v8::Local<v8::Value> val;
   if (!v8obj->Get(state->getContextLocal(), v8key).ToLocal(&val))
-    return abi::create_value_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
 
-  return abi::create_value_or_error(createJsiValue(state->isolate, val));
+  *out_value = createJsiValue(state->isolate, val);
+  return jsi_status_ok;
 }
 
 jsi_status JSI_ABI_CDECL jsi_set_object_property_from_value(
@@ -2021,8 +2140,11 @@ jsi_status JSI_ABI_CDECL jsi_delete_property_from_value(
   return jsi_status_ok;
 }
 
-jsi_array_or_error JSI_ABI_CDECL jsi_get_object_property_names(jsi_runtime *rt,
-                                                            jsi_object obj) {
+jsi_status JSI_ABI_CDECL jsi_get_object_property_names(
+    jsi_runtime *rt, jsi_object obj, jsi_array *out_array) {
+  if (!out_array)
+    return jsi_status_invalid_arg;
+  *out_array = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   TryCatch try_catch(state);
@@ -2038,14 +2160,16 @@ jsi_array_or_error JSI_ABI_CDECL jsi_get_object_property_names(jsi_runtime *rt,
                v8::IndexFilter::kIncludeIndices,
                v8::KeyConversionMode::kConvertToString)
            .ToLocal(&names))
-    return abi::create_array_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
 
-  return abi::create_array_or_error(
+  *out_array = abi::create_array(
       static_cast<jsi_pointer *>(new ObjectHandle(state->isolate, names)));
+  return jsi_status_ok;
 }
 
 jsi_status JSI_ABI_CDECL jsi_set_object_external_memory_pressure(
-    jsi_runtime *rt, jsi_object /*obj*/, size_t amount) {
+    jsi_runtime *rt, jsi_object obj, size_t amount) {
+  (void)obj;
   auto *state = getState(rt);
   V8Scope scope(state);
   state->isolate->AdjustAmountOfExternalAllocatedMemory(
@@ -2053,43 +2177,54 @@ jsi_status JSI_ABI_CDECL jsi_set_object_external_memory_pressure(
   return jsi_status_ok;
 }
 
-jsi_object_or_error JSI_ABI_CDECL jsi_create_error(jsi_runtime *rt,
-                                                const uint8_t *utf8_msg,
-                                                size_t len) {
+jsi_status JSI_ABI_CDECL jsi_create_error(
+    jsi_runtime *rt, const char *message, size_t length,
+    jsi_object *out_object) {
+  if (!out_object)
+    return jsi_status_invalid_arg;
+  *out_object = {};
+  length = resolveUtf8Length(message, length);
+  if (!message && length != 0)
+    return jsi_status_invalid_arg;
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Isolate *isolate = state->isolate;
 
   v8::Local<v8::String> msgStr;
-  if (utf8_msg && len > 0) {
-    if (!v8::String::NewFromUtf8(isolate,
-                                  reinterpret_cast<const char *>(utf8_msg),
+  if (message && length > 0) {
+    if (!v8::String::NewFromUtf8(isolate, message,
                                   v8::NewStringType::kNormal,
-                                  static_cast<int>(len))
+                                  static_cast<int>(length))
              .ToLocal(&msgStr)) {
       state->setNativeError("Failed to create message string");
-      return abi::create_object_or_error(jsi_status_native_error);
+      return jsi_status_native_error;
     }
   } else {
     msgStr = v8::String::Empty(isolate);
   }
 
   v8::Local<v8::Value> error = v8::Exception::Error(msgStr);
-  return abi::create_object_or_error(static_cast<jsi_pointer *>(
+  *out_object = abi::create_object(static_cast<jsi_pointer *>(
       new ObjectHandle(isolate, v8::Local<v8::Object>::Cast(error))));
+  return jsi_status_ok;
 }
 
 //------------------------------------------------------------------------------
 // Array Operations
 //------------------------------------------------------------------------------
 
-jsi_array_or_error JSI_ABI_CDECL jsi_create_array(jsi_runtime *rt, size_t length) {
+jsi_status JSI_ABI_CDECL jsi_create_array(
+    jsi_runtime *rt, size_t length, jsi_array *out_array) {
+  if (!out_array)
+    return jsi_status_invalid_arg;
+  *out_array = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::Array> arr =
       v8::Array::New(state->isolate, static_cast<int>(length));
-  return abi::create_array_or_error(
+  *out_array = abi::create_array(
       static_cast<jsi_pointer *>(new ObjectHandle(state->isolate, arr)));
+  return jsi_status_ok;
 }
 
 size_t JSI_ABI_CDECL jsi_get_array_length(jsi_runtime *rt, jsi_array arr) {
@@ -2101,9 +2236,11 @@ size_t JSI_ABI_CDECL jsi_get_array_length(jsi_runtime *rt, jsi_array arr) {
   return v8::Local<v8::Array>::Cast(v8obj)->Length();
 }
 
-jsi_value_or_error JSI_ABI_CDECL jsi_get_array_element(jsi_runtime *rt,
-                                                    jsi_object arr,
-                                                    size_t index) {
+jsi_status JSI_ABI_CDECL jsi_get_array_element(
+    jsi_runtime *rt, jsi_object arr, size_t index, jsi_value *out_value) {
+  if (!out_value)
+    return jsi_status_invalid_arg;
+  *out_value = abi::create_undefined_value();
   auto *state = getState(rt);
   V8Scope scope(state);
   TryCatch try_catch(state);
@@ -2112,9 +2249,10 @@ jsi_value_or_error JSI_ABI_CDECL jsi_get_array_element(jsi_runtime *rt,
   v8::Local<v8::Value> val;
   if (!v8obj->Get(state->getContextLocal(), static_cast<uint32_t>(index))
            .ToLocal(&val))
-    return abi::create_value_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
 
-  return abi::create_value_or_error(createJsiValue(state->isolate, val));
+  *out_value = createJsiValue(state->isolate, val);
+  return jsi_status_ok;
 }
 
 jsi_status JSI_ABI_CDECL jsi_set_array_element(jsi_runtime *rt,
@@ -2139,18 +2277,26 @@ jsi_status JSI_ABI_CDECL jsi_set_array_element(jsi_runtime *rt,
 // ArrayBuffer Operations
 //------------------------------------------------------------------------------
 
-jsi_arraybuffer_or_error JSI_ABI_CDECL jsi_create_arraybuffer(jsi_runtime *rt,
-                                                           size_t byte_length) {
+jsi_status JSI_ABI_CDECL jsi_create_arraybuffer(
+    jsi_runtime *rt, size_t byte_length, jsi_arraybuffer *out_arraybuffer) {
+  if (!out_arraybuffer)
+    return jsi_status_invalid_arg;
+  *out_arraybuffer = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::ArrayBuffer> ab =
       v8::ArrayBuffer::New(state->isolate, byte_length);
-  return abi::create_arraybuffer_or_error(
+  *out_arraybuffer = abi::create_arraybuffer(
       static_cast<jsi_pointer *>(new ObjectHandle(state->isolate, ab)));
+  return jsi_status_ok;
 }
 
-jsi_arraybuffer_or_error JSI_ABI_CDECL jsi_create_arraybuffer_from_external_data(
-    jsi_runtime *rt, jsi_mutable_buffer *buf) {
+jsi_status JSI_ABI_CDECL jsi_create_arraybuffer_from_external_data(
+    jsi_runtime *rt, jsi_mutable_buffer *buffer,
+    jsi_arraybuffer *out_arraybuffer) {
+  if (!out_arraybuffer)
+    return jsi_status_invalid_arg;
+  *out_arraybuffer = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Isolate *isolate = state->isolate;
@@ -2162,76 +2308,87 @@ jsi_arraybuffer_or_error JSI_ABI_CDECL jsi_create_arraybuffer_from_external_data
   // immediately. This mirrors the node-addon-api Buffer::NewOrCopy fallback;
   // JS<->native aliasing of the original buffer is not supported under the
   // sandbox.
-  v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(isolate, buf->size);
-  if (buf->size != 0)
-    std::memcpy(ab->Data(), buf->data, buf->size);
-  if (buf->api && buf->api->release)
-    buf->api->release(buf);
-  return abi::create_arraybuffer_or_error(
+  v8::Local<v8::ArrayBuffer> ab =
+      v8::ArrayBuffer::New(isolate, buffer->size);
+  if (buffer->size != 0)
+    std::memcpy(ab->Data(), buffer->data, buffer->size);
+  if (buffer->api && buffer->api->release)
+    buffer->api->release(buffer);
+  *out_arraybuffer = abi::create_arraybuffer(
       static_cast<jsi_pointer *>(new ObjectHandle(isolate, ab)));
 #else
   struct BufRef {
-    jsi_mutable_buffer *buf;
+    jsi_mutable_buffer *buffer;
   };
-  auto *ref = new BufRef{buf};
+  auto *ref = new BufRef{buffer};
 
   std::unique_ptr<v8::BackingStore> backing_store =
       v8::ArrayBuffer::NewBackingStore(
-          buf->data, buf->size,
+          buffer->data, buffer->size,
           [](void * /*data*/, size_t /*length*/, void *deleter_data) {
             auto *r = static_cast<BufRef *>(deleter_data);
-            if (r->buf->api && r->buf->api->release)
-              r->buf->api->release(r->buf);
+            if (r->buffer->api && r->buffer->api->release)
+              r->buffer->api->release(r->buffer);
             delete r;
           },
           ref);
 
   v8::Local<v8::ArrayBuffer> ab =
       v8::ArrayBuffer::New(isolate, std::move(backing_store));
-  return abi::create_arraybuffer_or_error(
+  *out_arraybuffer = abi::create_arraybuffer(
       static_cast<jsi_pointer *>(new ObjectHandle(isolate, ab)));
 #endif  // V8_ENABLE_SANDBOX
+  return jsi_status_ok;
 }
 
-jsi_uint8_ptr_or_error JSI_ABI_CDECL jsi_get_arraybuffer_data(jsi_runtime *rt,
-                                                           jsi_arraybuffer ab) {
+jsi_status JSI_ABI_CDECL jsi_get_arraybuffer_data(
+    jsi_runtime *rt, jsi_arraybuffer ab, uint8_t **out_data) {
+  if (!out_data)
+    return jsi_status_invalid_arg;
+  *out_data = nullptr;
   auto *state = getState(rt);
   V8Scope scope(state);
 
   v8::Local<v8::Object> v8obj = toObjectHandle({ab.pointer})->get(state->isolate);
   if (!v8obj->IsArrayBuffer()) {
     state->setNativeError("Object is not an ArrayBuffer");
-    return abi::create_uint8_ptr_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
 
   v8::Local<v8::ArrayBuffer> v8ab = v8::Local<v8::ArrayBuffer>::Cast(v8obj);
-  return abi::create_uint8_ptr_or_error(
-      static_cast<uint8_t *>(v8ab->GetBackingStore()->Data()));
+  *out_data = static_cast<uint8_t *>(v8ab->GetBackingStore()->Data());
+  return jsi_status_ok;
 }
 
-jsi_size_or_error JSI_ABI_CDECL jsi_get_arraybuffer_size(jsi_runtime *rt,
-                                                      jsi_arraybuffer ab) {
+jsi_status JSI_ABI_CDECL jsi_get_arraybuffer_size(
+    jsi_runtime *rt, jsi_arraybuffer ab, size_t *out_size) {
+  if (!out_size)
+    return jsi_status_invalid_arg;
+  *out_size = 0;
   auto *state = getState(rt);
   V8Scope scope(state);
 
   v8::Local<v8::Object> v8obj = toObjectHandle({ab.pointer})->get(state->isolate);
   if (!v8obj->IsArrayBuffer()) {
     state->setNativeError("Object is not an ArrayBuffer");
-    return abi::create_size_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
 
   v8::Local<v8::ArrayBuffer> v8ab = v8::Local<v8::ArrayBuffer>::Cast(v8obj);
-  return abi::create_size_or_error(v8ab->ByteLength());
+  *out_size = v8ab->ByteLength();
+  return jsi_status_ok;
 }
 
 //------------------------------------------------------------------------------
 // Function Operations
 //------------------------------------------------------------------------------
 
-jsi_value_or_error JSI_ABI_CDECL jsi_call(jsi_runtime *rt, jsi_function fn,
-                                       const jsi_value *js_this,
-                                       const jsi_value *args,
-                                       size_t arg_count) {
+jsi_status JSI_ABI_CDECL jsi_call(
+    jsi_runtime *rt, jsi_function fn, const jsi_value *js_this,
+    const jsi_value *args, size_t arg_count, jsi_value *out_value) {
+  if (!out_value)
+    return jsi_status_invalid_arg;
+  *out_value = abi::create_undefined_value();
   auto *state = getState(rt);
   V8Scope scope(state);
   TryCatch try_catch(state);
@@ -2240,7 +2397,7 @@ jsi_value_or_error JSI_ABI_CDECL jsi_call(jsi_runtime *rt, jsi_function fn,
   v8::Local<v8::Object> v8obj = toObjectHandle({fn.pointer})->get(state->isolate);
   if (!v8obj->IsFunction()) {
     state->setNativeError("Object is not a function");
-    return abi::create_value_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
   v8::Local<v8::Function> v8func = v8::Local<v8::Function>::Cast(v8obj);
 
@@ -2258,15 +2415,18 @@ jsi_value_or_error JSI_ABI_CDECL jsi_call(jsi_runtime *rt, jsi_function fn,
            ->Call(state->getContextLocal(), v8this,
                   static_cast<int>(arg_count), v8args.data())
            .ToLocal(&callResult))
-    return abi::create_value_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
 
-  return abi::create_value_or_error(createJsiValue(isolate, callResult));
+  *out_value = createJsiValue(isolate, callResult);
+  return jsi_status_ok;
 }
 
-jsi_value_or_error JSI_ABI_CDECL jsi_call_as_constructor(jsi_runtime *rt,
-                                                      jsi_function fn,
-                                                      const jsi_value *args,
-                                                      size_t arg_count) {
+jsi_status JSI_ABI_CDECL jsi_call_as_constructor(
+    jsi_runtime *rt, jsi_function fn, const jsi_value *args,
+    size_t arg_count, jsi_value *out_value) {
+  if (!out_value)
+    return jsi_status_invalid_arg;
+  *out_value = abi::create_undefined_value();
   auto *state = getState(rt);
   V8Scope scope(state);
   TryCatch try_catch(state);
@@ -2275,7 +2435,7 @@ jsi_value_or_error JSI_ABI_CDECL jsi_call_as_constructor(jsi_runtime *rt,
   v8::Local<v8::Object> v8obj = toObjectHandle({fn.pointer})->get(state->isolate);
   if (!v8obj->IsFunction()) {
     state->setNativeError("Object is not a function");
-    return abi::create_value_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
   v8::Local<v8::Function> v8func = v8::Local<v8::Function>::Cast(v8obj);
 
@@ -2289,15 +2449,19 @@ jsi_value_or_error JSI_ABI_CDECL jsi_call_as_constructor(jsi_runtime *rt,
            ->NewInstance(state->getContextLocal(),
                          static_cast<int>(arg_count), v8args.data())
            .ToLocal(&constructed))
-    return abi::create_value_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
 
-  return abi::create_value_or_error(
-      abi::create_object_value(new ObjectHandle(isolate, constructed)));
+  *out_value =
+      abi::create_object_value(new ObjectHandle(isolate, constructed));
+  return jsi_status_ok;
 }
 
-jsi_function_or_error JSI_ABI_CDECL jsi_create_function_from_host_function(
+jsi_status JSI_ABI_CDECL jsi_create_function_from_host_function(
     jsi_runtime *rt, jsi_propnameid name, uint32_t param_count,
-    jsi_host_function *hf) {
+    jsi_host_function *hf, jsi_function *out_function) {
+  if (!out_function)
+    return jsi_status_invalid_arg;
+  *out_function = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   TryCatch try_catch(state);
@@ -2312,7 +2476,7 @@ jsi_function_or_error JSI_ABI_CDECL jsi_create_function_from_host_function(
            .ToLocal(&func)) {
     ctx->hostFunction = nullptr; // caller still owns hf
     delete ctx;
-    return abi::create_function_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
   }
 
   // Set up weak ref so ctx + hf are released when V8 GCs the function
@@ -2328,8 +2492,9 @@ jsi_function_or_error JSI_ABI_CDECL jsi_create_function_from_host_function(
       func->SetName(v8::Local<v8::String>::Cast(v8name));
   }
 
-  return abi::create_function_or_error(
+  *out_function = abi::create_function(
       static_cast<jsi_pointer *>(new ObjectHandle(isolate, func)));
+  return jsi_status_ok;
 }
 
 jsi_host_function *JSI_ABI_CDECL jsi_get_host_function(jsi_runtime *rt,
@@ -2353,8 +2518,11 @@ jsi_host_function *JSI_ABI_CDECL jsi_get_host_function(jsi_runtime *rt,
 // Host Object Operations
 //------------------------------------------------------------------------------
 
-jsi_object_or_error JSI_ABI_CDECL
-jsi_create_object_from_host_object(jsi_runtime *rt, jsi_host_object *ho) {
+jsi_status JSI_ABI_CDECL jsi_create_object_from_host_object(
+    jsi_runtime *rt, jsi_host_object *ho, jsi_object *out_object) {
+  if (!out_object)
+    return jsi_status_invalid_arg;
+  *out_object = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   TryCatch try_catch(state);
@@ -2365,7 +2533,7 @@ jsi_create_object_from_host_object(jsi_runtime *rt, jsi_host_object *ho) {
 
   v8::Local<v8::Object> newObject;
   if (!constructor->NewInstance(context).ToLocal(&newObject))
-    return abi::create_object_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
 
   auto *proxy = new AbiHostObjectProxy(rt, ho, isolate, newObject);
   newObject->SetInternalField(0, v8::External::New(isolate, proxy));
@@ -2374,8 +2542,9 @@ jsi_create_object_from_host_object(jsi_runtime *rt, jsi_host_object *ho) {
   newObject->SetPrivate(context, hostObjectKey,
                         v8::External::New(isolate, proxy));
 
-  return abi::create_object_or_error(
+  *out_object = abi::create_object(
       static_cast<jsi_pointer *>(new ObjectHandle(isolate, newObject)));
+  return jsi_status_ok;
 }
 
 jsi_host_object *JSI_ABI_CDECL jsi_get_host_object(jsi_runtime *rt,
@@ -2472,13 +2641,17 @@ bool JSI_ABI_CDECL jsi_object_is_function(jsi_runtime *rt, jsi_object obj) {
 // Weak References
 //------------------------------------------------------------------------------
 
-jsi_weak_object_or_error JSI_ABI_CDECL jsi_create_weak_object(jsi_runtime *rt,
-                                                           jsi_object obj) {
+jsi_status JSI_ABI_CDECL jsi_create_weak_object(
+    jsi_runtime *rt, jsi_object obj, jsi_weak_object *out_weak_object) {
+  if (!out_weak_object)
+    return jsi_status_invalid_arg;
+  *out_weak_object = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::Object> v8obj = toObjectHandle(obj)->get(state->isolate);
-  return abi::create_weak_object_or_error(
+  *out_weak_object = abi::create_weak_object(
       static_cast<jsi_pointer *>(new WeakObjectHandle(state->isolate, v8obj)));
+  return jsi_status_ok;
 }
 
 jsi_value JSI_ABI_CDECL jsi_lock_weak_object(jsi_runtime *rt,
@@ -2495,8 +2668,11 @@ jsi_value JSI_ABI_CDECL jsi_lock_weak_object(jsi_runtime *rt,
 // Comparison
 //------------------------------------------------------------------------------
 
-jsi_bool_or_error JSI_ABI_CDECL jsi_instance_of(jsi_runtime *rt, jsi_object obj,
-                                             jsi_function ctor) {
+jsi_status JSI_ABI_CDECL jsi_instance_of(
+    jsi_runtime *rt, jsi_object obj, jsi_function ctor, bool *out_result) {
+  if (!out_result)
+    return jsi_status_invalid_arg;
+  *out_result = false;
   auto *state = getState(rt);
   V8Scope scope(state);
   TryCatch try_catch(state);
@@ -2507,8 +2683,9 @@ jsi_bool_or_error JSI_ABI_CDECL jsi_instance_of(jsi_runtime *rt, jsi_object obj,
   v8::Maybe<bool> result =
       v8obj->InstanceOf(state->getContextLocal(), v8ctor);
   if (result.IsNothing())
-    return abi::create_bool_or_error(jsi_status_js_error);
-  return abi::create_bool_or_error(result.FromJust());
+    return jsi_status_js_error;
+  *out_result = result.FromJust();
+  return jsi_status_ok;
 }
 
 bool JSI_ABI_CDECL jsi_strict_equals_symbol(jsi_runtime *rt, jsi_symbol a,
@@ -2543,23 +2720,31 @@ bool JSI_ABI_CDECL jsi_strict_equals_object(jsi_runtime *rt, jsi_object a,
 // BigInt Operations
 //------------------------------------------------------------------------------
 
-jsi_bigint_or_error JSI_ABI_CDECL jsi_create_bigint_from_int64(jsi_runtime *rt,
-                                                            int64_t value) {
+jsi_status JSI_ABI_CDECL jsi_create_bigint_from_int64(
+    jsi_runtime *rt, int64_t value, jsi_bigint *out_bigint) {
+  if (!out_bigint)
+    return jsi_status_invalid_arg;
+  *out_bigint = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::BigInt> bi = v8::BigInt::New(state->isolate, value);
-  return abi::create_bigint_or_error(
+  *out_bigint = abi::create_bigint(
       static_cast<jsi_pointer *>(new BigIntHandle(state->isolate, bi)));
+  return jsi_status_ok;
 }
 
-jsi_bigint_or_error JSI_ABI_CDECL jsi_create_bigint_from_uint64(jsi_runtime *rt,
-                                                             uint64_t value) {
+jsi_status JSI_ABI_CDECL jsi_create_bigint_from_uint64(
+    jsi_runtime *rt, uint64_t value, jsi_bigint *out_bigint) {
+  if (!out_bigint)
+    return jsi_status_invalid_arg;
+  *out_bigint = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::BigInt> bi =
       v8::BigInt::NewFromUnsigned(state->isolate, value);
-  return abi::create_bigint_or_error(
+  *out_bigint = abi::create_bigint(
       static_cast<jsi_pointer *>(new BigIntHandle(state->isolate, bi)));
+  return jsi_status_ok;
 }
 
 bool JSI_ABI_CDECL jsi_bigint_is_int64(jsi_runtime *rt, jsi_bigint bigint) {
@@ -2587,30 +2772,33 @@ uint64_t JSI_ABI_CDECL jsi_bigint_truncate_to_uint64(jsi_runtime *rt,
 }
 
 int64_t JSI_ABI_CDECL jsi_bigint_to_int64(jsi_runtime *rt, jsi_bigint bigint,
-                                       bool *lossless) {
+                                       bool *out_lossless) {
   auto *state = getState(rt);
   V8Scope scope(state);
   bool is_lossless = true;
   int64_t result = toBigIntHandle(bigint)->get(state->isolate)->Int64Value(&is_lossless);
-  if (lossless)
-    *lossless = is_lossless;
+  if (out_lossless)
+    *out_lossless = is_lossless;
   return result;
 }
 
 uint64_t JSI_ABI_CDECL jsi_bigint_to_uint64(jsi_runtime *rt, jsi_bigint bigint,
-                                         bool *lossless) {
+                                         bool *out_lossless) {
   auto *state = getState(rt);
   V8Scope scope(state);
   bool is_lossless = true;
   uint64_t result = toBigIntHandle(bigint)->get(state->isolate)->Uint64Value(&is_lossless);
-  if (lossless)
-    *lossless = is_lossless;
+  if (out_lossless)
+    *out_lossless = is_lossless;
   return result;
 }
 
-jsi_string_or_error JSI_ABI_CDECL jsi_bigint_to_string(jsi_runtime *rt,
-                                                    jsi_bigint bigint,
-                                                    uint32_t radix) {
+jsi_status JSI_ABI_CDECL jsi_bigint_to_string(
+    jsi_runtime *rt, jsi_bigint bigint, uint32_t radix,
+    jsi_string *out_string) {
+  if (!out_string)
+    return jsi_status_invalid_arg;
+  *out_string = {};
   auto *state = getState(rt);
   V8Scope scope(state);
   TryCatch try_catch(state);
@@ -2621,7 +2809,7 @@ jsi_string_or_error JSI_ABI_CDECL jsi_bigint_to_string(jsi_runtime *rt,
 
   v8::Local<v8::Object> bigintProto;
   if (!bi->ToObject(context).ToLocal(&bigintProto))
-    return abi::create_string_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
 
   v8::Local<v8::String> toStringName =
       v8::String::NewFromUtf8Literal(isolate, "toString");
@@ -2629,7 +2817,7 @@ jsi_string_or_error JSI_ABI_CDECL jsi_bigint_to_string(jsi_runtime *rt,
   if (!bigintProto->Get(context, toStringName).ToLocal(&toStringFn) ||
       !toStringFn->IsFunction()) {
     state->setNativeError("BigInt.prototype.toString not found");
-    return abi::create_string_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
 
   v8::Local<v8::Value> radixArg =
@@ -2638,15 +2826,16 @@ jsi_string_or_error JSI_ABI_CDECL jsi_bigint_to_string(jsi_runtime *rt,
   if (!v8::Local<v8::Function>::Cast(toStringFn)
            ->Call(context, bi, 1, &radixArg)
            .ToLocal(&resultValue))
-    return abi::create_string_or_error(jsi_status_js_error);
+    return jsi_status_js_error;
 
   if (!resultValue->IsString()) {
     state->setNativeError("BigInt.toString did not return a string");
-    return abi::create_string_or_error(jsi_status_native_error);
+    return jsi_status_native_error;
   }
 
-  return abi::create_string_or_error(static_cast<jsi_pointer *>(
+  *out_string = abi::create_string(static_cast<jsi_pointer *>(
       new StringHandle(isolate, v8::Local<v8::String>::Cast(resultValue))));
+  return jsi_status_ok;
 }
 
 //==============================================================================
@@ -2663,7 +2852,8 @@ const jsi_runtime_api g_vtable = {
     /* get_and_clear_native_exception_message */
     jsi_get_and_clear_native_exception_message,
     /* set_js_error_value */ jsi_set_js_error_value,
-    /* set_native_exception_message_utf8 */ jsi_set_native_exception_message,
+    /* set_native_exception_message_utf8 */
+    jsi_set_native_exception_message_utf8,
 
     /* clone_propnameid */ jsi_clone_propnameid,
     /* clone_string */ jsi_clone_string,

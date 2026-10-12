@@ -35,6 +35,8 @@
 #include <stdbool.h>
 #endif
 
+#include "jsi_abi_stela.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -113,21 +115,16 @@ typedef struct jsi_host_object_api jsi_host_object_api;
 typedef struct jsi_native_state jsi_native_state;
 typedef struct jsi_native_state_api jsi_native_state_api;
 typedef struct jsi_interface_id jsi_interface_id;
-typedef struct jsi_object_or_error jsi_object_or_error;
-typedef struct jsi_array_or_error jsi_array_or_error;
-typedef struct jsi_string_or_error jsi_string_or_error;
-typedef struct jsi_bigint_or_error jsi_bigint_or_error;
-typedef struct jsi_symbol_or_error jsi_symbol_or_error;
-typedef struct jsi_function_or_error jsi_function_or_error;
-typedef struct jsi_arraybuffer_or_error jsi_arraybuffer_or_error;
-typedef struct jsi_propnameid_or_error jsi_propnameid_or_error;
-typedef struct jsi_weak_object_or_error jsi_weak_object_or_error;
-typedef struct jsi_bool_or_error jsi_bool_or_error;
-typedef struct jsi_size_or_error jsi_size_or_error;
-typedef struct jsi_uint8_ptr_or_error jsi_uint8_ptr_or_error;
-typedef struct jsi_value_or_error jsi_value_or_error;
-typedef struct jsi_prepared_javascript_or_error jsi_prepared_javascript_or_error;
-typedef struct jsi_propnameid_list_or_error jsi_propnameid_list_or_error;
+
+/* A UTF-16 code unit. */
+#ifdef __cplusplus
+typedef char16_t jsi_char16;
+#else
+typedef uint16_t jsi_char16;
+#endif
+
+/* Pass as a (text, length) input's length when the text is NUL-terminated. */
+#define JSI_ABI_AUTO_LENGTH SIZE_MAX
 
 /* Opaque, engine-agnostic configuration object. The runtime factory (e.g.
  * v8_jsi_abi_runtime_create) allocates one and hands it to a jsi_configure_runtime_cb
@@ -143,18 +140,27 @@ typedef struct jsi_config_s* jsi_config;
 typedef void(JSI_ABI_CDECL *jsi_data_delete_cb)(void *data, void *deleter_data);
 
 /*==========================================================================
- * Error Codes
+ * Status
+ *
+ * Every fallible call returns a jsi_status. Codes are grouped in bands
+ * (code & 0xF000); test the band, not the exact code, to classify a failure.
+ * On failure, a call's out_* outputs are zeroed (a jsi_value becomes
+ * undefined).
  *==========================================================================*/
 
-/* Error codes are odd values (bit 0 = 1) and 0 means "no error".
- * This lets bit-packed OrError variants encode the error directly
- * (no shift), and lets void-returning operations return jsi_status
- * directly with 0 = success / odd = error. Future codes must be odd. */
-typedef enum jsi_status {
-  jsi_status_ok = 0,
-  jsi_status_native_error = 1, /* Native C++ exception (message available) */
-  jsi_status_js_error = 3 /* JavaScript exception (JS value available) */
-} jsi_status;
+JSI_ABI_ENUM(int32_t, jsi_status){
+    jsi_status_ok = 0,
+    /* 0x1000: caller contract */
+    jsi_status_invalid_arg = 0x1001,
+    jsi_status_version_mismatch = 0x1002,
+    /* 0x2000: state and resources (reserved) */
+    /* 0x4000: a JS exception is pending; fetch it with
+     * get_and_clear_js_error_value */
+    jsi_status_js_error = 0x4001,
+    /* 0x7000: native or internal failure; fetch the message with
+     * get_and_clear_native_exception_message */
+    jsi_status_native_error = 0x7001,
+};
 
 /*==========================================================================
  * Configure callback (factory-owned pull model)
@@ -163,7 +169,7 @@ typedef enum jsi_status {
 /* The runtime factory allocates a jsi_config and invokes this callback so the
  * consumer can populate it via the engine's typed setters. The config handle is
  * valid ONLY for the duration of the call. Return jsi_status_ok to proceed, or
- * an odd jsi_status to abort creation (the factory then frees the config
+ * a failure status to abort creation (the factory then frees the config
  * and the create call returns NULL). May be NULL at the create site, meaning
  * "all defaults". */
 typedef jsi_status(JSI_ABI_CDECL *jsi_configure_runtime_cb)(
@@ -175,41 +181,6 @@ typedef jsi_status(JSI_ABI_CDECL *jsi_configure_runtime_cb)(
  *
  * ManagedPointer — reference-counted GC root, released through its api table.
  * Each pointer type wraps a jsi_pointer* to indicate the JS type.
- *
- * OrError variants come in two layouts, depending on whether the success
- * payload leaves a free bit for tagging:
- *
- * (A) Bit-packed (single uintptr_t). Used by every jsi_<ptr>_or_error
- *     (jsi_object_or_error, jsi_string_or_error, ...) and by
- *     jsi_bool_or_error. Discriminated by bit 0:
- *
- *       bit 0 = 0 : success.
- *                     pointer types — field is jsi_pointer* cast to
- *                                     uintptr_t (relies on jsi_pointer
- *                                     alignment >= 2 so bit 0 is 0).
- *                     jsi_bool_or_error — field is (val << 1):
- *                                         false = 0, true = 2.
- *                                         Decoder: field != 0.
- *       bit 0 = 1 : error. Field is the jsi_status value directly
- *                          (all error codes are odd; see enum above).
- *                          No shift is needed for either construction
- *                          or decoding.
- *
- * (B) Struct with explicit is_error flag + union. Used by
- *     jsi_size_or_error and jsi_uint8_ptr_or_error — their payloads use
- *     the full uintptr_t and leave no room for a tag bit.
- *
- * Void-returning operations skip the OrError wrapper entirely and return
- * jsi_status directly (0 = success, odd = error).
- *
- * Note: layout (A) stores a bare uintptr_t (not a union of jsi_pointer*
- * and uintptr_t). The tag bit shares the word with the pointer, so checking
- * it via a union would mean reading a non-active member — strict-reading
- * UB in C++. The pointer<->uintptr_t round-trip via reinterpret_cast is
- * explicitly well-defined ([expr.reinterpret.cast]/5).
- *
- * Construction and decoding helpers for both layouts live in
- * jsi_abi_helpers.h (create_*_or_error, is_error, get_error, get_*).
  *
  * NOTE: We intentionally spell out each type explicitly instead of using
  * X-macros (like Hermes ABI's HERMES_ABI_POINTER_TYPES macro). Explicit
@@ -224,119 +195,53 @@ struct jsi_pointer {
   const jsi_pointer_api *api;
 };
 
-/* --- Object --- */
 struct jsi_object {
   jsi_pointer *pointer;
 };
-struct jsi_object_or_error {
-  uintptr_t ptr_or_error;
-};
-
-/* --- Array --- */
 struct jsi_array {
   jsi_pointer *pointer;
 };
-struct jsi_array_or_error {
-  uintptr_t ptr_or_error;
-};
-
-/* --- String --- */
 struct jsi_string {
   jsi_pointer *pointer;
 };
-struct jsi_string_or_error {
-  uintptr_t ptr_or_error;
-};
-
-/* --- BigInt --- */
 struct jsi_bigint {
   jsi_pointer *pointer;
 };
-struct jsi_bigint_or_error {
-  uintptr_t ptr_or_error;
-};
-
-/* --- Symbol --- */
 struct jsi_symbol {
   jsi_pointer *pointer;
 };
-struct jsi_symbol_or_error {
-  uintptr_t ptr_or_error;
-};
-
-/* --- Function --- */
 struct jsi_function {
   jsi_pointer *pointer;
 };
-struct jsi_function_or_error {
-  uintptr_t ptr_or_error;
-};
-
-/* --- ArrayBuffer --- */
 struct jsi_arraybuffer {
   jsi_pointer *pointer;
 };
-struct jsi_arraybuffer_or_error {
-  uintptr_t ptr_or_error;
-};
-
-/* --- PropNameID --- */
 struct jsi_propnameid {
   jsi_pointer *pointer;
 };
-struct jsi_propnameid_or_error {
-  uintptr_t ptr_or_error;
-};
-
-/* --- WeakObject --- */
 struct jsi_weak_object {
   jsi_pointer *pointer;
-};
-struct jsi_weak_object_or_error {
-  uintptr_t ptr_or_error;
-};
-
-/* --- Bool-or-error (bit-packing scheme; see big-box comment above) ---
- * Void-returning operations return jsi_status directly (no wrapper);
- * 0 means success, odd values are errors. */
-struct jsi_bool_or_error {
-  uintptr_t bool_or_error;
-};
-
-/* --- Size and uint8_t* or-error (explicit is_error field) --- */
-struct jsi_size_or_error {
-  bool is_error;
-  union {
-    size_t val;
-    jsi_status error;
-  } data;
-};
-struct jsi_uint8_ptr_or_error {
-  bool is_error;
-  union {
-    uint8_t *val;
-    jsi_status error;
-  } data;
 };
 
 /*==========================================================================
  * Value Representation (inline tagged union — from Hermes ABI)
  *==========================================================================*/
 
-/* The POINTER_MASK marks value kinds that contain a jsi_pointer*. */
-#define JSI_ABI_POINTER_MASK (1u << (sizeof(uint32_t) * 8u - 1u))
+/* Marks the value kinds whose data is a jsi_pointer*. Test with this macro,
+ * never a literal. */
+#define JSI_ABI_POINTER_MASK 0x40000000
 
-typedef enum jsi_valuekind {
-  jsi_valuekind_undefined = 0,
-  jsi_valuekind_null = 1,
-  jsi_valuekind_boolean = 2,
-  jsi_valuekind_error = 3, /* Internal: used in jsi_value_or_error */
-  jsi_valuekind_number = 4,
-  jsi_valuekind_symbol = 5 | JSI_ABI_POINTER_MASK,
-  jsi_valuekind_bigint = 6 | JSI_ABI_POINTER_MASK,
-  jsi_valuekind_string = 7 | JSI_ABI_POINTER_MASK,
-  jsi_valuekind_object = 9 | JSI_ABI_POINTER_MASK
-} jsi_valuekind;
+JSI_ABI_ENUM(int32_t, jsi_valuekind){
+    jsi_valuekind_undefined = 0,
+    jsi_valuekind_null = 1,
+    jsi_valuekind_boolean = 2,
+    /* 3 is reserved. */
+    jsi_valuekind_number = 4,
+    jsi_valuekind_symbol = 5 | JSI_ABI_POINTER_MASK,
+    jsi_valuekind_bigint = 6 | JSI_ABI_POINTER_MASK,
+    jsi_valuekind_string = 7 | JSI_ABI_POINTER_MASK,
+    jsi_valuekind_object = 9 | JSI_ABI_POINTER_MASK,
+};
 
 struct jsi_value {
   jsi_valuekind kind;
@@ -344,14 +249,9 @@ struct jsi_value {
     bool boolean;
     double number;
     jsi_pointer *pointer;
-    jsi_status error; /* Only when kind == jsi_valuekind_error */
   } data;
 };
-
-struct jsi_value_or_error {
-  jsi_value value;
-};
-
+#define JSI_VALUE_INIT {jsi_valuekind_undefined, {false}}
 /*==========================================================================
  * Buffer Types (from Hermes ABI)
  *
@@ -381,6 +281,7 @@ struct jsi_growable_buffer {
   size_t size;
   size_t used;
 };
+#define JSI_GROWABLE_BUFFER_INIT {NULL, NULL, 0, 0}
 
 struct jsi_buffer_api {
   void(JSI_ABI_CDECL *release)(jsi_buffer *self);
@@ -390,6 +291,7 @@ struct jsi_buffer {
   const uint8_t *data;
   size_t size;
 };
+#define JSI_BUFFER_INIT {NULL, NULL, 0}
 
 struct jsi_mutable_buffer_api {
   void(JSI_ABI_CDECL *release)(jsi_mutable_buffer *self);
@@ -399,6 +301,7 @@ struct jsi_mutable_buffer {
   uint8_t *data;
   size_t size;
 };
+#define JSI_MUTABLE_BUFFER_INIT {NULL, NULL, 0}
 
 /*==========================================================================
  * PreparedJavaScript
@@ -420,9 +323,6 @@ struct jsi_prepared_javascript {
   const jsi_prepared_javascript_api *api;
   /* Implementation may append fields after this header. */
 };
-struct jsi_prepared_javascript_or_error {
-  uintptr_t ptr_or_error;
-};
 
 /*==========================================================================
  * Callback Types (embedded-struct pattern — from Hermes ABI)
@@ -431,16 +331,18 @@ struct jsi_prepared_javascript_or_error {
 /* Host function: called when JS invokes a native function. */
 struct jsi_host_function_api {
   void(JSI_ABI_CDECL *release)(jsi_host_function *);
-  jsi_value_or_error(JSI_ABI_CDECL *call)(
+  jsi_status(JSI_ABI_CDECL *call)(
       jsi_host_function *self,
       jsi_runtime *rt,
       const jsi_value *this_arg,
       const jsi_value *args,
-      size_t arg_count);
+      size_t arg_count,
+      jsi_value *out_value);
 };
 struct jsi_host_function {
   const jsi_host_function_api *api;
 };
+#define JSI_HOST_FUNCTION_INIT {NULL}
 
 /* PropNameID list: returned by host object get_own_keys. */
 struct jsi_propnameid_list_api {
@@ -451,30 +353,30 @@ struct jsi_propnameid_list {
   const jsi_propnameid *props;
   size_t size;
 };
-
-struct jsi_propnameid_list_or_error {
-  uintptr_t ptr_or_error;
-};
+#define JSI_PROPNAMEID_LIST_INIT {NULL, NULL, 0}
 
 /* Host object: JS object backed by native callbacks. */
 struct jsi_host_object_api {
   void(JSI_ABI_CDECL *release)(jsi_host_object *);
-  jsi_value_or_error(JSI_ABI_CDECL *get)(
+  jsi_status(JSI_ABI_CDECL *get)(
       jsi_host_object *self,
       jsi_runtime *rt,
-      jsi_propnameid name);
+      jsi_propnameid name,
+      jsi_value *out_value);
   jsi_status(JSI_ABI_CDECL *set)(
       jsi_host_object *self,
       jsi_runtime *rt,
       jsi_propnameid name,
       const jsi_value *value);
-  jsi_propnameid_list_or_error(JSI_ABI_CDECL *get_own_keys)(
+  jsi_status(JSI_ABI_CDECL *get_own_keys)(
       jsi_host_object *self,
-      jsi_runtime *rt);
+      jsi_runtime *rt,
+      jsi_propnameid_list **out_list);
 };
 struct jsi_host_object {
   const jsi_host_object_api *api;
 };
+#define JSI_HOST_OBJECT_INIT {NULL}
 
 /* Native state: attached to JS objects, released on GC. */
 struct jsi_native_state_api {
@@ -483,6 +385,7 @@ struct jsi_native_state_api {
 struct jsi_native_state {
   const jsi_native_state_api *api;
 };
+#define JSI_NATIVE_STATE_INIT {NULL}
 
 /*==========================================================================
  * Interface Query (for optional extensions — like JSI C++ ICast)
@@ -494,7 +397,7 @@ struct jsi_interface_id {
 };
 
 /*==========================================================================
- * Runtime VTable
+ * Runtime function table
  *==========================================================================*/
 
 struct jsi_runtime_api {
@@ -513,8 +416,8 @@ struct jsi_runtime_api {
   jsi_status(JSI_ABI_CDECL *query_interface)(
       jsi_runtime *rt,
       const jsi_interface_id *iid,
-      const void **vtable_out,
-      void **instance_out);
+      const void **out_api,
+      void **out_instance);
 
   /* Report the implementation's max supported ABI version (Node-API
    * napi_get_version analog). Optional feature-probe — the create-time version
@@ -543,7 +446,7 @@ struct jsi_runtime_api {
   /* Get and clear native exception message (after jsi_status_native_error). */
   void(JSI_ABI_CDECL *get_and_clear_native_exception_message)(
       jsi_runtime *rt,
-      jsi_growable_buffer *buf);
+      jsi_growable_buffer *buffer);
 
   /* Set errors before returning from host function/object callbacks. */
   void(JSI_ABI_CDECL *set_js_error_value)(
@@ -551,7 +454,7 @@ struct jsi_runtime_api {
       const jsi_value *error_value);
   void(JSI_ABI_CDECL *set_native_exception_message_utf8)(
       jsi_runtime *rt,
-      const uint8_t *utf8,
+      const char *value,
       size_t length);
 
   /*----------------------------------------------------------------------
@@ -580,7 +483,7 @@ struct jsi_runtime_api {
 
   void(JSI_ABI_CDECL *get_description)(
       jsi_runtime *rt,
-      jsi_growable_buffer *buf);
+      jsi_growable_buffer *buffer);
   bool(JSI_ABI_CDECL *is_inspectable)(jsi_runtime *rt);
 
   /*----------------------------------------------------------------------
@@ -592,7 +495,7 @@ struct jsi_runtime_api {
    * can implement these as no-ops. */
   jsi_status(JSI_ABI_CDECL *push_scope)(
       jsi_runtime *rt,
-      void **scope);
+      void **out_scope);
   jsi_status(JSI_ABI_CDECL *pop_scope)(
       jsi_runtime *rt,
       void *scope);
@@ -601,31 +504,35 @@ struct jsi_runtime_api {
    * Script evaluation
    *----------------------------------------------------------------------*/
 
-  jsi_value_or_error(JSI_ABI_CDECL *evaluate_javascript_source)(
+  jsi_status(JSI_ABI_CDECL *evaluate_javascript_source)(
       jsi_runtime *rt,
-      jsi_buffer *buf,
+      jsi_buffer *buffer,
       const char *source_url,
-      size_t source_url_len);
+      size_t source_url_length,
+      jsi_value *out_value);
 
   /* Prepare (compile) a script for later execution. The returned
    * jsi_prepared_javascript* is owned by the caller and freed via
    * api->release. */
-  jsi_prepared_javascript_or_error(JSI_ABI_CDECL *prepare_javascript)(
+  jsi_status(JSI_ABI_CDECL *prepare_javascript)(
       jsi_runtime *rt,
-      jsi_buffer *buf,
+      jsi_buffer *buffer,
       const char *source_url,
-      size_t source_url_len);
-  jsi_value_or_error(JSI_ABI_CDECL *evaluate_prepared_javascript)(
+      size_t source_url_length,
+      jsi_prepared_javascript **out_prepared);
+  jsi_status(JSI_ABI_CDECL *evaluate_prepared_javascript)(
       jsi_runtime *rt,
-      jsi_prepared_javascript *prepared);
+      jsi_prepared_javascript *prepared,
+      jsi_value *out_value);
 
   /*----------------------------------------------------------------------
    * Microtasks
    *----------------------------------------------------------------------*/
 
-  jsi_bool_or_error(JSI_ABI_CDECL *drain_microtasks)(
+  jsi_status(JSI_ABI_CDECL *drain_microtasks)(
       jsi_runtime *rt,
-      int32_t max_hint);
+      int32_t max_hint,
+      bool *out_drained);
   jsi_status(JSI_ABI_CDECL *queue_microtask)(
       jsi_runtime *rt,
       jsi_function callback);
@@ -640,22 +547,24 @@ struct jsi_runtime_api {
    * String operations
    *----------------------------------------------------------------------*/
 
-  jsi_string_or_error(JSI_ABI_CDECL *create_string_utf8)(
+  jsi_status(JSI_ABI_CDECL *create_string_utf8)(
       jsi_runtime *rt,
-      const uint8_t *utf8,
-      size_t len);
-  jsi_string_or_error(JSI_ABI_CDECL *create_string_utf16)(
+      const char *value,
+      size_t length,
+      jsi_string *out_string);
+  jsi_status(JSI_ABI_CDECL *create_string_utf16)(
       jsi_runtime *rt,
-      const uint16_t *utf16,
-      size_t len);
+      const jsi_char16 *value,
+      size_t length,
+      jsi_string *out_string);
   void(JSI_ABI_CDECL *get_string_utf8)(
       jsi_runtime *rt,
       jsi_string str,
-      jsi_growable_buffer *buf);
+      jsi_growable_buffer *buffer);
   void(JSI_ABI_CDECL *get_string_utf16)(
       jsi_runtime *rt,
       jsi_string str,
-      jsi_growable_buffer *buf);
+      jsi_growable_buffer *buffer);
 
   /*----------------------------------------------------------------------
    * Symbol operations
@@ -664,22 +573,25 @@ struct jsi_runtime_api {
   void(JSI_ABI_CDECL *get_symbol_utf8)(
       jsi_runtime *rt,
       jsi_symbol sym,
-      jsi_growable_buffer *buf);
+      jsi_growable_buffer *buffer);
 
   /*----------------------------------------------------------------------
    * PropNameID operations
    *----------------------------------------------------------------------*/
 
-  jsi_propnameid_or_error(JSI_ABI_CDECL *create_propnameid_utf8)(
+  jsi_status(JSI_ABI_CDECL *create_propnameid_utf8)(
       jsi_runtime *rt,
-      const uint8_t *utf8,
-      size_t len);
-  jsi_propnameid_or_error(JSI_ABI_CDECL *create_propnameid_from_string)(
+      const char *value,
+      size_t length,
+      jsi_propnameid *out_propnameid);
+  jsi_status(JSI_ABI_CDECL *create_propnameid_from_string)(
       jsi_runtime *rt,
-      jsi_string str);
-  jsi_propnameid_or_error(JSI_ABI_CDECL *create_propnameid_from_symbol)(
+      jsi_string str,
+      jsi_propnameid *out_propnameid);
+  jsi_status(JSI_ABI_CDECL *create_propnameid_from_symbol)(
       jsi_runtime *rt,
-      jsi_symbol sym);
+      jsi_symbol sym,
+      jsi_propnameid *out_propnameid);
   bool(JSI_ABI_CDECL *propnameid_equals)(
       jsi_runtime *rt,
       jsi_propnameid a,
@@ -687,36 +599,41 @@ struct jsi_runtime_api {
   void(JSI_ABI_CDECL *get_propnameid_utf8)(
       jsi_runtime *rt,
       jsi_propnameid name,
-      jsi_growable_buffer *buf);
+      jsi_growable_buffer *buffer);
 
   /*----------------------------------------------------------------------
    * Object operations
    *----------------------------------------------------------------------*/
 
-  jsi_object_or_error(JSI_ABI_CDECL *create_object)(
-      jsi_runtime *rt);
-  jsi_object_or_error(JSI_ABI_CDECL *create_object_with_prototype)(
+  jsi_status(JSI_ABI_CDECL *create_object)(
       jsi_runtime *rt,
-      const jsi_value *prototype);
+      jsi_object *out_object);
+  jsi_status(JSI_ABI_CDECL *create_object_with_prototype)(
+      jsi_runtime *rt,
+      const jsi_value *prototype,
+      jsi_object *out_object);
 
   /* Prototype access */
-  jsi_value_or_error(JSI_ABI_CDECL *get_prototype_of)(
+  jsi_status(JSI_ABI_CDECL *get_prototype_of)(
       jsi_runtime *rt,
-      jsi_object obj);
+      jsi_object obj,
+      jsi_value *out_value);
   jsi_status(JSI_ABI_CDECL *set_prototype_of)(
       jsi_runtime *rt,
       jsi_object obj,
       const jsi_value *prototype);
 
   /* Property operations (PropNameID-based) */
-  jsi_bool_or_error(JSI_ABI_CDECL *has_object_property_from_propnameid)(
+  jsi_status(JSI_ABI_CDECL *has_object_property_from_propnameid)(
       jsi_runtime *rt,
       jsi_object obj,
-      jsi_propnameid name);
-  jsi_value_or_error(JSI_ABI_CDECL *get_object_property_from_propnameid)(
+      jsi_propnameid name,
+      bool *out_result);
+  jsi_status(JSI_ABI_CDECL *get_object_property_from_propnameid)(
       jsi_runtime *rt,
       jsi_object obj,
-      jsi_propnameid name);
+      jsi_propnameid name,
+      jsi_value *out_value);
   jsi_status(JSI_ABI_CDECL *set_object_property_from_propnameid)(
       jsi_runtime *rt,
       jsi_object obj,
@@ -728,14 +645,16 @@ struct jsi_runtime_api {
       jsi_propnameid name);
 
   /* Property operations (Value-based — key can be string, symbol, number) */
-  jsi_bool_or_error(JSI_ABI_CDECL *has_object_property_from_value)(
+  jsi_status(JSI_ABI_CDECL *has_object_property_from_value)(
       jsi_runtime *rt,
       jsi_object obj,
-      const jsi_value *key);
-  jsi_value_or_error(JSI_ABI_CDECL *get_object_property_from_value)(
+      const jsi_value *key,
+      bool *out_result);
+  jsi_status(JSI_ABI_CDECL *get_object_property_from_value)(
       jsi_runtime *rt,
       jsi_object obj,
-      const jsi_value *key);
+      const jsi_value *key,
+      jsi_value *out_value);
   jsi_status(JSI_ABI_CDECL *set_object_property_from_value)(
       jsi_runtime *rt,
       jsi_object obj,
@@ -747,9 +666,10 @@ struct jsi_runtime_api {
       const jsi_value *key);
 
   /* Get enumerable string property names. */
-  jsi_array_or_error(JSI_ABI_CDECL *get_object_property_names)(
+  jsi_status(JSI_ABI_CDECL *get_object_property_names)(
       jsi_runtime *rt,
-      jsi_object obj);
+      jsi_object obj,
+      jsi_array *out_array);
 
   /* External memory pressure hint for GC. */
   jsi_status(JSI_ABI_CDECL *set_object_external_memory_pressure)(
@@ -758,25 +678,28 @@ struct jsi_runtime_api {
       size_t amount);
 
   /* Error object creation */
-  jsi_object_or_error(JSI_ABI_CDECL *create_error_utf8)(
+  jsi_status(JSI_ABI_CDECL *create_error_utf8)(
       jsi_runtime *rt,
-      const uint8_t *utf8_msg,
-      size_t len);
+      const char *message,
+      size_t length,
+      jsi_object *out_object);
 
   /*----------------------------------------------------------------------
    * Array operations
    *----------------------------------------------------------------------*/
 
-  jsi_array_or_error(JSI_ABI_CDECL *create_array)(
+  jsi_status(JSI_ABI_CDECL *create_array)(
       jsi_runtime *rt,
-      size_t length);
+      size_t length,
+      jsi_array *out_array);
   size_t(JSI_ABI_CDECL *get_array_length)(
       jsi_runtime *rt,
       jsi_array arr);
-  jsi_value_or_error(JSI_ABI_CDECL *get_array_element)(
+  jsi_status(JSI_ABI_CDECL *get_array_element)(
       jsi_runtime *rt,
       jsi_object arr,
-      size_t index);
+      size_t index,
+      jsi_value *out_value);
   jsi_status(JSI_ABI_CDECL *set_array_element)(
       jsi_runtime *rt,
       jsi_object arr,
@@ -787,40 +710,46 @@ struct jsi_runtime_api {
    * ArrayBuffer operations
    *----------------------------------------------------------------------*/
 
-  jsi_arraybuffer_or_error(JSI_ABI_CDECL *create_arraybuffer)(
+  jsi_status(JSI_ABI_CDECL *create_arraybuffer)(
       jsi_runtime *rt,
-      size_t byte_length);
-  jsi_arraybuffer_or_error(
-      JSI_ABI_CDECL *create_arraybuffer_from_external_data)(
+      size_t byte_length,
+      jsi_arraybuffer *out_arraybuffer);
+  jsi_status(JSI_ABI_CDECL *create_arraybuffer_from_external_data)(
       jsi_runtime *rt,
-      jsi_mutable_buffer *buf);
-  jsi_uint8_ptr_or_error(JSI_ABI_CDECL *get_arraybuffer_data)(
+      jsi_mutable_buffer *buffer,
+      jsi_arraybuffer *out_arraybuffer);
+  jsi_status(JSI_ABI_CDECL *get_arraybuffer_data)(
       jsi_runtime *rt,
-      jsi_arraybuffer ab);
-  jsi_size_or_error(JSI_ABI_CDECL *get_arraybuffer_size)(
+      jsi_arraybuffer ab,
+      uint8_t **out_data);
+  jsi_status(JSI_ABI_CDECL *get_arraybuffer_size)(
       jsi_runtime *rt,
-      jsi_arraybuffer ab);
+      jsi_arraybuffer ab,
+      size_t *out_size);
 
   /*----------------------------------------------------------------------
    * Function operations
    *----------------------------------------------------------------------*/
 
-  jsi_value_or_error(JSI_ABI_CDECL *call)(
+  jsi_status(JSI_ABI_CDECL *call)(
       jsi_runtime *rt,
       jsi_function fn,
       const jsi_value *js_this,
       const jsi_value *args,
-      size_t arg_count);
-  jsi_value_or_error(JSI_ABI_CDECL *call_as_constructor)(
+      size_t arg_count,
+      jsi_value *out_value);
+  jsi_status(JSI_ABI_CDECL *call_as_constructor)(
       jsi_runtime *rt,
       jsi_function fn,
       const jsi_value *args,
-      size_t arg_count);
-  jsi_function_or_error(JSI_ABI_CDECL *create_function_from_host_function)(
+      size_t arg_count,
+      jsi_value *out_value);
+  jsi_status(JSI_ABI_CDECL *create_function_from_host_function)(
       jsi_runtime *rt,
       jsi_propnameid name,
       uint32_t param_count,
-      jsi_host_function *hf);
+      jsi_host_function *hf,
+      jsi_function *out_function);
   jsi_host_function *(JSI_ABI_CDECL *get_host_function)(
       jsi_runtime *rt,
       jsi_function fn);
@@ -829,9 +758,10 @@ struct jsi_runtime_api {
    * Host object operations
    *----------------------------------------------------------------------*/
 
-  jsi_object_or_error(JSI_ABI_CDECL *create_object_from_host_object)(
+  jsi_status(JSI_ABI_CDECL *create_object_from_host_object)(
       jsi_runtime *rt,
-      jsi_host_object *ho);
+      jsi_host_object *ho,
+      jsi_object *out_object);
   jsi_host_object *(JSI_ABI_CDECL *get_host_object)(
       jsi_runtime *rt,
       jsi_object obj);
@@ -869,9 +799,10 @@ struct jsi_runtime_api {
    * Weak references
    *----------------------------------------------------------------------*/
 
-  jsi_weak_object_or_error(JSI_ABI_CDECL *create_weak_object)(
+  jsi_status(JSI_ABI_CDECL *create_weak_object)(
       jsi_runtime *rt,
-      jsi_object obj);
+      jsi_object obj,
+      jsi_weak_object *out_weak_object);
   jsi_value(JSI_ABI_CDECL *lock_weak_object)(
       jsi_runtime *rt,
       jsi_weak_object wo);
@@ -880,10 +811,11 @@ struct jsi_runtime_api {
    * Comparison
    *----------------------------------------------------------------------*/
 
-  jsi_bool_or_error(JSI_ABI_CDECL *instance_of)(
+  jsi_status(JSI_ABI_CDECL *instance_of)(
       jsi_runtime *rt,
       jsi_object obj,
-      jsi_function ctor);
+      jsi_function ctor,
+      bool *out_result);
   bool(JSI_ABI_CDECL *strict_equals_symbol)(
       jsi_runtime *rt,
       jsi_symbol a,
@@ -905,12 +837,14 @@ struct jsi_runtime_api {
    * BigInt
    *----------------------------------------------------------------------*/
 
-  jsi_bigint_or_error(JSI_ABI_CDECL *create_bigint_from_int64)(
+  jsi_status(JSI_ABI_CDECL *create_bigint_from_int64)(
       jsi_runtime *rt,
-      int64_t value);
-  jsi_bigint_or_error(JSI_ABI_CDECL *create_bigint_from_uint64)(
+      int64_t value,
+      jsi_bigint *out_bigint);
+  jsi_status(JSI_ABI_CDECL *create_bigint_from_uint64)(
       jsi_runtime *rt,
-      uint64_t value);
+      uint64_t value,
+      jsi_bigint *out_bigint);
   bool(JSI_ABI_CDECL *bigint_is_int64)(
       jsi_runtime *rt,
       jsi_bigint bigint);
@@ -923,15 +857,16 @@ struct jsi_runtime_api {
   int64_t(JSI_ABI_CDECL *bigint_to_int64)(
       jsi_runtime *rt,
       jsi_bigint bigint,
-      bool *lossless);
+      bool *out_lossless);
   uint64_t(JSI_ABI_CDECL *bigint_to_uint64)(
       jsi_runtime *rt,
       jsi_bigint bigint,
-      bool *lossless);
-  jsi_string_or_error(JSI_ABI_CDECL *bigint_to_string)(
+      bool *out_lossless);
+  jsi_status(JSI_ABI_CDECL *bigint_to_string)(
       jsi_runtime *rt,
       jsi_bigint bigint,
-      uint32_t radix);
+      uint32_t radix,
+      jsi_string *out_string);
 };
 
 /*==========================================================================

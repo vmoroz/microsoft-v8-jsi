@@ -560,11 +560,53 @@ TEST(DualApi, NodeApiAndJsiShareIsolate) {
   ASSERT_EQ(jsr_delete_runtime(runtime), napi_ok);
 }
 
+namespace {
+
+// A growable sink for the ABI's string getters.
+struct AbiTestBuffer : public jsi_growable_buffer {
+  std::string buf{std::string(64, '\0')};
+  AbiTestBuffer() {
+    static const jsi_growable_buffer_api bufApi{&tryGrowTo};
+    api = &bufApi;
+    data = reinterpret_cast<uint8_t *>(buf.data());
+    size = buf.size();
+    used = 0;
+  }
+  std::string str() const {
+    return std::string(reinterpret_cast<const char *>(data), used);
+  }
+  static void JSI_ABI_CDECL tryGrowTo(jsi_growable_buffer *b, size_t sz) {
+    auto *self = static_cast<AbiTestBuffer *>(b);
+    if (sz > self->buf.size()) {
+      self->buf.resize(sz);
+      b->data = reinterpret_cast<uint8_t *>(self->buf.data());
+      b->size = self->buf.size();
+    }
+  }
+};
+
+// Script source handed to the ABI, which releases it.
+struct AbiSourceBuffer : public jsi_buffer {
+  std::string text;
+  explicit AbiSourceBuffer(std::string s) : text(std::move(s)) {
+    static const jsi_buffer_api bufApi{&releaseBuffer};
+    api = &bufApi;
+    data = reinterpret_cast<const uint8_t *>(text.data());
+    size = text.size();
+  }
+  static void JSI_ABI_CDECL releaseBuffer(jsi_buffer *b) {
+    delete static_cast<AbiSourceBuffer *>(b);
+  }
+};
+
+} // namespace
+
 // query_interface negative-path test. The ABI currently supports no
 // optional interfaces, so query_interface always reports not-supported.
-// Confirms it returns jsi_status_native_error and surfaces "Interface not supported"
-// via the native-exception-message slot. Exercises the only path through which
-// a non-JS error message flows back to the consumer.
+// Confirms it returns jsi_status_native_error, zeroes both outputs, and
+// surfaces "Interface not supported" via the native-exception-message slot.
+// Exercises the only path through which a non-JS error message flows back to
+// the consumer.
 TEST(JsiAbiQueryInterface, UnknownIidReturnsError) {
   jsi_runtime *rt = v8_jsi_abi_runtime_create(JSI_ABI_VERSION, nullptr, nullptr);
   ASSERT_NE(rt, nullptr);
@@ -574,41 +616,75 @@ TEST(JsiAbiQueryInterface, UnknownIidReturnsError) {
   static constexpr jsi_interface_id kBogusIid = {
       0xDEADBEEFCAFEBABEull, 0x0123456789ABCDEFull};
 
-  const void *vtableOut = nullptr;
-  void *instanceOut = nullptr;
+  int sentinel = 0;
+  const void *apiOut = &sentinel;
+  void *instanceOut = &sentinel;
   jsi_status result =
-      rt->api->query_interface(rt, &kBogusIid, &vtableOut, &instanceOut);
+      rt->api->query_interface(rt, &kBogusIid, &apiOut, &instanceOut);
 
-  ASSERT_TRUE(::jsi::abi::is_error(result));
-  EXPECT_EQ(::jsi::abi::get_error(result), jsi_status_native_error);
+  EXPECT_EQ(result, jsi_status_native_error);
+  EXPECT_EQ(apiOut, nullptr);
+  EXPECT_EQ(instanceOut, nullptr);
 
   // Read back the native exception message — must mention "Interface not
   // supported".
-  struct LocalBuf : public jsi_growable_buffer {
-    std::string buf{std::string(64, '\0')};
-    LocalBuf() {
-      static const jsi_growable_buffer_api bufVt{&tryGrowTo};
-      api = const_cast<jsi_growable_buffer_api *>(&bufVt);
-      data = reinterpret_cast<uint8_t *>(buf.data());
-      size = buf.size();
-      used = 0;
-    }
-    static void JSI_ABI_CDECL tryGrowTo(jsi_growable_buffer *b, size_t sz) {
-      auto *self = static_cast<LocalBuf *>(b);
-      if (sz > self->buf.size()) {
-        self->buf.resize(sz);
-        b->data = reinterpret_cast<uint8_t *>(self->buf.data());
-        b->size = self->buf.size();
-      }
-    }
-  } gb;
-
+  AbiTestBuffer gb;
   rt->api->get_and_clear_native_exception_message(rt, &gb);
-  std::string msg(reinterpret_cast<const char *>(gb.data), gb.used);
+  std::string msg = gb.str();
   EXPECT_NE(msg.find("Interface not supported"), std::string::npos)
       << "expected 'Interface not supported' in message; got: " << msg;
 
   rt->api->release(rt);
+}
+
+// Status-plus-out contract: JSI_ABI_AUTO_LENGTH inputs, a NULL output is
+// invalid_arg, and a failing call reports the JS band with its output zeroed.
+TEST(JsiAbiStatus, OutputsAndAutoLength) {
+  jsi_runtime *rt = v8_jsi_abi_runtime_create(JSI_ABI_VERSION, nullptr, nullptr);
+  ASSERT_NE(rt, nullptr);
+  const jsi_runtime_api *api = rt->api;
+  void *scope = nullptr;
+  ASSERT_EQ(api->push_scope(rt, &scope), jsi_status_ok);
+
+  jsi_string str{};
+  ASSERT_EQ(
+      api->create_string_utf8(rt, "hello", JSI_ABI_AUTO_LENGTH, &str),
+      jsi_status_ok);
+  AbiTestBuffer gb;
+  api->get_string_utf8(rt, str, &gb);
+  EXPECT_EQ(gb.str(), "hello");
+  ::jsi::abi::release_pointer(str.pointer);
+
+  jsi_string str16{};
+  ASSERT_EQ(
+      api->create_string_utf16(rt, u"h\u00e9", JSI_ABI_AUTO_LENGTH, &str16),
+      jsi_status_ok);
+  AbiTestBuffer gb16;
+  api->get_string_utf8(rt, str16, &gb16);
+  EXPECT_EQ(gb16.str(), "h\xc3\xa9");
+  ::jsi::abi::release_pointer(str16.pointer);
+
+  EXPECT_EQ(
+      api->create_string_utf8(rt, "x", 1, nullptr), jsi_status_invalid_arg);
+
+  jsi_value out{};
+  out.kind = jsi_valuekind_number;
+  out.data.number = 1;
+  jsi_status st = api->evaluate_javascript_source(
+      rt,
+      new AbiSourceBuffer("throw new Error('boom')"),
+      "status.js",
+      JSI_ABI_AUTO_LENGTH,
+      &out);
+  EXPECT_EQ(st, jsi_status_js_error);
+  EXPECT_EQ(st & 0xF000, 0x4000);
+  EXPECT_EQ(out.kind, jsi_valuekind_undefined);
+  jsi_value err = api->get_and_clear_js_error_value(rt);
+  EXPECT_EQ(err.kind, jsi_valuekind_object);
+  ::jsi::abi::release_value(err);
+
+  EXPECT_EQ(api->pop_scope(rt, scope), jsi_status_ok);
+  api->release(rt);
 }
 
 int main(int argc, char **argv) {

@@ -45,17 +45,9 @@ const HEADERS: readonly Header[] = [
   { root: "deps/chromium/sandbox_dll", include: "sbox_stela.h" },
   { root: "src/public", include: "v8host_client.h" },
   { root: "src/public", include: "v8host_stela.h" },
-  {
-    root: "src",
-    include: "jsi_abi/jsi_abi.h",
-    pending: "bit-31 enumerators in C, <cstddef> in C++; the JSI ABI migration fixes it",
-  },
+  { root: "src", include: "jsi_abi/jsi_abi.h" },
   { root: "src", include: "jsi_abi/jsi_abi_stela.h" },
-  {
-    root: "src",
-    include: "jsi_abi/v8_jsi_abi.h",
-    pending: "doesn't parse as C; the JSI ABI migration (to v8_jsi_abi.h) fixes it",
-  },
+  { root: "src", include: "jsi_abi/v8_jsi_abi.h" },
   { root: "src/node-api", include: "js_runtime_api.h" },
   {
     root: "src/public",
