@@ -38,8 +38,10 @@
 
 #include "jsi_abi/jsi_abi.h"
 
-/* Exports only while v8jsi builds (V8_JSI_ABI_IMPL defined). Consumers get it
- * empty, or may predefine it as __declspec(dllimport). */
+/**
+ * Exports only while v8jsi builds (V8_JSI_ABI_IMPL defined). Consumers get it
+ * empty, or may predefine it as __declspec(dllimport).
+ */
 #ifndef V8_JSI_ABI_API
 #ifdef V8_JSI_ABI_IMPL
 #ifdef _WIN32
@@ -60,7 +62,8 @@ extern "C" {
  * Runtime creation
  *============================================================================*/
 
-/* Create a V8-backed jsi_runtime.
+/**
+ * Create a V8-backed jsi_runtime.
  *
  * abi_version: the JSI_ABI_VERSION the consumer compiled against. A version
  *   this implementation does not support fails with
@@ -77,16 +80,17 @@ extern "C" {
  *
  * Returns jsi_status_ok, jsi_status_invalid_arg (out_runtime NULL),
  * jsi_status_version_mismatch, the configure/poison status, or
- * jsi_status_native_error if V8 could not create the isolate. */
+ * jsi_status_native_error if V8 could not create the isolate.
+ */
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_runtime_create(
     uint32_t abi_version,
-    jsi_configure_runtime_cb configure,
-    void *user_data,
+    JSI_ABI_NULLABLE jsi_configure_runtime_cb configure,
+    JSI_ABI_NULLABLE void *user_data,
     jsi_runtime **out_runtime);
 typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_runtime_create_fn)(
     uint32_t abi_version,
-    jsi_configure_runtime_cb configure,
-    void *user_data,
+    JSI_ABI_NULLABLE jsi_configure_runtime_cb configure,
+    JSI_ABI_NULLABLE void *user_data,
     jsi_runtime **out_runtime);
 
 /*============================================================================
@@ -105,18 +109,22 @@ typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_runtime_create_fn)(
  * Heap / threading
  *----------------------------------------------------------------------------*/
 
+/// Initial V8 heap size in bytes. 0 means the V8 default.
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_initial_heap_size(jsi_config config, size_t bytes);
 typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_config_set_initial_heap_size_fn)(
     jsi_config config, size_t bytes);
 
+/// Maximum V8 heap size in bytes. 0 means the V8 default.
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_maximum_heap_size(jsi_config config, size_t bytes);
 typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_config_set_maximum_heap_size_fn)(
     jsi_config config, size_t bytes);
 
-/* Cap the V8 worker thread pool. 0 means default
- * (V8 picks min(num_cores - 1, 16)). */
+/**
+ * Cap the V8 worker thread pool. 0 means default
+ * (V8 picks min(num_cores - 1, 16)).
+ */
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_thread_pool_size(jsi_config config, uint8_t size);
 typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_config_set_thread_pool_size_fn)(
@@ -126,27 +134,35 @@ typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_config_set_thread_pool_size_fn)(
  * Inspector / debugger
  *----------------------------------------------------------------------------*/
 
-/* Name shown in the inspector UI to distinguish parallel runtimes. The text
+/**
+ * Name shown in the inspector UI to distinguish parallel runtimes. The text
  * is copied. length may be JSI_ABI_AUTO_LENGTH; value may be NULL only when
- * length is 0 or JSI_ABI_AUTO_LENGTH (an empty name). */
+ * length is 0 or JSI_ABI_AUTO_LENGTH (an empty name).
+ */
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
-v8_jsi_abi_config_set_debugger_runtime_name_utf8(jsi_config config,
-                                                 const char *value,
-                                                 size_t length);
+v8_jsi_abi_config_set_debugger_runtime_name_utf8(
+    jsi_config config,
+    JSI_ABI_NULLABLE const char *value,
+    size_t length);
 typedef jsi_status(
     JSI_ABI_CDECL *v8_jsi_abi_config_set_debugger_runtime_name_utf8_fn)(
-    jsi_config config, const char *value, size_t length);
+    jsi_config config,
+    JSI_ABI_NULLABLE const char *value,
+    size_t length);
 
+/// Enable the V8 inspector. Default: false.
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_inspector_enabled(jsi_config config, bool value);
 typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_config_set_inspector_enabled_fn)(
     jsi_config config, bool value);
 
+/// Inspector TCP port.
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_inspector_port(jsi_config config, uint16_t port);
 typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_config_set_inspector_port_fn)(
     jsi_config config, uint16_t port);
 
+/// Pause on the first statement until a debugger attaches. Default: false.
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_inspector_break_on_start(jsi_config config, bool value);
 typedef jsi_status(
@@ -157,16 +173,20 @@ typedef jsi_status(
  * Microtasks / promises
  *----------------------------------------------------------------------------*/
 
-/* If true, the runtime uses MicrotasksPolicy::kExplicit and the host must
- * drain microtasks itself. Default is false (V8 default policy). */
+/**
+ * If true, the runtime uses MicrotasksPolicy::kExplicit and the host must
+ * drain microtasks itself. Default is false (V8 default policy).
+ */
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_explicit_microtask_policy(jsi_config config, bool value);
 typedef jsi_status(
     JSI_ABI_CDECL *v8_jsi_abi_config_set_explicit_microtask_policy_fn)(
     jsi_config config, bool value);
 
-/* If true, the PromiseRejectCallback that tracks unhandled rejections is
- * NOT installed. Default is false (track rejections). */
+/**
+ * If true, the PromiseRejectCallback that tracks unhandled rejections is
+ * NOT installed. Default is false (track rejections).
+ */
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_ignore_unhandled_promises(jsi_config config, bool value);
 typedef jsi_status(
@@ -177,7 +197,7 @@ typedef jsi_status(
  * GC
  *----------------------------------------------------------------------------*/
 
-/* Expose the global gc() function (passes --expose_gc to V8). */
+/// Expose the global gc() function (passes --expose_gc to V8).
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_gc_api_enabled(jsi_config config, bool value);
 typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_config_set_gc_api_enabled_fn)(
@@ -187,7 +207,7 @@ typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_config_set_gc_api_enabled_fn)(
  * Concurrency
  *----------------------------------------------------------------------------*/
 
-/* Wrap isolate access in v8::Locker for multi-threaded use. */
+/// Wrap isolate access in v8::Locker for multi-threaded use.
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_multi_thread_enabled(jsi_config config, bool value);
 typedef jsi_status(
@@ -198,26 +218,31 @@ typedef jsi_status(
  * Tracing
  *----------------------------------------------------------------------------*/
 
+/// Log JIT code events.
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_jit_tracing_enabled(jsi_config config, bool value);
 typedef jsi_status(
     JSI_ABI_CDECL *v8_jsi_abi_config_set_jit_tracing_enabled_fn)(
     jsi_config config, bool value);
 
+/// Log inspector protocol messages.
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_message_tracing_enabled(jsi_config config, bool value);
 typedef jsi_status(
     JSI_ABI_CDECL *v8_jsi_abi_config_set_message_tracing_enabled_fn)(
     jsi_config config, bool value);
 
+/// Log GC events.
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_gc_tracing_enabled(jsi_config config, bool value);
 typedef jsi_status(
     JSI_ABI_CDECL *v8_jsi_abi_config_set_gc_tracing_enabled_fn)(
     jsi_config config, bool value);
 
-/* V8 ETW provider GUID 57277741-3638-4A4B-BDBA-0AC6E45DA56C
- * (passes --enable-system-instrumentation to V8). */
+/**
+ * V8 ETW provider GUID 57277741-3638-4A4B-BDBA-0AC6E45DA56C
+ * (passes --enable-system-instrumentation to V8).
+ */
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_system_instrumentation_enabled(jsi_config config,
                                                      bool value);
@@ -279,23 +304,26 @@ typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_set_v8_flags_fn)(
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_snapshot_create(
     const char *script,
     size_t script_length,
-    const char *source_url,
+    JSI_ABI_NULLABLE const char *source_url,
     bool jitless,
     uint8_t **out_data,
     size_t *out_size);
 typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_snapshot_create_fn)(
     const char *script,
     size_t script_length,
-    const char *source_url,
+    JSI_ABI_NULLABLE const char *source_url,
     bool jitless,
     uint8_t **out_data,
     size_t *out_size);
 
-/* Free a container returned by v8_jsi_abi_snapshot_create. NULL is a no-op. */
-V8_JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_snapshot_destroy(uint8_t *data);
-typedef void(JSI_ABI_CDECL *v8_jsi_abi_snapshot_destroy_fn)(uint8_t *data);
+/// Free a container returned by v8_jsi_abi_snapshot_create. NULL is a no-op.
+V8_JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_snapshot_destroy(JSI_ABI_NULLABLE uint8_t *data);
+typedef void(JSI_ABI_CDECL *v8_jsi_abi_snapshot_destroy_fn)(
+    JSI_ABI_NULLABLE uint8_t *data);
 
-/* Supply a V8 startup-snapshot container (built with
+/**
+ * Supply a V8 startup-snapshot container (built with
  * v8_jsi_abi_snapshot_create) to a runtime. The isolate is created from it
  * (Isolate::CreateParams::snapshot_blob) so the embedded script's heap is
  * pre-materialized — neither parsed nor run.
@@ -307,20 +335,23 @@ typedef void(JSI_ABI_CDECL *v8_jsi_abi_snapshot_destroy_fn)(uint8_t *data);
  * fails before the runtime is built, the config fires the deleter instead.
  * data_delete_cb may be NULL (the bytes are then caller-owned and must
  * outlive the runtime). NULL data with size 0 clears any previously set
- * snapshot; NULL data with a nonzero size is jsi_status_invalid_arg. */
+ * snapshot; NULL data with a nonzero size is jsi_status_invalid_arg.
+ */
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_config_set_startup_snapshot(
     jsi_config config,
-    const uint8_t *data,
+    JSI_ABI_NULLABLE const uint8_t *data,
     size_t size,
-    jsi_data_delete_cb data_delete_cb,
-    void *data_delete_data);
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_ASYNC JSI_ABI_CLOSURE(data_delete_data)
+        jsi_data_delete_cb data_delete_cb,
+    JSI_ABI_NULLABLE void *data_delete_data);
 typedef jsi_status(
     JSI_ABI_CDECL *v8_jsi_abi_config_set_startup_snapshot_fn)(
     jsi_config config,
-    const uint8_t *data,
+    JSI_ABI_NULLABLE const uint8_t *data,
     size_t size,
-    jsi_data_delete_cb data_delete_cb,
-    void *data_delete_data);
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_ASYNC JSI_ABI_CLOSURE(data_delete_data)
+        jsi_data_delete_cb data_delete_cb,
+    JSI_ABI_NULLABLE void *data_delete_data);
 
 /*============================================================================
  * Startup-snapshot container compatibility check
@@ -344,30 +375,29 @@ typedef jsi_status(
  * this engine, otherwise the reason it is not. This is a classification, not
  * a failure status.
  *============================================================================*/
+/// Snapshot-container compatibility. See the compatibility notes above.
 JSI_ABI_ENUM(int32_t, v8_jsi_abi_snapshot_compat){
     v8_jsi_abi_snapshot_compat_ok = 0,
-    /* smaller than the container header */
-    v8_jsi_abi_snapshot_compat_truncated = 1,
-    /* not a v8jsi snapshot container */
-    v8_jsi_abi_snapshot_compat_bad_magic = 2,
-    /* unknown container format version */
-    v8_jsi_abi_snapshot_compat_bad_format = 3,
-    /* V8 CachedDataVersionTag differs */
-    v8_jsi_abi_snapshot_compat_version_mismatch = 4,
-    /* engine build flags differ (cage, pointer compression, lite mode) */
+    v8_jsi_abi_snapshot_compat_truncated = 1, ///< smaller than the container header
+    v8_jsi_abi_snapshot_compat_bad_magic = 2, ///< not a v8jsi snapshot container
+    v8_jsi_abi_snapshot_compat_bad_format = 3, ///< unknown container format version
+    v8_jsi_abi_snapshot_compat_version_mismatch = 4, ///< V8 CachedDataVersionTag differs
+    /// engine build flags differ (cage, pointer compression, lite mode)
     v8_jsi_abi_snapshot_compat_flags_mismatch = 5,
-    /* header raw size != actual bytes */
-    v8_jsi_abi_snapshot_compat_size_mismatch = 6,
+    v8_jsi_abi_snapshot_compat_size_mismatch = 6, ///< header raw size != actual bytes
 };
 
+/// Checks whether this engine can load a snapshot container. See above.
 V8_JSI_ABI_API v8_jsi_abi_snapshot_compat JSI_ABI_CDECL
 v8_jsi_abi_snapshot_check(const uint8_t *data, size_t size);
 typedef v8_jsi_abi_snapshot_compat(
     JSI_ABI_CDECL *v8_jsi_abi_snapshot_check_fn)(const uint8_t *data,
                                                  size_t size);
 
-/* Human-readable description of a v8_jsi_abi_snapshot_compat (never NULL;
- * an unknown value gets a generic string). */
+/**
+ * Human-readable description of a v8_jsi_abi_snapshot_compat (never NULL;
+ * an unknown value gets a generic string).
+ */
 V8_JSI_ABI_API const char *JSI_ABI_CDECL
 v8_jsi_abi_snapshot_compat_to_string(v8_jsi_abi_snapshot_compat value);
 typedef const char *(
@@ -395,8 +425,9 @@ typedef const char *(
  * fires the deleter instead.
  *============================================================================*/
 
+/// Loads cached bytecode. See the script cache notes above.
 typedef void(JSI_ABI_CDECL *v8_jsi_abi_script_cache_load_cb)(
-    void *user_data,
+    JSI_ABI_NULLABLE void *user_data,
     const char *source_url,
     uint64_t source_hash,
     const char *runtime_name,
@@ -407,8 +438,9 @@ typedef void(JSI_ABI_CDECL *v8_jsi_abi_script_cache_load_cb)(
     jsi_data_delete_cb *out_data_delete_cb,
     void **out_data_delete_data);
 
+/// Stores cached bytecode. See the script cache notes above.
 typedef void(JSI_ABI_CDECL *v8_jsi_abi_script_cache_store_cb)(
-    void *user_data,
+    JSI_ABI_NULLABLE void *user_data,
     const char *source_url,
     uint64_t source_hash,
     const char *runtime_name,
@@ -416,23 +448,37 @@ typedef void(JSI_ABI_CDECL *v8_jsi_abi_script_cache_store_cb)(
     const char *cache_tag,
     const uint8_t *data,
     size_t size,
-    jsi_data_delete_cb data_delete_cb,
-    void *data_delete_data);
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_ASYNC JSI_ABI_CLOSURE(data_delete_data)
+        jsi_data_delete_cb data_delete_cb,
+    JSI_ABI_NULLABLE void *data_delete_data);
 
+/// Configures callbacks described in the script cache notes above.
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_config_set_script_cache(
     jsi_config config,
-    v8_jsi_abi_script_cache_load_cb load_cb,
-    v8_jsi_abi_script_cache_store_cb store_cb,
-    void *user_data,
-    jsi_data_delete_cb user_data_delete_cb,
-    void *user_data_delete_data);
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_NOTIFIED JSI_ABI_CLOSURE(user_data)
+        JSI_ABI_DESTROY(user_data_delete_cb)
+            v8_jsi_abi_script_cache_load_cb load_cb,
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_NOTIFIED
+        JSI_ABI_DESTROY(user_data_delete_cb)
+            v8_jsi_abi_script_cache_store_cb store_cb,
+    JSI_ABI_NULLABLE void *user_data,
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_ASYNC
+        JSI_ABI_CLOSURE(user_data_delete_data)
+            jsi_data_delete_cb user_data_delete_cb,
+    JSI_ABI_NULLABLE void *user_data_delete_data);
 typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_config_set_script_cache_fn)(
     jsi_config config,
-    v8_jsi_abi_script_cache_load_cb load_cb,
-    v8_jsi_abi_script_cache_store_cb store_cb,
-    void *user_data,
-    jsi_data_delete_cb user_data_delete_cb,
-    void *user_data_delete_data);
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_NOTIFIED JSI_ABI_CLOSURE(user_data)
+        JSI_ABI_DESTROY(user_data_delete_cb)
+            v8_jsi_abi_script_cache_load_cb load_cb,
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_NOTIFIED
+        JSI_ABI_DESTROY(user_data_delete_cb)
+            v8_jsi_abi_script_cache_store_cb store_cb,
+    JSI_ABI_NULLABLE void *user_data,
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_ASYNC
+        JSI_ABI_CLOSURE(user_data_delete_data)
+            jsi_data_delete_cb user_data_delete_cb,
+    JSI_ABI_NULLABLE void *user_data_delete_data);
 
 /*============================================================================
  * Task runner (foreground-thread dispatch)
@@ -452,27 +498,42 @@ typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_config_set_script_cache_fn)(
  * fires the deleter instead.
  *============================================================================*/
 
-typedef void(JSI_ABI_CDECL *v8_jsi_abi_task_run_cb)(void *user_data);
+/// Runs a foreground task. See the task runner notes above.
+typedef void(JSI_ABI_CDECL *v8_jsi_abi_task_run_cb)(
+    JSI_ABI_NULLABLE void *user_data);
 
+/// Posts a foreground task. See the task runner notes above.
 typedef void(JSI_ABI_CDECL *v8_jsi_abi_task_runner_post_task_cb)(
-    void *user_data,
-    void *task_data,
-    v8_jsi_abi_task_run_cb task_run_cb,
-    jsi_data_delete_cb task_data_delete_cb,
-    void *task_data_delete_data);
+    JSI_ABI_NULLABLE void *user_data,
+    JSI_ABI_NULLABLE void *task_data,
+    JSI_ABI_SCOPE_ASYNC JSI_ABI_CLOSURE(task_data)
+        v8_jsi_abi_task_run_cb task_run_cb,
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_ASYNC
+        JSI_ABI_CLOSURE(task_data_delete_data)
+            jsi_data_delete_cb task_data_delete_cb,
+    JSI_ABI_NULLABLE void *task_data_delete_data);
 
+/// Configures the foreground task runner described above.
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_config_set_task_runner(
     jsi_config config,
-    v8_jsi_abi_task_runner_post_task_cb post_task_cb,
-    void *user_data,
-    jsi_data_delete_cb user_data_delete_cb,
-    void *user_data_delete_data);
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_NOTIFIED
+        JSI_ABI_DESTROY(user_data_delete_cb)
+            v8_jsi_abi_task_runner_post_task_cb post_task_cb,
+    JSI_ABI_NULLABLE void *user_data,
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_ASYNC
+        JSI_ABI_CLOSURE(user_data_delete_data)
+            jsi_data_delete_cb user_data_delete_cb,
+    JSI_ABI_NULLABLE void *user_data_delete_data);
 typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_config_set_task_runner_fn)(
     jsi_config config,
-    v8_jsi_abi_task_runner_post_task_cb post_task_cb,
-    void *user_data,
-    jsi_data_delete_cb user_data_delete_cb,
-    void *user_data_delete_data);
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_NOTIFIED
+        JSI_ABI_DESTROY(user_data_delete_cb)
+            v8_jsi_abi_task_runner_post_task_cb post_task_cb,
+    JSI_ABI_NULLABLE void *user_data,
+    JSI_ABI_NULLABLE JSI_ABI_SCOPE_ASYNC
+        JSI_ABI_CLOSURE(user_data_delete_data)
+            jsi_data_delete_cb user_data_delete_cb,
+    JSI_ABI_NULLABLE void *user_data_delete_data);
 
 /*============================================================================
  * Inspector control

@@ -45,7 +45,7 @@ extern "C" {
  * Platform Macros
  *==========================================================================*/
 
-/* Calling convention: __cdecl on Windows (it matters on x86), empty elsewhere. */
+/// Calling convention: __cdecl on Windows (it matters on x86), empty elsewhere.
 #ifndef JSI_ABI_CDECL
 #ifdef _WIN32
 #define JSI_ABI_CDECL __cdecl
@@ -54,8 +54,10 @@ extern "C" {
 #endif
 #endif
 
-/* Exports only while the implementing library builds (JSI_ABI_IMPL defined).
- * Consumers get it empty, or may predefine it as __declspec(dllimport). */
+/**
+ * Exports only while the implementing library builds (JSI_ABI_IMPL defined).
+ * Consumers get it empty, or may predefine it as __declspec(dllimport).
+ */
 #ifndef JSI_ABI_API
 #ifdef JSI_ABI_IMPL
 #ifdef _WIN32
@@ -78,6 +80,7 @@ extern "C" {
  * the runtime to it or fails if it exceeds the implementation's max (Model B).
  *==========================================================================*/
 
+/// The current JSI ABI version.
 #define JSI_ABI_VERSION 1u
 
 /*==========================================================================
@@ -116,29 +119,35 @@ typedef struct jsi_native_state jsi_native_state;
 typedef struct jsi_native_state_api jsi_native_state_api;
 typedef struct jsi_interface_id jsi_interface_id;
 
-/* A UTF-16 code unit. */
+/// A UTF-16 code unit.
 #ifdef __cplusplus
 typedef char16_t jsi_char16;
 #else
 typedef uint16_t jsi_char16;
 #endif
 
-/* Pass as a (text, length) input's length when the text is NUL-terminated. */
+/// Pass as a (text, length) input's length when the text is NUL-terminated.
 #define JSI_ABI_AUTO_LENGTH SIZE_MAX
 
-/* Opaque, engine-agnostic configuration object. The runtime factory (e.g.
+/**
+ * Opaque, engine-agnostic configuration object. The runtime factory (e.g.
  * v8_jsi_abi_runtime_create) allocates one and hands it to a jsi_configure_runtime_cb
  * so the consumer can populate it via engine-specific setters (e.g.
  * v8_jsi_abi_config_set_*); the handle is valid ONLY for that callback's duration.
- * Layout is owned by the engine implementation. */
+ * Layout is owned by the engine implementation.
+ */
 typedef struct jsi_config_s* jsi_config;
 
-/* Standard data-deleter callback used when ownership of a buffer or other
+/**
+ * Standard data-deleter callback used when ownership of a buffer or other
  * pointer crosses the DLL boundary. The side that hands the pointer over also
  * supplies this callback so the receiver can free it with the same allocator
  * that allocated it. Called as delete_cb(user_data, data): user_data is the
- * deleter's own context, data is the pointer being released. */
-typedef void(JSI_ABI_CDECL *jsi_data_delete_cb)(void *user_data, void *data);
+ * deleter's own context, data is the pointer being released.
+ */
+typedef void(JSI_ABI_CDECL *jsi_data_delete_cb)(
+    JSI_ABI_NULLABLE void *user_data,
+    void *data);
 
 /*==========================================================================
  * Status
@@ -167,14 +176,16 @@ JSI_ABI_ENUM(int32_t, jsi_status){
  * Configure callback (factory-owned pull model)
  *==========================================================================*/
 
-/* The runtime factory allocates a jsi_config and invokes this callback so the
+/**
+ * The runtime factory allocates a jsi_config and invokes this callback so the
  * consumer can populate it via the engine's typed setters. The config handle is
  * valid ONLY for the duration of the call. Return jsi_status_ok to proceed, or
  * a failure status to abort creation (the factory then frees the config
  * and the create call returns NULL). May be NULL at the create site, meaning
- * "all defaults". */
+ * "all defaults".
+ */
 typedef jsi_status(JSI_ABI_CDECL *jsi_configure_runtime_cb)(
-    void *user_data,
+    JSI_ABI_NULLABLE void *user_data,
     jsi_config config);
 
 /*==========================================================================
@@ -189,9 +200,11 @@ typedef jsi_status(JSI_ABI_CDECL *jsi_configure_runtime_cb)(
  * to IntelliSense, and easier to read and maintain.
  *==========================================================================*/
 
+/// Operations for a managed JSI pointer.
 struct jsi_pointer_api {
   void(JSI_ABI_CDECL *invalidate)(jsi_pointer *self);
 };
+/// A reference-counted GC root.
 struct jsi_pointer {
   const jsi_pointer_api *api;
 };
@@ -228,10 +241,13 @@ struct jsi_weak_object {
  * Value Representation (inline tagged union — from Hermes ABI)
  *==========================================================================*/
 
-/* Marks the value kinds whose data is a jsi_pointer*. Test with this macro,
- * never a literal. */
+/**
+ * Marks the value kinds whose data is a jsi_pointer*. Test with this macro,
+ * never a literal.
+ */
 #define JSI_ABI_POINTER_MASK 0x40000000
 
+/// The kind of value stored in a jsi_value.
 JSI_ABI_ENUM(int32_t, jsi_valuekind){
     jsi_valuekind_undefined = 0,
     jsi_valuekind_null = 1,
@@ -244,13 +260,14 @@ JSI_ABI_ENUM(int32_t, jsi_valuekind){
     jsi_valuekind_object = 9 | JSI_ABI_POINTER_MASK,
 };
 
+/// A JS value: a kind tag plus an inline payload.
 struct jsi_value {
-  jsi_valuekind kind;
+  jsi_valuekind kind; ///< The value kind.
   union {
     bool boolean;
     double number;
     jsi_pointer *pointer;
-  } data;
+  } data; ///< The inline value payload.
 };
 #define JSI_VALUE_INIT {jsi_valuekind_undefined, {false}}
 /*==========================================================================
@@ -273,34 +290,40 @@ struct jsi_value {
  *                          contract as jsi_buffer.
  *==========================================================================*/
 
+/// Operations for a growable output buffer.
 struct jsi_growable_buffer_api {
   void(JSI_ABI_CDECL *try_grow_to)(jsi_growable_buffer *buf, size_t sz);
 };
+/// A caller-owned growable output buffer.
 struct jsi_growable_buffer {
   const jsi_growable_buffer_api *api;
-  uint8_t *data;
-  size_t size;
-  size_t used;
+  JSI_ABI_NULLABLE uint8_t *data; ///< The buffer data.
+  size_t size; ///< The capacity in bytes.
+  size_t used; ///< The bytes written so far.
 };
 #define JSI_GROWABLE_BUFFER_INIT {NULL, NULL, 0, 0}
 
+/// Operations for a retained read-only buffer.
 struct jsi_buffer_api {
   void(JSI_ABI_CDECL *release)(jsi_buffer *self);
 };
+/// A retained read-only buffer.
 struct jsi_buffer {
   const jsi_buffer_api *api;
-  const uint8_t *data;
-  size_t size;
+  const uint8_t *data; ///< The buffer data.
+  size_t size; ///< The buffer size in bytes.
 };
 #define JSI_BUFFER_INIT {NULL, NULL, 0}
 
+/// Operations for a retained writable buffer.
 struct jsi_mutable_buffer_api {
   void(JSI_ABI_CDECL *release)(jsi_mutable_buffer *self);
 };
+/// A retained writable buffer.
 struct jsi_mutable_buffer {
   const jsi_mutable_buffer_api *api;
-  uint8_t *data;
-  size_t size;
+  uint8_t *data; ///< The buffer data.
+  size_t size; ///< The buffer size in bytes.
 };
 #define JSI_MUTABLE_BUFFER_INIT {NULL, NULL, 0}
 
@@ -317,9 +340,11 @@ struct jsi_mutable_buffer {
  * api->release(p) when done.
  *==========================================================================*/
 
+/// Operations for a prepared JavaScript handle.
 struct jsi_prepared_javascript_api {
   void(JSI_ABI_CDECL *release)(jsi_prepared_javascript *self);
 };
+/// An engine-managed prepared JavaScript handle.
 struct jsi_prepared_javascript {
   const jsi_prepared_javascript_api *api;
   /* Implementation may append fields after this header. */
@@ -329,34 +354,36 @@ struct jsi_prepared_javascript {
  * Callback Types (embedded-struct pattern — from Hermes ABI)
  *==========================================================================*/
 
-/* Host function: called when JS invokes a native function. */
+/// Host function: called when JS invokes a native function.
 struct jsi_host_function_api {
   void(JSI_ABI_CDECL *release)(jsi_host_function *);
   jsi_status(JSI_ABI_CDECL *call)(
       jsi_host_function *self,
       jsi_runtime *rt,
       const jsi_value *this_arg,
-      const jsi_value *args,
+      JSI_ABI_NULLABLE const jsi_value *args,
       size_t arg_count,
       jsi_value *out_value);
 };
+/// A native function callable from JavaScript.
 struct jsi_host_function {
   const jsi_host_function_api *api;
 };
 #define JSI_HOST_FUNCTION_INIT {NULL}
 
-/* PropNameID list: returned by host object get_own_keys. */
+/// PropNameID list: returned by host object get_own_keys.
 struct jsi_propnameid_list_api {
   void(JSI_ABI_CDECL *release)(jsi_propnameid_list *);
 };
+/// A list of property-name identifiers.
 struct jsi_propnameid_list {
   const jsi_propnameid_list_api *api;
-  const jsi_propnameid *props;
-  size_t size;
+  JSI_ABI_NULLABLE const jsi_propnameid *props; ///< The property-name identifiers.
+  size_t size; ///< The number of property-name identifiers.
 };
 #define JSI_PROPNAMEID_LIST_INIT {NULL, NULL, 0}
 
-/* Host object: JS object backed by native callbacks. */
+/// Host object: JS object backed by native callbacks.
 struct jsi_host_object_api {
   void(JSI_ABI_CDECL *release)(jsi_host_object *);
   jsi_status(JSI_ABI_CDECL *get)(
@@ -374,15 +401,17 @@ struct jsi_host_object_api {
       jsi_runtime *rt,
       jsi_propnameid_list **out_list);
 };
+/// A JavaScript object backed by native callbacks.
 struct jsi_host_object {
   const jsi_host_object_api *api;
 };
 #define JSI_HOST_OBJECT_INIT {NULL}
 
-/* Native state: attached to JS objects, released on GC. */
+/// Native state: attached to JS objects, released on GC.
 struct jsi_native_state_api {
   void(JSI_ABI_CDECL *release)(jsi_native_state *self);
 };
+/// Native state attached to a JavaScript object.
 struct jsi_native_state {
   const jsi_native_state_api *api;
 };
@@ -392,15 +421,17 @@ struct jsi_native_state {
  * Interface Query (for optional extensions — like JSI C++ ICast)
  *==========================================================================*/
 
+/// An identifier for an optional interface.
 struct jsi_interface_id {
-  uint64_t lower;
-  uint64_t upper;
+  uint64_t lower; ///< The lower 64 bits.
+  uint64_t upper; ///< The upper 64 bits.
 };
 
 /*==========================================================================
  * Runtime function table
  *==========================================================================*/
 
+/// The runtime function table.
 struct jsi_runtime_api {
   /* Pure function table — no version/reserved data fields. Version negotiation
    * happens once at create time (see JSI_ABI_VERSION / v8_jsi_abi_runtime_create). New
@@ -412,17 +443,21 @@ struct jsi_runtime_api {
    * discover capabilities before calling anything else.
    *----------------------------------------------------------------------*/
 
-  /* Query for an optional interface extension.
-   * Returns jsi_status_native_error with empty message if not supported. */
+  /**
+   * Query for an optional interface extension.
+   * Returns jsi_status_native_error with empty message if not supported.
+   */
   jsi_status(JSI_ABI_CDECL *query_interface)(
       jsi_runtime *rt,
       const jsi_interface_id *iid,
       const void **out_api,
       void **out_instance);
 
-  /* Report the implementation's max supported ABI version (Node-API
+  /**
+   * Report the implementation's max supported ABI version (Node-API
    * napi_get_version analog). Optional feature-probe — the create-time version
-   * negotiation in v8_jsi_abi_runtime_create is what actually gates. */
+   * negotiation in v8_jsi_abi_runtime_create is what actually gates.
+   */
   uint32_t(JSI_ABI_CDECL *get_abi_version)(jsi_runtime *rt);
 
   /*----------------------------------------------------------------------
@@ -440,11 +475,11 @@ struct jsi_runtime_api {
    * Error retrieval (from Hermes ABI pattern)
    *----------------------------------------------------------------------*/
 
-  /* Get and clear the JS exception value (after jsi_status_js_error). */
+  /// Get and clear the JS exception value (after jsi_status_js_error).
   jsi_value(JSI_ABI_CDECL *get_and_clear_js_error_value)(
       jsi_runtime *rt);
 
-  /* Get and clear native exception message (after jsi_status_native_error). */
+  /// Get and clear native exception message (after jsi_status_native_error).
   void(JSI_ABI_CDECL *get_and_clear_native_exception_message)(
       jsi_runtime *rt,
       jsi_growable_buffer *buffer);
@@ -455,7 +490,7 @@ struct jsi_runtime_api {
       const jsi_value *error_value);
   void(JSI_ABI_CDECL *set_native_exception_message_utf8)(
       jsi_runtime *rt,
-      const char *value,
+      JSI_ABI_NULLABLE const char *value,
       size_t length);
 
   /*----------------------------------------------------------------------
@@ -491,9 +526,11 @@ struct jsi_runtime_api {
    * Handle scopes
    *----------------------------------------------------------------------*/
 
-  /* Push a new handle scope. All pointer types created after this call
+  /**
+   * Push a new handle scope. All pointer types created after this call
    * are valid until pop_scope. Engines that don't need scopes (Hermes)
-   * can implement these as no-ops. */
+   * can implement these as no-ops.
+   */
   jsi_status(JSI_ABI_CDECL *push_scope)(
       jsi_runtime *rt,
       void **out_scope);
@@ -507,20 +544,22 @@ struct jsi_runtime_api {
 
   jsi_status(JSI_ABI_CDECL *evaluate_javascript_source)(
       jsi_runtime *rt,
-      jsi_buffer *buffer,
-      const char *source_url,
+      JSI_ABI_TRANSFER_FULL jsi_buffer *buffer,
+      JSI_ABI_NULLABLE const char *source_url,
       size_t source_url_length,
       jsi_value *out_value);
 
-  /* Prepare (compile) a script for later execution. The returned
+  /**
+   * Prepare (compile) a script for later execution. The returned
    * jsi_prepared_javascript* is owned by the caller and freed via
-   * api->release. */
+   * api->release.
+   */
   jsi_status(JSI_ABI_CDECL *prepare_javascript)(
       jsi_runtime *rt,
-      jsi_buffer *buffer,
-      const char *source_url,
+      JSI_ABI_TRANSFER_FULL jsi_buffer *buffer,
+      JSI_ABI_NULLABLE const char *source_url,
       size_t source_url_length,
-      jsi_prepared_javascript **out_prepared);
+      JSI_ABI_TRANSFER_FULL jsi_prepared_javascript **out_prepared);
   jsi_status(JSI_ABI_CDECL *evaluate_prepared_javascript)(
       jsi_runtime *rt,
       jsi_prepared_javascript *prepared,
@@ -550,12 +589,12 @@ struct jsi_runtime_api {
 
   jsi_status(JSI_ABI_CDECL *create_string_utf8)(
       jsi_runtime *rt,
-      const char *value,
+      JSI_ABI_NULLABLE const char *value,
       size_t length,
       jsi_string *out_string);
   jsi_status(JSI_ABI_CDECL *create_string_utf16)(
       jsi_runtime *rt,
-      const jsi_char16 *value,
+      JSI_ABI_NULLABLE const jsi_char16 *value,
       size_t length,
       jsi_string *out_string);
   void(JSI_ABI_CDECL *get_string_utf8)(
@@ -582,7 +621,7 @@ struct jsi_runtime_api {
 
   jsi_status(JSI_ABI_CDECL *create_propnameid_utf8)(
       jsi_runtime *rt,
-      const char *value,
+      JSI_ABI_NULLABLE const char *value,
       size_t length,
       jsi_propnameid *out_propnameid);
   jsi_status(JSI_ABI_CDECL *create_propnameid_from_string)(
@@ -611,7 +650,7 @@ struct jsi_runtime_api {
       jsi_object *out_object);
   jsi_status(JSI_ABI_CDECL *create_object_with_prototype)(
       jsi_runtime *rt,
-      const jsi_value *prototype,
+      JSI_ABI_NULLABLE const jsi_value *prototype,
       jsi_object *out_object);
 
   /* Prototype access */
@@ -666,13 +705,13 @@ struct jsi_runtime_api {
       jsi_object obj,
       const jsi_value *key);
 
-  /* Get enumerable string property names. */
+  /// Get enumerable string property names.
   jsi_status(JSI_ABI_CDECL *get_object_property_names)(
       jsi_runtime *rt,
       jsi_object obj,
       jsi_array *out_array);
 
-  /* External memory pressure hint for GC. */
+  /// External memory pressure hint for GC.
   jsi_status(JSI_ABI_CDECL *set_object_external_memory_pressure)(
       jsi_runtime *rt,
       jsi_object obj,
@@ -681,7 +720,7 @@ struct jsi_runtime_api {
   /* Error object creation */
   jsi_status(JSI_ABI_CDECL *create_error_utf8)(
       jsi_runtime *rt,
-      const char *message,
+      JSI_ABI_NULLABLE const char *message,
       size_t length,
       jsi_object *out_object);
 
@@ -717,7 +756,7 @@ struct jsi_runtime_api {
       jsi_arraybuffer *out_arraybuffer);
   jsi_status(JSI_ABI_CDECL *create_arraybuffer_from_external_data)(
       jsi_runtime *rt,
-      jsi_mutable_buffer *buffer,
+      JSI_ABI_TRANSFER_FULL jsi_mutable_buffer *buffer,
       jsi_arraybuffer *out_arraybuffer);
   jsi_status(JSI_ABI_CDECL *get_arraybuffer_data)(
       jsi_runtime *rt,
@@ -735,22 +774,23 @@ struct jsi_runtime_api {
   jsi_status(JSI_ABI_CDECL *call)(
       jsi_runtime *rt,
       jsi_function fn,
-      const jsi_value *js_this,
-      const jsi_value *args,
+      JSI_ABI_NULLABLE const jsi_value *js_this,
+      JSI_ABI_NULLABLE const jsi_value *args,
       size_t arg_count,
       jsi_value *out_value);
   jsi_status(JSI_ABI_CDECL *call_as_constructor)(
       jsi_runtime *rt,
       jsi_function fn,
-      const jsi_value *args,
+      JSI_ABI_NULLABLE const jsi_value *args,
       size_t arg_count,
       jsi_value *out_value);
   jsi_status(JSI_ABI_CDECL *create_function_from_host_function)(
       jsi_runtime *rt,
       jsi_propnameid name,
       uint32_t param_count,
-      jsi_host_function *hf,
+      JSI_ABI_TRANSFER_FULL jsi_host_function *hf,
       jsi_function *out_function);
+  /// Returns NULL when fn is not a host function.
   jsi_host_function *(JSI_ABI_CDECL *get_host_function)(
       jsi_runtime *rt,
       jsi_function fn);
@@ -761,8 +801,9 @@ struct jsi_runtime_api {
 
   jsi_status(JSI_ABI_CDECL *create_object_from_host_object)(
       jsi_runtime *rt,
-      jsi_host_object *ho,
+      JSI_ABI_TRANSFER_FULL jsi_host_object *ho,
       jsi_object *out_object);
+  /// Returns NULL when obj is not a host object.
   jsi_host_object *(JSI_ABI_CDECL *get_host_object)(
       jsi_runtime *rt,
       jsi_object obj);
@@ -774,13 +815,14 @@ struct jsi_runtime_api {
   bool(JSI_ABI_CDECL *has_native_state)(
       jsi_runtime *rt,
       jsi_object obj);
+  /// Returns NULL when obj has no native state.
   jsi_native_state *(JSI_ABI_CDECL *get_native_state)(
       jsi_runtime *rt,
       jsi_object obj);
   jsi_status(JSI_ABI_CDECL *set_native_state)(
       jsi_runtime *rt,
       jsi_object obj,
-      jsi_native_state *ns);
+      JSI_ABI_NULLABLE JSI_ABI_TRANSFER_FULL jsi_native_state *ns);
 
   /*----------------------------------------------------------------------
    * Type checks
@@ -874,6 +916,7 @@ struct jsi_runtime_api {
  * Runtime Instance
  *==========================================================================*/
 
+/// A JSI runtime instance.
 struct jsi_runtime {
   const jsi_runtime_api *api;
 };
