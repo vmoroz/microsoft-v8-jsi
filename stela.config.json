@@ -1,0 +1,34 @@
+{
+  "schema": "stela.config/1",
+  "libraries": [
+    {
+      "name": "sbox",
+      "prefix": "sbox",
+      "macroPrefix": "SBOX",
+      "headers": ["deps/chromium/sandbox_dll/sbox.h"],
+      "stelaHeader": "deps/chromium/sandbox_dll/sbox_stela.h"
+    },
+    {
+      "name": "v8host",
+      "prefix": "v8host",
+      "macroPrefix": "V8HOST",
+      "headers": ["src/public/v8host_client.h"],
+      "stelaHeader": "src/public/v8host_stela.h"
+    },
+    {
+      "name": "jsi_abi",
+      "prefix": "jsi",
+      "macroPrefix": "JSI_ABI",
+      "headers": ["src/jsi_abi/jsi_abi.h"],
+      "stelaHeader": "src/jsi_abi/jsi_abi_stela.h"
+    },
+    {
+      "name": "v8_jsi_abi",
+      "prefix": "v8_jsi_abi",
+      "macroPrefix": "V8_JSI_ABI",
+      "headers": ["src/jsi_abi/v8_jsi_config.h"],
+      "status": "jsi_status",
+      "stelaHeader": false
+    }
+  ]
+}
