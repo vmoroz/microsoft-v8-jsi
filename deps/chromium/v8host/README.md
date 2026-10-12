@@ -12,16 +12,13 @@ the `sbox_plugin_api` vtable of those functions. The DLL also exports the
 2): `v8host_initialize`, the session and run functions, and the
 `v8host_config_*` / `v8host_run_config_*` setters (29 exports in all). It links the JSI C++ API (`jsi_cpp`) but **never
 the sandbox core** — it reaches the message channel only through the
-`sbox_worker_api` function pointers the container hands it. This replaces the
-retired two-image topology where a `v8host.exe` target owned `main()` and loaded
-`sbox.dll`.
+`sbox_worker_api` function pointers the container hands it.
 
 ## Status: real V8/JSI engine
 
 The current `v8host.dll` is built from
-[`v8host_engine.cc`](./v8host_engine.cc) — the **real V8/JSI engine** carved from
-the retired `v8host.exe` main, split at the `LowerToken` boundary and exposed as
-the plugin vtable:
+[`v8host_engine.cc`](./v8host_engine.cc) — the **real V8/JSI engine**, split at
+the `LowerToken` boundary and exposed as the plugin vtable:
 
 - **`configure` (broker):** describes the sandbox the worker will run in — arms
   ACG and sets integrity for the Untrusted (jitless) tier, leaves ACG off for
