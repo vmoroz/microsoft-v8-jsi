@@ -550,7 +550,7 @@ void ForwardWorkerFrame(void* context, int kind, const void* data, size_t size) 
     const auto* bytes = static_cast<const uint8_t*>(data);
     const uint32_t phase = bytes[0] | (uint32_t(bytes[1]) << 8) |
         (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
-    if (phase != SBOX_LIFECYCLE_STARTUP && phase != SBOX_LIFECYCLE_SECURITY)
+    if (phase != sbox_lifecycle_phase_startup && phase != sbox_lifecycle_phase_security)
       return;
   }
   if (session->on_message)
@@ -591,7 +591,7 @@ DWORD WINAPI BrokerReaderThread(void* param) {
       }
       // Preserve queued output before the broker-origin exit fact.
       DrainWorkerFrames(s);
-      const uint8_t phase[] = {SBOX_LIFECYCLE_EXIT, 0, 0, 0};
+      const uint8_t phase[] = {sbox_lifecycle_phase_exit, 0, 0, 0};
       if (s->on_message)
         s->on_message(s->on_message_ctx, SBOX_MSG_LIFECYCLE, phase, sizeof(phase));
       wait_count = 2;
@@ -971,7 +971,7 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
 // Public entry: callable from ANY thread, including concurrently. Marshals the
 // real spawn onto the single launcher thread (Chromium requires every spawn on
 // one thread), blocks until it finishes, and returns the session (or nullptr).
-SBOX_API SboxSession* sbox_broker_spawn(const wchar_t* target_exe,
+SBOX_CORE_API SboxSession* sbox_broker_spawn(const wchar_t* target_exe,
                                         const SboxPolicy* policy,
                                         SboxMessageCb on_message, void* ctx) {
   if (!ValidatePolicy(target_exe, policy))
@@ -1011,7 +1011,7 @@ SBOX_API SboxSession* sbox_broker_spawn(const wchar_t* target_exe,
   return req.result;
 }
 
-SBOX_API int sbox_broker_post_message(SboxSession* session, int kind,
+SBOX_CORE_API int sbox_broker_post_message(SboxSession* session, int kind,
                                       const void* data, size_t len) {
   if (!session || !session->msg_map)
     return -1;
@@ -1023,14 +1023,14 @@ SBOX_API int sbox_broker_post_message(SboxSession* session, int kind,
   return 0;
 }
 
-SBOX_API int sbox_broker_close(SboxSession* session) {
+SBOX_CORE_API int sbox_broker_close(SboxSession* session) {
   if (!session || !session->evt_close)
     return -1;
   ::SetEvent(session->evt_close);  // manual-reset: stays signaled
   return 0;
 }
 
-SBOX_API int sbox_broker_wait(SboxSession* session) {
+SBOX_CORE_API int sbox_broker_wait(SboxSession* session) {
   if (!session)
     return -1;
 
@@ -1093,7 +1093,7 @@ SBOX_API int sbox_broker_wait(SboxSession* session) {
   return static_cast<int>(ec);
 }
 
-SBOX_API int sbox_broker_run(const wchar_t* target_exe,
+SBOX_CORE_API int sbox_broker_run(const wchar_t* target_exe,
                              const SboxPolicy* policy) {
   SboxSession* s = sbox_broker_spawn(target_exe, policy, nullptr, nullptr);
   if (!s)
@@ -1209,7 +1209,7 @@ SBOX_TRUST_TRANSITION_API int sbox_trust_transition_test_get_exit_observation(
 }
 #endif
 
-SBOX_API SboxTarget* sbox_target_begin(void) {
+SBOX_CORE_API SboxTarget* sbox_target_begin(void) {
   EnsureBase();
   setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -1264,7 +1264,7 @@ SBOX_API SboxTarget* sbox_target_begin(void) {
   return target;
 }
 
-SBOX_API int sbox_target_test_ipc(SboxTarget* target) {
+SBOX_CORE_API int sbox_target_test_ipc(SboxTarget* target) {
   if (!target || !target->services)
     return 0;
   return static_cast<sandbox::TargetServicesBase*>(target->services)
@@ -1273,7 +1273,7 @@ SBOX_API int sbox_target_test_ipc(SboxTarget* target) {
              : 0;
 }
 
-SBOX_API int sbox_target_lower_token(SboxTarget* target) {
+SBOX_CORE_API int sbox_target_lower_token(SboxTarget* target) {
   if (!target || !target->services)
     return -1;
   // Install the ntdll interceptions while still privileged: ACG (applied by
@@ -1333,13 +1333,13 @@ SBOX_API int sbox_target_lower_token(SboxTarget* target) {
   return 0;
 }
 
-SBOX_API void sbox_target_end(SboxTarget* target) {
+SBOX_CORE_API void sbox_target_end(SboxTarget* target) {
   if (target && target->msg_map)
     ::UnmapViewOfFile(target->msg_map);
   delete target;  // does not terminate the process
 }
 
-SBOX_API int sbox_target_plugin_data(SboxTarget* target, const void** data,
+SBOX_CORE_API int sbox_target_plugin_data(SboxTarget* target, const void** data,
                                      size_t* len) {
   if (!target || !data || !len)
     return 0;
@@ -1349,7 +1349,7 @@ SBOX_API int sbox_target_plugin_data(SboxTarget* target, const void** data,
   return 1;
 }
 
-SBOX_API int sbox_target_acg_enabled(SboxTarget* target) {
+SBOX_CORE_API int sbox_target_acg_enabled(SboxTarget* target) {
   if (!target)
     return 0;
   return (sandbox::g_shared_delayed_mitigations &
@@ -1358,7 +1358,7 @@ SBOX_API int sbox_target_acg_enabled(SboxTarget* target) {
              : 0;
 }
 
-SBOX_API int sbox_target_post_message(SboxTarget* target, int kind,
+SBOX_CORE_API int sbox_target_post_message(SboxTarget* target, int kind,
                                       const void* data, size_t len) {
   if (!target || !target->msg_map)
     return -1;
@@ -1370,22 +1370,22 @@ SBOX_API int sbox_target_post_message(SboxTarget* target, int kind,
   return 0;
 }
 
-SBOX_API int sbox_target_post_lifecycle(SboxTarget* target, uint32_t phase) {
-  if (phase != SBOX_LIFECYCLE_STARTUP && phase != SBOX_LIFECYCLE_SECURITY)
+SBOX_CORE_API int sbox_target_post_lifecycle(SboxTarget* target, uint32_t phase) {
+  if (phase != sbox_lifecycle_phase_startup && phase != sbox_lifecycle_phase_security)
     return -1;
   const uint8_t bytes[] = {static_cast<uint8_t>(phase), 0, 0, 0};
   return sbox_target_post_message(target, SBOX_MSG_LIFECYCLE, bytes, sizeof(bytes));
 }
 
-SBOX_API void* sbox_target_inbound_event(SboxTarget* target) {
+SBOX_CORE_API void* sbox_target_inbound_event(SboxTarget* target) {
   return target ? target->evt_b2t : nullptr;
 }
 
-SBOX_API void* sbox_target_close_event(SboxTarget* target) {
+SBOX_CORE_API void* sbox_target_close_event(SboxTarget* target) {
   return target ? target->evt_close : nullptr;
 }
 
-SBOX_API int sbox_target_drain_messages(SboxTarget* target, SboxMessageCb cb,
+SBOX_CORE_API int sbox_target_drain_messages(SboxTarget* target, SboxMessageCb cb,
                                         void* ctx) {
   if (!target || !target->msg_map || !cb)
     return 0;
@@ -1404,7 +1404,7 @@ bool SboxTestReader(bool final_drain, bool suppress_exit, const std::wstring& ex
       auto& o = *static_cast<Observation*>(context);
       const auto* bytes = static_cast<const uint8_t*>(data);
       o.frames.emplace_back(kind, std::vector<uint8_t>(bytes, bytes + size));
-      if (kind == SBOX_MSG_LIFECYCLE && size == 4 && bytes[0] == SBOX_LIFECYCLE_EXIT)
+      if (kind == SBOX_MSG_LIFECYCLE && size == 4 && bytes[0] == sbox_lifecycle_phase_exit)
         ::SetEvent(o.exit_seen);
       if (kind == SBOX_MSG_BINARY && size == 1 && bytes[0] == 9)
         ::SetEvent(o.result_seen);

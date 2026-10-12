@@ -155,10 +155,10 @@ bool ConfigFidelity(size_t count, std::string *detail) {
   OpenLocal(conn);
   router::Router service(BrokerMode::kDedicated);
   auto config = LogicalConfig();
-  config.integrity = sbox_integrity_untrusted;
-  config.delayed_integrity = sbox_integrity_low;
-  config.initial_token = sbox_token_restricted_same_access;
-  config.lockdown_token = sbox_token_limited;
+  config.integrity = sbox_integrity_level_untrusted;
+  config.delayed_integrity = sbox_integrity_level_low;
+  config.initial_token = sbox_token_level_restricted_same_access;
+  config.lockdown_token = sbox_token_level_limited;
   config.use_app_container = true;
   config.low_privilege_app_container = true;
   config.app_container_profile = "owned-profile";
@@ -450,22 +450,22 @@ struct EngineFixture {
     api.struct_size = sizeof(api);
     api.get_plugin_data = [](sbox_worker worker, const void **data, size_t *size) -> sbox_status {
       auto &f = *reinterpret_cast<EngineFixture *>(worker);
-      *data = f.profile.data(); *size = f.profile.size(); return sbox_ok;
+      *data = f.profile.data(); *size = f.profile.size(); return sbox_status_ok;
     };
     api.acg_enabled = [](sbox_worker) { return 1; };
     api.post_message = [](sbox_worker worker, sbox_msg_kind kind, const void *data, size_t size) -> sbox_status {
       auto &f = *reinterpret_cast<EngineFixture *>(worker);
       v8host::RunEnvelope env;
-      if (kind != sbox_msg_binary || !v8host::DecodeRunEnvelope(static_cast<const uint8_t *>(data), size, &env)) {
+      if (kind != sbox_msg_kind_binary || !v8host::DecodeRunEnvelope(static_cast<const uint8_t *>(data), size, &env)) {
         f.invalid = true;
-        return sbox_error;
+        return sbox_status_failed;
       }
       f.output.push_back(std::move(env));
-      return sbox_ok;
+      return sbox_status_ok;
     };
   }
   ~EngineFixture() { V8HostEngineShutdown(reinterpret_cast<sbox_worker>(this)); }
-  bool Warm() { return V8HostEngineWarmup(reinterpret_cast<sbox_worker>(this), &api) == sbox_ok; }
+  bool Warm() { return V8HostEngineWarmup(reinterpret_cast<sbox_worker>(this), &api) == sbox_status_ok; }
   bool Batch(const std::vector<v8host::RunEnvelope> &batch, bool closing, size_t *bytes, size_t *frames) {
     size_t remaining = 99;
     return V8HostEngineTestBatch(batch, closing, bytes, frames, &remaining) && remaining == 0 && !invalid;
@@ -481,7 +481,7 @@ v8host::RunEnvelope GuestRelay(size_t size, uint32_t id = 1) {
   v8host::RunEnvelope env;
   env.type = v8host::RunEnvelopeType::kRelay;
   env.run_id = id;
-  env.relay_kind = sbox_msg_binary;
+  env.relay_kind = sbox_msg_kind_binary;
   env.payload.assign(size, 7);
   return env;
 }
@@ -611,40 +611,40 @@ struct RouterFixture {
     if (wait_release)
       ::CloseHandle(wait_release);
   }
-  static sbox_status SBOX_CALL Spawn(sbox_broker broker, const void *data, size_t size,
+  static sbox_status SBOX_CDECL Spawn(sbox_broker broker, const void *data, size_t size,
       sbox_message_cb callback, void *context, sbox_broker_worker *handle) {
     auto &f = *reinterpret_cast<RouterFixture *>(broker);
     ++f.spawns;
     v8host::V8HostSpawnConfigV1 config;
     if (!v8host::V8HostSpawnConfigV1::Decode(static_cast<const uint8_t *>(data), size, &config) ||
         (f.fail_spawn && !f.early))
-      return sbox_error;
+      return sbox_status_failed;
     f.worker = static_cast<router::Worker *>(context);
     if (f.early) {
       const uint8_t startup[] = {1, 0, 0, 0}, security[] = {2, 0, 0, 0};
-      callback(context, sbox_msg_lifecycle, startup, 4);
-      callback(context, sbox_msg_lifecycle, security, 4);
+      callback(context, sbox_msg_kind_lifecycle, startup, 4);
+      callback(context, sbox_msg_kind_lifecycle, security, 4);
       f.before_publication = !f.worker->handle && f.posts.empty() && bool(f.worker->engine_image);
     }
     if (f.fail_spawn)
-      return sbox_error;
+      return sbox_status_failed;
     if (f.stop_during_spawn)
       f.conn.Stop();
     f.handles.push_back(std::make_unique<Handle>(&f, f.worker));
     *handle = reinterpret_cast<sbox_broker_worker>(f.handles.back().get());
-    return sbox_ok;
+    return sbox_status_ok;
   }
-  static sbox_status SBOX_CALL Post(sbox_broker_worker handle, sbox_msg_kind kind, const void *data, size_t size) {
+  static sbox_status SBOX_CDECL Post(sbox_broker_worker handle, sbox_msg_kind kind, const void *data, size_t size) {
     auto &f = *reinterpret_cast<Handle *>(handle)->fixture;
     if (reinterpret_cast<Handle *>(handle)->closed)
       ++f.post_after_close;
     v8host::RunEnvelope env;
-    if (f.fail_post || kind != sbox_msg_binary || !v8host::DecodeRunEnvelope(static_cast<const uint8_t *>(data), size, &env))
-      return sbox_error;
+    if (f.fail_post || kind != sbox_msg_kind_binary || !v8host::DecodeRunEnvelope(static_cast<const uint8_t *>(data), size, &env))
+      return sbox_status_failed;
     f.posts.push_back(std::move(env));
-    return sbox_ok;
+    return sbox_status_ok;
   }
-  static sbox_status SBOX_CALL Close(sbox_broker_worker handle) {
+  static sbox_status SBOX_CDECL Close(sbox_broker_worker handle) {
     auto &f = *reinterpret_cast<Handle *>(handle)->fixture;
     ++f.closes;
     reinterpret_cast<Handle *>(handle)->closed = true;
@@ -652,9 +652,9 @@ struct RouterFixture {
     auto *worker = reinterpret_cast<Handle *>(handle)->worker;
     if (!worker || f.conn.sessions.contains(worker->session->session_id) || !worker->session->runs.empty())
       ++f.close_before_removal;
-    return sbox_ok;
+    return sbox_status_ok;
   }
-  static sbox_status SBOX_CALL Wait(sbox_broker_worker handle, int32_t *code) {
+  static sbox_status SBOX_CDECL Wait(sbox_broker_worker handle, int32_t *code) {
     auto &f = *reinterpret_cast<Handle *>(handle)->fixture;
     ++f.waits;
     if (f.wait_entered)
@@ -662,7 +662,7 @@ struct RouterFixture {
     if (f.wait_release)
       ::WaitForSingleObject(f.wait_release, INFINITE);
     *code = 0;
-    return sbox_ok;
+    return sbox_status_ok;
   }
   bool Create() {
     return LocalRoute(*service, conn, protocol::BuildCreateSessionFrame(ControlHeader(1), LogicalConfig()));
@@ -677,11 +677,11 @@ struct RouterFixture {
     auto h = ControlHeader(0, 1, id);
     h.type = protocol::MessageType::RELAY_TO_WORKER;
     std::vector<uint8_t> body(size, byte);
-    return LocalRoute(*service, conn, protocol::BuildRelayFrame(h, sbox_msg_binary, body.data(), body.size()));
+    return LocalRoute(*service, conn, protocol::BuildRelayFrame(h, sbox_msg_kind_binary, body.data(), body.size()));
   }
   void Phase(uint8_t phase, size_t size = 4) {
     const uint8_t bytes[] = {phase, 0, 0, 0, 0};
-    router::Worker::OnMessage(worker, sbox_msg_lifecycle, bytes, size);
+    router::Worker::OnMessage(worker, sbox_msg_kind_lifecycle, bytes, size);
     service->Pump(conn);
   }
   void Terminal(uint32_t id, v8host::RunEnvelopeType type = v8host::RunEnvelopeType::kResult) {
@@ -690,7 +690,7 @@ struct RouterFixture {
     env.run_id = id;
     env.status_code = static_cast<uint32_t>(protocol::StatusCode::ERROR_INTERNAL);
     auto bytes = v8host::EncodeRunEnvelope(env);
-    router::Worker::OnMessage(worker, sbox_msg_binary, bytes.data(), bytes.size());
+    router::Worker::OnMessage(worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
     service->Pump(conn);
   }
 };
@@ -847,11 +847,11 @@ bool MailboxPumpBound(std::string *detail) {
   DrainLocal(f.conn);
   auto *worker = f.worker;
   auto bytes = v8host::EncodeRunEnvelope(GuestRelay(1));
-  router::Worker::OnMessage(worker, sbox_msg_binary, bytes.data(), bytes.size());
+  router::Worker::OnMessage(worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
   size_t copied = 0;
   worker->mailbox_readout = [&] {
     ++copied;
-    router::Worker::OnMessage(worker, sbox_msg_binary, bytes.data(), bytes.size());
+    router::Worker::OnMessage(worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
   };
   f.service->Pump(f.conn);
   worker->mailbox_readout = {};
@@ -947,12 +947,12 @@ bool LifecycleAbi5(std::string* detail) {
       return false;
     auto entry = reinterpret_cast<sbox_plugin_main_fn>(::GetProcAddress(module, SBOX_PLUGIN_ENTRY));
     const bool old = std::wstring(dll) == L"v8host_abi4_plugin.dll";
-    const sbox_plugin* plugin = nullptr;
-    ok = entry && entry(old ? 4u : 5u, &plugin) == sbox_ok && plugin &&
+    const sbox_plugin_api* plugin = nullptr;
+    ok = entry && entry(old ? 4u : 5u, &plugin) == sbox_status_ok && plugin &&
         plugin->abi_version == (old ? 4u : 5u) && plugin->configure && plugin->broker_run &&
         plugin->warmup && plugin->run && plugin->shutdown && ok;
     plugin = nullptr;
-    ok = entry && entry(old ? 5u : 4u, &plugin) == sbox_error_version && !plugin && ok;
+    ok = entry && entry(old ? 5u : 4u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
     ::FreeLibrary(module);
   }
   DWORD code = 0;
@@ -984,9 +984,9 @@ bool ExitFinalDrain(std::string* detail) {
   env.type = v8host::RunEnvelopeType::kResult;
   env.run_id = 1;
   const auto bytes = v8host::EncodeRunEnvelope(env);
-  router::Worker::OnMessage(f.worker, sbox_msg_binary, bytes.data(), bytes.size());
-  const uint8_t exit[] = {SBOX_LIFECYCLE_EXIT,0,0,0};
-  router::Worker::OnMessage(f.worker, sbox_msg_lifecycle, exit, 4);
+  router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
+  const uint8_t exit[] = {sbox_lifecycle_phase_exit,0,0,0};
+  router::Worker::OnMessage(f.worker, sbox_msg_kind_lifecycle, exit, 4);
   f.service->Pump(f.conn);
   protocol::FrameHeader h;
   const bool ordered = PopFrame(f.conn, &h) && h.type == protocol::MessageType::RESULT && h.run_id == 1 &&
@@ -1005,14 +1005,14 @@ bool ExitFactOrigin(std::string *detail) {
   f.wait_release = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
   if (!f.Create() || !f.Start(1))
     return false;
-  f.Phase(SBOX_LIFECYCLE_STARTUP);
-  f.Phase(SBOX_LIFECYCLE_EXIT);
+  f.Phase(sbox_lifecycle_phase_startup);
+  f.Phase(sbox_lifecycle_phase_exit);
   if (!f.conn.sessions.empty() || ::WaitForSingleObject(f.wait_entered, 5000) != WAIT_OBJECT_0 ||
       f.closes != 1 || f.close_before_removal || f.waits != 1) {
     *detail = "exit ids/cleanup handoff";
     return false;
   }
-  f.Phase(SBOX_LIFECYCLE_EXIT);
+  f.Phase(sbox_lifecycle_phase_exit);
   protocol::FrameHeader h;
   unsigned exits = 0, terminals = 0;
   while (PopFrame(f.conn, &h)) {
@@ -1034,13 +1034,13 @@ bool ExitCleanupOrderings(std::string* detail) {
     DrainLocal(f.conn);
     auto* worker = f.worker;
     if (order == 0)
-      f.Phase(SBOX_LIFECYCLE_EXIT);
+      f.Phase(sbox_lifecycle_phase_exit);
     if (!LocalRoute(*f.service, f.conn, protocol::BuildCloseSessionFrame(ControlHeader(9))))
       return false;
     if (::WaitForSingleObject(f.wait_entered, 5000) != WAIT_OBJECT_0)
       return false;
     if (order == 1)
-      f.Phase(SBOX_LIFECYCLE_EXIT);
+      f.Phase(sbox_lifecycle_phase_exit);
     protocol::FrameHeader h;
     // The session or explicit-close terminal precedes the ACK.
     bool terminal = PopFrame(f.conn, &h) && h.type == (order == 0
@@ -1157,11 +1157,11 @@ bool ReadinessProvenance(std::string *detail) {
   v8host::RunEnvelope spoof;
   spoof.type = v8host::RunEnvelopeType::kRelay;
   spoof.run_id = 1;
-  spoof.relay_kind = sbox_msg_string;
+  spoof.relay_kind = sbox_msg_kind_string;
   const std::string marker = "STARTUP_READY SECURITY_READY";
   spoof.payload.assign(marker.begin(), marker.end());
   auto bytes = v8host::EncodeRunEnvelope(spoof);
-  router::Worker::OnMessage(f.worker, sbox_msg_binary, bytes.data(), bytes.size());
+  router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
   f.service->Pump(f.conn);
   protocol::FrameHeader h;
   if (!PopFrame(f.conn, &h) || h.type != protocol::MessageType::RELAY_FROM_WORKER || !f.conn.out_queue.empty()) {
@@ -1187,7 +1187,7 @@ bool LifecycleWrongWorker(std::string *detail) {
     auto stale = std::make_unique<router::Worker>();
     stale->session = owner->session;
     const uint8_t phase[] = {1, 0, 0, 0};
-    router::Worker::OnMessage(stale.get(), sbox_msg_lifecycle, phase, sizeof(phase));
+    router::Worker::OnMessage(stale.get(), sbox_msg_kind_lifecycle, phase, sizeof(phase));
     f.service->Pump(f.conn);
     if (::WaitForSingleObject(f.wait_entered, 3000) != WAIT_OBJECT_0 ||
         !f.conn.sessions.empty() || !owner->mailbox_failed || stale->mailbox_tail.load() - stale->mailbox_head.load() ||
@@ -1236,7 +1236,7 @@ bool WorkerOutputZeroId(std::string *detail) {
       auto env = GuestRelay(1, 0);
       env.type = type;
       auto bytes = v8host::EncodeRunEnvelope(env);
-      router::Worker::OnMessage(f.worker, sbox_msg_binary, bytes.data(), bytes.size());
+      router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
       f.service->Pump(f.conn);
       const bool rejected = f.conn.sessions.empty();
       f.service->Close(f.conn);
@@ -1391,13 +1391,13 @@ bool TerminalContenderOrderings(std::string *detail) {
         passed = passed && LocalRoute(*f.service, f.conn, protocol::BuildCloseSessionFrame(ControlHeader(20)));
       } else if (action <= 2) {
         if (action == 2) {
-          const uint8_t phase[] = {SBOX_LIFECYCLE_EXIT, 0, 0, 0};
-          router::Worker::OnMessage(worker, sbox_msg_lifecycle, phase, 4);
+          const uint8_t phase[] = {sbox_lifecycle_phase_exit, 0, 0, 0};
+          router::Worker::OnMessage(worker, sbox_msg_kind_lifecycle, phase, 4);
         } else {
           v8host::RunEnvelope env; env.run_id = 1;
           env.type = action == 0 ? v8host::RunEnvelopeType::kResult : v8host::RunEnvelopeType::kRunError;
           auto bytes = v8host::EncodeRunEnvelope(env);
-          router::Worker::OnMessage(worker, sbox_msg_binary, bytes.data(), bytes.size());
+          router::Worker::OnMessage(worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
         }
         if (!disconnected) f.service->Pump(f.conn);
       }
@@ -1456,8 +1456,8 @@ bool CompleteZeroDrain(std::string *detail) {
       worker->retry_deadline == std::chrono::steady_clock::time_point{};
   const unsigned calls = clocks;
   ticks = 100000;
-  const uint8_t exit[] = {SBOX_LIFECYCLE_EXIT, 0, 0, 0};
-  router::Worker::OnMessage(worker, sbox_msg_lifecycle, exit, 4);
+  const uint8_t exit[] = {sbox_lifecycle_phase_exit, 0, 0, 0};
+  router::Worker::OnMessage(worker, sbox_msg_kind_lifecycle, exit, 4);
   passed = passed && clocks == calls && posts == 1;
   ::SetEvent(f.wait_release); closer.join(); ::CloseHandle(joined);
   // A registered writer prevents zero even after worker cleanup joins.
@@ -1555,7 +1555,7 @@ bool PauseResume(std::string *detail) {
   std::thread reader([&] { read = f.conn.ReadFrame(&byte, 1, &size, INFINITE); });
   bool passed = ::WaitForSingleObject(pipe.paused, 5000) == WAIT_OBJECT_0 && f.conn.active_io == 0;
   auto encoded = v8host::EncodeRunEnvelope(GuestRelay(1));
-  if (passed) router::Worker::OnMessage(f.worker, sbox_msg_binary, encoded.data(), encoded.size());
+  if (passed) router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, encoded.data(), encoded.size());
   ::SetEvent(release);
   // Real writer progress: controls followed by active-run output, while the
   // strand services mailbox wakes independently of admitting a new pipe read.
@@ -1611,7 +1611,7 @@ bool RunPressureContainment(std::string *detail) {
   }
   auto h = ControlHeader(0, 1, 1); h.type = protocol::MessageType::RELAY_TO_WORKER;
   const uint8_t input = 9;
-  if (!ReadThroughPressure(f, protocol::BuildRelayFrame(h, sbox_msg_binary, &input, 1)) ||
+  if (!ReadThroughPressure(f, protocol::BuildRelayFrame(h, sbox_msg_kind_binary, &input, 1)) ||
       f.posts.size() != 2 || f.posts.back().payload != std::vector<uint8_t>{9} || f.conn.ReadsPaused()) {
     *detail = "queued run held active-run input behind a connection pause"; return false;
   }
@@ -1697,7 +1697,7 @@ bool BookkeepingCallbackOverlap(std::string *detail) {
     });
     bool passed = ::WaitForSingleObject(entered, 5000) == WAIT_OBJECT_0;
     auto encoded = v8host::EncodeRunEnvelope(GuestRelay(1));
-    if (passed) router::Worker::OnMessage(f.worker, sbox_msg_binary, encoded.data(), encoded.size());
+    if (passed) router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, encoded.data(), encoded.size());
     passed = passed && !f.worker->mailbox_failed && f.conn.out_relay_bytes == 37;
     ::SetEvent(release); strand.join(); f.worker->ledger_publication = nullptr;
     ::CloseHandle(entered); ::CloseHandle(release); f.service->Pump(f.conn);
@@ -1720,7 +1720,7 @@ bool LedgerHazardChurn(std::string *detail) {
   auto weak = std::weak_ptr(f.conn.sessions.at(1)->runs.at(1)->outbound);
   f.worker->ledger_acquired = [&] { ::SetEvent(entered); ::WaitForSingleObject(release, INFINITE); };
   auto encoded = v8host::EncodeRunEnvelope(GuestRelay(1));
-  std::thread callback([&] { router::Worker::OnMessage(f.worker, sbox_msg_binary, encoded.data(), encoded.size()); });
+  std::thread callback([&] { router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, encoded.data(), encoded.size()); });
   bool passed = ::WaitForSingleObject(entered, 5000) == WAIT_OBJECT_0;
   if (passed) {
     f.conn.sessions.at(1)->runs.at(1)->TryTerminal(router::RunState::kFailed);
@@ -1746,20 +1746,20 @@ bool OutputLossSticky(std::string *detail) {
     auto ledger = f.conn.sessions.at(1)->runs.at(1)->outbound;
     auto held = f.conn.ChargeOutput(protocol::kMaxQueuedRelayBytesPerRun - 36, ledger);
     auto first = v8host::EncodeRunEnvelope(GuestRelay(0));
-    router::Worker::OnMessage(f.worker, sbox_msg_binary, first.data(), first.size());
+    router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, first.data(), first.size());
     bool injected = false, rejected = false;
     f.worker->mailbox_readout = [&] {
       if (injected) return;
       injected = true;
       auto overflow = v8host::EncodeRunEnvelope(GuestRelay(1));
       const size_t tail = f.worker->mailbox_tail;
-      router::Worker::OnMessage(f.worker, sbox_msg_binary, overflow.data(), overflow.size());
+      router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, overflow.data(), overflow.size());
       held.Reset();
-      router::Worker::OnMessage(f.worker, sbox_msg_binary, first.data(), first.size());
+      router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, first.data(), first.size());
       rejected = ledger->failed && f.worker->mailbox_tail == tail;
       v8host::RunEnvelope result; result.type = terminal; result.run_id = 1;
       auto bytes = v8host::EncodeRunEnvelope(result);
-      router::Worker::OnMessage(f.worker, sbox_msg_binary, bytes.data(), bytes.size());
+      router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
     };
     f.service->Pump(f.conn); f.worker->mailbox_readout = nullptr;
     size_t errors = 0; std::vector<uint8_t> output;
@@ -1790,7 +1790,7 @@ bool DiscardIntakeOrdering(std::string *detail) {
   f.worker->intake_entered = [&] { ::SetEvent(entered); ::WaitForSingleObject(release, INFINITE); };
   auto *worker = f.worker;
   auto encoded = v8host::EncodeRunEnvelope(GuestRelay(1));
-  std::thread callback([&] { router::Worker::OnMessage(worker, sbox_msg_binary, encoded.data(), encoded.size()); });
+  std::thread callback([&] { router::Worker::OnMessage(worker, sbox_msg_kind_binary, encoded.data(), encoded.size()); });
   bool passed = ::WaitForSingleObject(entered, 5000) == WAIT_OBJECT_0;
   const size_t tail = worker->mailbox_tail;
   worker->DiscardMailbox();
@@ -1812,7 +1812,7 @@ bool TerminalBeforeFallback(std::string *detail) {
   v8host::RunEnvelope result; result.type = v8host::RunEnvelopeType::kResult; result.run_id = 1;
   result.disposition = v8host::RunEnvelopeDisposition::kCancelled;
   auto bytes = v8host::EncodeRunEnvelope(result);
-  router::Worker::OnMessage(f.worker, sbox_msg_binary, bytes.data(), bytes.size());
+  router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
   ticks = 6000; f.service->Pump(f.conn);
   protocol::FrameHeader h;
   if (f.closes || f.conn.sessions.empty() || f.worker->cancel_deadline != std::chrono::steady_clock::time_point{} ||
@@ -1827,10 +1827,10 @@ bool FinalReplyMailbox(std::string *detail) {
   if (!f.Create() || !f.Start(1) || !pipe.Open()) return false;
   DrainLocal(f.conn);
   auto encoded = v8host::EncodeRunEnvelope(GuestRelay(1));
-  router::Worker::OnMessage(f.worker, sbox_msg_binary, encoded.data(), encoded.size());
+  router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, encoded.data(), encoded.size());
   // Keep both relay and control credits in unpumped worker mailboxes.
   const uint8_t startup[] = {1, 0, 0, 0};
-  router::Worker::OnMessage(f.worker, sbox_msg_lifecycle, startup, sizeof(startup));
+  router::Worker::OnMessage(f.worker, sbox_msg_kind_lifecycle, startup, sizeof(startup));
   auto h = ControlHeader(19, 0, 3); h.type = static_cast<protocol::MessageType>(0xffff);
   h.flags = protocol::kFlagMustUnderstand;
   std::vector<uint8_t> unknown; protocol::EncodeHeader(h, unknown);
@@ -1862,7 +1862,7 @@ bool WorkerMailboxOverflow(std::string *detail) {
     while (bytes) {
       const size_t part = (std::min)(bytes, size_t(protocol::kMaxFramePayload));
       auto encoded = v8host::EncodeRunEnvelope(GuestRelay(part - 16, ++n % 2 ? 1 : 2));
-      router::Worker::OnMessage(f.worker, sbox_msg_binary, encoded.data(), encoded.size());
+      router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, encoded.data(), encoded.size());
       bytes -= part;
     }
     if (f.worker->mailbox_failed != (delta > 0) ||
@@ -1881,14 +1881,14 @@ bool WorkerMailboxOverflow(std::string *detail) {
     auto *worker = f.worker;
     auto encoded = v8host::EncodeRunEnvelope(GuestRelay(1));
     if (!malformed) for (size_t i = 0; i < worker->mailbox.size(); ++i)
-      router::Worker::OnMessage(worker, sbox_msg_binary, encoded.data(), encoded.size());
-    router::Worker::OnMessage(worker, sbox_msg_binary, malformed ? nullptr : encoded.data(), encoded.size());
+      router::Worker::OnMessage(worker, sbox_msg_kind_binary, encoded.data(), encoded.size());
+    router::Worker::OnMessage(worker, sbox_msg_kind_binary, malformed ? nullptr : encoded.data(), encoded.size());
     const bool retained_failure = worker->mailbox_failed;
     f.service->Pump(f.conn);
     if (!retained_failure || !f.conn.sessions.empty() || ::WaitForSingleObject(f.wait_entered, 5000) != WAIT_OBJECT_0)
       return false;
     const size_t tail = worker->mailbox_tail;
-    router::Worker::OnMessage(worker, sbox_msg_binary, encoded.data(), encoded.size());
+    router::Worker::OnMessage(worker, sbox_msg_kind_binary, encoded.data(), encoded.size());
     if (worker->mailbox_tail != tail || f.conn.out_relay_bytes || !PopWorkerExit(f.conn)) return false;
     ::SetEvent(f.wait_release); f.service->Close(f.conn);
     if (!f.conn.CompleteZero() || f.waits != 1 || f.closes != 1 || f.post_after_close || f.close_before_removal) return false;
@@ -1899,7 +1899,7 @@ bool WorkerMailboxOverflow(std::string *detail) {
   f.worker->byte_head = SIZE_MAX - 10; f.worker->byte_tail = SIZE_MAX - 10;
   for (uint8_t i = 0; i < 64; ++i) {
     auto encoded = v8host::EncodeRunEnvelope(GuestRelay(1)); encoded.back() = i;
-    router::Worker::OnMessage(f.worker, sbox_msg_binary, encoded.data(), encoded.size());
+    router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, encoded.data(), encoded.size());
   }
   f.service->Pump(f.conn);
   for (uint8_t i = 0; i < 64; ++i) {
@@ -1938,7 +1938,7 @@ bool FillInbound(RouterFixture &f, uint32_t session, size_t bytes) {
     if (part < 16) return false;
     auto h = ControlHeader(0, session, 1); h.type = protocol::MessageType::RELAY_TO_WORKER;
     std::vector<uint8_t> payload(part - 16, 7);
-    if (!LocalRoute(*f.service, f.conn, protocol::BuildRelayFrame(h, sbox_msg_binary, payload.data(), payload.size())))
+    if (!LocalRoute(*f.service, f.conn, protocol::BuildRelayFrame(h, sbox_msg_kind_binary, payload.data(), payload.size())))
       return false;
     bytes -= part;
   }
@@ -1949,7 +1949,7 @@ bool FillOutbound(RouterFixture &f, router::Worker *worker, size_t bytes) {
     const size_t part = (std::min)(bytes, size_t(protocol::kMaxFramePayload + 20));
     if (part < 36) return false;
     auto encoded = v8host::EncodeRunEnvelope(GuestRelay(part - 36));
-    router::Worker::OnMessage(worker, sbox_msg_binary, encoded.data(), encoded.size());
+    router::Worker::OnMessage(worker, sbox_msg_kind_binary, encoded.data(), encoded.size());
     f.service->Pump(f.conn);
     bytes -= part;
   }
@@ -2172,7 +2172,7 @@ bool CreditAllPaths(std::string *detail) {
     const uint32_t id = path == 1 ? 2 : 1;
     auto other = f.conn.sessions.at(1)->runs.at(id)->outbound;
     auto encoded = v8host::EncodeRunEnvelope(GuestRelay(10, id));
-    router::Worker::OnMessage(f.worker, sbox_msg_binary, encoded.data(), encoded.size());
+    router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, encoded.data(), encoded.size());
     if (other->bytes != 46 || f.conn.out_relay_bytes != 46) return false;
     if (path <= 2) {
       if (path == 2) f.Terminal(1); else f.service->Pump(f.conn);
@@ -2354,7 +2354,7 @@ bool MailboxReadout(std::string *detail) {
     auto env = GuestRelay(1);
     env.payload[0] = byte;
     auto bytes = v8host::EncodeRunEnvelope(env);
-    router::Worker::OnMessage(f.worker, sbox_msg_binary, bytes.data(), bytes.size());
+    router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
   };
   emit(7);
   bool barrier_ok = false, first = true;
@@ -2388,7 +2388,7 @@ bool MailboxReadout(std::string *detail) {
     if (protocol::DecodeAndValidateFrame(bytes.data(), bytes.size(), &h, &payload, &size) != protocol::DecodeStatus::kOk ||
         h.type != protocol::MessageType::RELAY_FROM_WORKER || h.run_id != 1 ||
         !protocol::DecodeRelayPayload(payload, size, &kind, &body, &body_size) ||
-        kind != sbox_msg_binary || body_size != 1 || body[0] != expected) {
+        kind != sbox_msg_kind_binary || body_size != 1 || body[0] != expected) {
       *detail = "callback read-out FIFO lost or duplicated";
       return false;
     }
@@ -2412,7 +2412,7 @@ bool MailboxFailureSticky(std::string *detail) {
       auto env = GuestRelay(1);
       env.payload[0] = byte;
       auto bytes = v8host::EncodeRunEnvelope(env);
-      router::Worker::OnMessage(worker, sbox_msg_binary, bytes.data(), bytes.size());
+      router::Worker::OnMessage(worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
     };
     auto later = [&] {
       emit(17);
@@ -2420,7 +2420,7 @@ bool MailboxFailureSticky(std::string *detail) {
       env.type = v8host::RunEnvelopeType::kResult;
       env.run_id = 1;
       auto bytes = v8host::EncodeRunEnvelope(env);
-      router::Worker::OnMessage(worker, sbox_msg_binary, bytes.data(), bytes.size());
+      router::Worker::OnMessage(worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
     };
     for (size_t i = 0; i < (oversize ? 1 : worker->mailbox.size()); ++i) emit(static_cast<uint8_t>(i));
     const size_t published = worker->mailbox_tail.load();
@@ -2429,7 +2429,7 @@ bool MailboxFailureSticky(std::string *detail) {
       if (++readouts == 1) {
         if (oversize) {
           const uint8_t byte = 0;
-          router::Worker::OnMessage(worker, sbox_msg_binary, &byte, protocol::kMaxFramePayload + 1);
+          router::Worker::OnMessage(worker, sbox_msg_kind_binary, &byte, protocol::kMaxFramePayload + 1);
           later();
         } else {
           emit(16);  // The copied slot has not been released: this must drop.
@@ -2474,12 +2474,12 @@ bool MailboxBoundary(std::string *detail) {
     DrainLocal(f.conn);
     const uint8_t phase[] = {1,0,0,0};
     if (mode == 3)
-      router::Worker::OnMessage(f.worker, sbox_msg_binary, phase, protocol::kMaxFramePayload + 1);
+      router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, phase, protocol::kMaxFramePayload + 1);
     else if (mode == 4)
-      router::Worker::OnMessage(f.worker, sbox_msg_binary, nullptr, 1);
+      router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, nullptr, 1);
     else
       for (size_t i = 0; i < (mode == 0 ? f.worker->mailbox.size() : f.worker->mailbox.size() + 1); ++i)
-        router::Worker::OnMessage(f.worker, sbox_msg_lifecycle, phase, 4);
+        router::Worker::OnMessage(f.worker, sbox_msg_kind_lifecycle, phase, 4);
     f.service->Pump(f.conn);
     if (mode == 0) {
       if (f.conn.sessions.empty() || !f.worker->startup || f.worker->mailbox_head != f.worker->mailbox_tail ||
@@ -2505,7 +2505,7 @@ bool RelayMailboxFairness(std::string *detail) {
   for (uint8_t i = 0; i < 64; ++i) {
     auto bytes = v8host::EncodeRunEnvelope(GuestRelay(1));
     bytes.back() = i;
-    router::Worker::OnMessage(f.worker, sbox_msg_binary, bytes.data(), bytes.size());
+    router::Worker::OnMessage(f.worker, sbox_msg_kind_binary, bytes.data(), bytes.size());
     if (!f.Relay(1, 1, i)) return false;
     std::vector<uint8_t> frame;
     if (!f.conn.TakeOutput(&frame)) {
@@ -2520,7 +2520,7 @@ bool RelayMailboxFairness(std::string *detail) {
     if (protocol::DecodeAndValidateFrame(frame.data(), frame.size(), &h, &payload, &size) != protocol::DecodeStatus::kOk ||
         h.type != protocol::MessageType::RELAY_FROM_WORKER || h.run_id != 1 ||
         !protocol::DecodeRelayPayload(payload, size, &kind, &body, &body_size) ||
-        kind != sbox_msg_binary || body_size != 1 || body[0] != i || f.conn.sessions.size() != 1 ||
+        kind != sbox_msg_kind_binary || body_size != 1 || body[0] != i || f.conn.sessions.size() != 1 ||
         f.closes || f.worker->mailbox_failed || !f.conn.out_queue.empty()) return false;
   }
   return f.posts.size() == 65 && f.worker->mailbox_head == f.worker->mailbox_tail;
@@ -2555,7 +2555,7 @@ bool InlineReadMailbox(std::string *detail) {
     // Completed write guarantees the read has buffered data; no pending-read wake is needed.
     if (!PipeIo(pipes.client, true, &sent)) return false;
     const uint8_t startup[] = {1, 0, 0, 0};
-    router::Worker::OnMessage(f.worker, sbox_msg_lifecycle, startup, sizeof(startup));
+    router::Worker::OnMessage(f.worker, sbox_msg_kind_lifecycle, startup, sizeof(startup));
     DWORD size = 0;
     if (!f.conn.ReadFrame(received.data(), 1, &size, 3000) || size != 1 || received != sent ||
         f.conn.inline_reads != static_cast<uint32_t>(i + 1) || f.conn.sessions.empty() || f.closes ||
@@ -2789,8 +2789,8 @@ bool OpenCaptured(CapturedBroker &broker, WireHarness &h, std::string *detail) {
     return false;
   auto config = LogicalConfig();
   config.broker_mode = 1;
-  config.initial_token = sbox_token_restricted_same_access;
-  config.delayed_integrity = sbox_integrity_untrusted;
+  config.initial_token = sbox_token_level_restricted_same_access;
+  config.delayed_integrity = sbox_integrity_level_untrusted;
   return h.Send(protocol::BuildCreateSessionFrame(h.Header(1), config)) &&
       h.Expect(protocol::MessageType::ACK, 1, 1) && h.Expect(protocol::MessageType::SESSION_READY, 0, 1);
 }
@@ -2803,7 +2803,7 @@ protocol::StartRunPayload Script(const std::string &guest) {
 bool SendString(WireHarness &h, uint32_t id, const std::string &message) {
   auto header = h.Header(0, 1, id);
   header.type = protocol::MessageType::RELAY_TO_WORKER;
-  return h.Send(protocol::BuildRelayFrame(header, sbox_msg_string,
+  return h.Send(protocol::BuildRelayFrame(header, sbox_msg_kind_string,
       reinterpret_cast<const uint8_t *>(message.data()), message.size()));
 }
 bool ExpectString(WireHarness &h, uint32_t id, const std::string &message) {
@@ -2814,7 +2814,7 @@ bool ExpectString(WireHarness &h, uint32_t id, const std::string &message) {
   size_t size;
   return h.Receive(&bytes, &header) && header.type == protocol::MessageType::RELAY_FROM_WORKER && header.run_id == id &&
       protocol::DecodeRelayPayload(bytes.data() + protocol::kFrameHeaderSize,
-          bytes.size() - protocol::kFrameHeaderSize, &kind, &body, &size) && kind == sbox_msg_string &&
+          bytes.size() - protocol::kFrameHeaderSize, &kind, &body, &size) && kind == sbox_msg_kind_string &&
       std::string(reinterpret_cast<const char *>(body), size) == message;
 }
 bool ExpectResult(WireHarness &h, uint32_t id, protocol::ResultDisposition disposition) {
@@ -2979,8 +2979,8 @@ bool StartSpawn(std::string *detail) {
   };
   if (!h.Send(protocol::BuildCreateSessionFrame(h.Header(1), [] {
         auto config = LogicalConfig(); config.broker_mode = 1;
-        config.initial_token = sbox_token_restricted_same_access;
-        config.delayed_integrity = sbox_integrity_untrusted; return config;
+        config.initial_token = sbox_token_level_restricted_same_access;
+        config.delayed_integrity = sbox_integrity_level_untrusted; return config;
       }())) || !expect(protocol::MessageType::ACK, 1, 1, 0, "CREATE ACK") ||
       !expect(protocol::MessageType::SESSION_READY, 0, 1, 0, "SESSION_READY")) {
     *detail = "CREATE readiness";
@@ -2995,8 +2995,8 @@ bool StartSpawn(std::string *detail) {
   relay.type = protocol::MessageType::RELAY_TO_WORKER;
   const uint8_t binary[] = {1, 2, 3};
   if (!h.Send(protocol::BuildStartRunFrame(h.Header(2, 1, 1), start)) ||
-      !h.Send(protocol::BuildRelayFrame(relay, sbox_msg_string, reinterpret_cast<const uint8_t *>("one"), 3)) ||
-      !h.Send(protocol::BuildRelayFrame(relay, sbox_msg_binary, binary, sizeof(binary))) ||
+      !h.Send(protocol::BuildRelayFrame(relay, sbox_msg_kind_string, reinterpret_cast<const uint8_t *>("one"), 3)) ||
+      !h.Send(protocol::BuildRelayFrame(relay, sbox_msg_kind_binary, binary, sizeof(binary))) ||
       !expect(protocol::MessageType::ACK, 2, 1, 1, "START ACK") ||
       !expect(protocol::MessageType::STARTUP_READY, 0, 1, 0, "STARTUP") ||
       !expect(protocol::MessageType::SECURITY_READY, 0, 1, 0, "SECURITY")) {
@@ -3012,8 +3012,8 @@ bool StartSpawn(std::string *detail) {
     if (!h.Receive(&bytes, &header) || header.type != protocol::MessageType::RELAY_FROM_WORKER ||
         header.run_id != 1 || !protocol::DecodeRelayPayload(bytes.data() + protocol::kFrameHeaderSize,
             bytes.size() - protocol::kFrameHeaderSize, &kind, &body, &size) ||
-        (i == 0 ? kind != sbox_msg_string || std::string(reinterpret_cast<const char *>(body), size) != "echo:one"
-                : kind != sbox_msg_binary || std::vector<uint8_t>(body, body + size) != std::vector<uint8_t>{66, 2, 3})) {
+        (i == 0 ? kind != sbox_msg_kind_string || std::string(reinterpret_cast<const char *>(body), size) != "echo:one"
+                : kind != sbox_msg_kind_binary || std::vector<uint8_t>(body, body + size) != std::vector<uint8_t>{66, 2, 3})) {
       *detail = "JS relay echo " + std::to_string(i);
       return false;
     }
@@ -3160,7 +3160,7 @@ bool PersistentControl(std::string *detail) {
     return false;
   auto relay = h.Header(0, 99, 99);
   relay.type = protocol::MessageType::RELAY_TO_WORKER;
-  if (!h.Send(protocol::BuildRelayFrame(relay, sbox_msg_binary, nullptr, 0)) ||
+  if (!h.Send(protocol::BuildRelayFrame(relay, sbox_msg_kind_binary, nullptr, 0)) ||
       !h.Send(protocol::BuildCloseSessionFrame(h.Header(5, 2))) || !h.Expect(protocol::MessageType::ACK, 5, 2))
     return false;
   return h.Finish();
@@ -3232,7 +3232,7 @@ bool HeaderDirectionReject(std::string *detail) {
       header.run_id = 1;
       header.request_id = 0;
       header.type = protocol::MessageType::RELAY_TO_WORKER;
-      bytes = protocol::BuildRelayFrame(header, sbox_msg_lifecycle, nullptr, 0);
+      bytes = protocol::BuildRelayFrame(header, sbox_msg_kind_lifecycle, nullptr, 0);
       if (test == 17) {
         header.payload_length = 0;
         bytes.clear();
@@ -3282,7 +3282,7 @@ bool ControlCache(std::string *detail) {
       !mismatch.Expect(protocol::MessageType::ACK, 1, 1) ||
       !mismatch.Expect(protocol::MessageType::SESSION_READY, 0, 1))
     return false;
-  config.initial_token = sbox_token_limited;
+  config.initial_token = sbox_token_level_limited;
   if (!mismatch.Send(protocol::BuildCreateSessionFrame(mismatch.Header(1), config)) || !mismatch.Closed())
     return false;
   router::Connection conn;
@@ -4429,13 +4429,13 @@ bool HostRejectsBadPluginAbi(std::string* detail) {
 
 struct ContractCClient {
   HMODULE module = nullptr;
-  decltype(&v8host_client_initialize) initialize = nullptr;
-  decltype(&v8host_client_create_session) create = nullptr;
-  decltype(&v8host_client_set_callbacks) callbacks = nullptr;
-  decltype(&v8host_client_start_run) start = nullptr;
-  decltype(&v8host_client_post_message) post = nullptr;
-  decltype(&v8host_client_cancel_run) cancel = nullptr;
-  decltype(&v8host_client_close_session) close = nullptr;
+  decltype(&v8host_initialize) initialize = nullptr;
+  decltype(&v8host_session_open) create = nullptr;
+  decltype(&v8host_session_set_callbacks) callbacks = nullptr;
+  decltype(&v8host_session_start_run) start = nullptr;
+  decltype(&v8host_run_post_message) post = nullptr;
+  decltype(&v8host_run_cancel) cancel = nullptr;
+  decltype(&v8host_session_close) close = nullptr;
   bool Load() {
     if (module) return true;
     const std::wstring path = ExecutableDirectory() + L"/v8host.dll";
@@ -4443,15 +4443,15 @@ struct ContractCClient {
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (!module) return false;
 #define CLIENT_ENTRY(member, symbol) member = reinterpret_cast<decltype(member)>(::GetProcAddress(module, #symbol)); if (!member) return false
-    CLIENT_ENTRY(initialize, v8host_client_initialize);
-    CLIENT_ENTRY(create, v8host_client_create_session);
-    CLIENT_ENTRY(callbacks, v8host_client_set_callbacks);
-    CLIENT_ENTRY(start, v8host_client_start_run);
-    CLIENT_ENTRY(post, v8host_client_post_message);
-    CLIENT_ENTRY(cancel, v8host_client_cancel_run);
-    CLIENT_ENTRY(close, v8host_client_close_session);
+    CLIENT_ENTRY(initialize, v8host_initialize);
+    CLIENT_ENTRY(create, v8host_session_open);
+    CLIENT_ENTRY(callbacks, v8host_session_set_callbacks);
+    CLIENT_ENTRY(start, v8host_session_start_run);
+    CLIENT_ENTRY(post, v8host_run_post_message);
+    CLIENT_ENTRY(cancel, v8host_run_cancel);
+    CLIENT_ENTRY(close, v8host_session_close);
 #undef CLIENT_ENTRY
-    return initialize() == V8HOST_OK;
+    return initialize() == v8host_status_ok;
   }
 };
 ContractCClient& PublicClient() {
@@ -4461,50 +4461,50 @@ ContractCClient& PublicClient() {
 }
 struct PublicCapture {
   ContractCClient* client = nullptr;
-  V8HostSession* session = nullptr;
-  V8HostRun* run = nullptr;
+  v8host_session_s* session = nullptr;
+  v8host_run_s* run = nullptr;
   DWORD thread = ::GetCurrentThreadId();
   std::vector<int32_t> states, events, kinds;
-  std::vector<V8HostStatus> statuses;
+  std::vector<v8host_status> statuses;
   std::vector<std::vector<uint8_t>> messages;
   int terminal = 0, disconnects = 0;
   ULONGLONG startup_started = 0;
   bool valid = true, close_in_terminal = true, closed = false;
   std::function<bool()> observe_worker;
-  static void V8HOST_CALL State(void* context, V8HostSession* session, int32_t state, V8HostStatus status) {
+  static void V8HOST_CDECL State(void* context, v8host_session_s* session, int32_t state, v8host_status status) {
     auto& c = *static_cast<PublicCapture*>(context);
-    c.valid &= ::GetCurrentThreadId() == c.thread && session == c.session && status == V8HOST_OK && !c.closed;
+    c.valid &= ::GetCurrentThreadId() == c.thread && session == c.session && status == v8host_status_ok && !c.closed;
     c.states.push_back(state);
-    if (state == V8HOST_SESSION_STATE_WORKER_SECURITY_READY && c.startup_started)
+    if (state == v8host_session_state_worker_security_ready && c.startup_started)
       std::printf("[client startup] session=%p duration_ms=%llu\n", session, ::GetTickCount64() - c.startup_started);
   }
-  static void V8HOST_CALL Run(void* context, V8HostRun* run, int32_t event, V8HostStatus status) {
+  static void V8HOST_CDECL Run(void* context, v8host_run_s* run, int32_t event, v8host_status status) {
     auto& c = *static_cast<PublicCapture*>(context);
     c.valid &= ::GetCurrentThreadId() == c.thread && run == c.run && !c.closed;
     c.events.push_back(event); c.statuses.push_back(status);
-    if (event != V8HOST_RUN_EVENT_STARTED) {
+    if (event != v8host_run_event_started) {
       ++c.terminal;
       if (c.close_in_terminal) {
         c.client->close(c.session); c.closed = true;
       }
     }
   }
-  static void V8HOST_CALL Message(void* context, V8HostRun* run, int32_t kind, const void* data, size_t len) {
+  static void V8HOST_CDECL Message(void* context, v8host_run_s* run, int32_t kind, const void* data, size_t len) {
     auto& c = *static_cast<PublicCapture*>(context);
     c.valid &= ::GetCurrentThreadId() == c.thread && run == c.run && !c.closed &&
-        c.states == std::vector<int32_t>{V8HOST_SESSION_STATE_READY,
-          V8HOST_SESSION_STATE_WORKER_STARTUP_READY, V8HOST_SESSION_STATE_WORKER_SECURITY_READY};
+        c.states == std::vector<int32_t>{v8host_session_state_ready,
+          v8host_session_state_worker_startup_ready, v8host_session_state_worker_security_ready};
     c.kinds.push_back(kind);
     const auto* bytes = static_cast<const uint8_t*>(data);
     c.messages.emplace_back(bytes, bytes + len);
     if (c.observe_worker) c.valid &= c.observe_worker();
   }
-  static void V8HOST_CALL Disconnect(void* context) {
+  static void V8HOST_CDECL Disconnect(void* context) {
     auto& c = *static_cast<PublicCapture*>(context);
     c.valid &= ::GetCurrentThreadId() == c.thread && !c.closed; ++c.disconnects;
   }
-  V8HostCallbacks Table() {
-    V8HostCallbacks t = {}; t.struct_size = sizeof(t); t.context = this;
+  v8host_callbacks Table() {
+    v8host_callbacks t = {}; t.struct_size = sizeof(t); t.context = this;
     t.on_session_state = State; t.on_run_event = Run; t.on_relay_message = Message;
     t.on_broker_disconnect = Disconnect; return t;
   }
@@ -4611,23 +4611,23 @@ struct PublicDedicatedProcesses {
 bool PublicRealJsMode(int32_t mode, std::string* detail) {
   CapturedBroker broker;
   PublicDedicatedProcesses dedicated;
-  if (mode == V8HOST_BROKER_SHARED && !broker.Launch(detail)) return false;
+  if (mode == v8host_broker_mode_shared && !broker.Launch(detail)) return false;
   auto& client = PublicClient();
   if (!client.Load()) { *detail = "production DLL client load/initialize failed"; return false; }
   PublicCapture capture; capture.client = &client; capture.close_in_terminal = false;
-  if (mode == V8HOST_BROKER_DEDICATED) {
+  if (mode == v8host_broker_mode_dedicated) {
     if (!dedicated.Prepare()) { *detail = "dedicated shared-endpoint identity"; return false; }
     capture.observe_worker = [&] { return dedicated.Observe(); };
   }
   V8HostSessionConfig config = {}; config.struct_size = sizeof(config);
-  config.broker_mode = mode; config.tier = V8HOST_TIER_UNTRUSTED;
-  config.prohibit_dynamic_code = 1; config.initial_token = sbox_token_restricted_same_access;
-  config.delayed_integrity = sbox_integrity_untrusted;
-  if (client.create(&config, &capture.session) != V8HOST_OK || !capture.session) {
+  config.broker_mode = mode; config.tier = v8host_tier_untrusted;
+  config.prohibit_dynamic_code = 1; config.initial_token = sbox_token_level_restricted_same_access;
+  config.delayed_integrity = sbox_integrity_level_untrusted;
+  if (client.create(&config, &capture.session) != v8host_status_ok || !capture.session) {
     *detail = "public create"; return false;
   }
   auto callbacks = capture.Table();
-  if (client.callbacks(capture.session, &callbacks) != V8HOST_OK) {
+  if (client.callbacks(capture.session, &callbacks) != v8host_status_ok) {
     *detail = "public callbacks"; return false;
   }
   for (int round = 0; round != 2; ++round) {
@@ -4639,15 +4639,15 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
     input.payload = guest.data(); input.payload_len = guest.size();
     char text[6] = {}; std::memcpy(text, round ? "bravo" : "alpha", 5);
     uint8_t binary[] = {0, static_cast<uint8_t>(1 + round * 2), static_cast<uint8_t>(2 + round * 2)};
-    V8HostRun* previous = capture.run;
+    v8host_run_s* previous = capture.run;
     if (round == 0) capture.startup_started = ::GetTickCount64();
-    if (client.start(capture.session, &input, &capture.run) != V8HOST_OK || !capture.run ||
+    if (client.start(capture.session, &input, &capture.run) != v8host_status_ok || !capture.run ||
         capture.run == previous) {
       *detail = "public same-session start round=" + std::to_string(round + 1); return false;
     }
     std::fill(guest.begin(), guest.end(), ' ');
-    if (client.post(capture.run, sbox_msg_string, text, 5) != V8HOST_OK ||
-        client.post(capture.run, sbox_msg_binary, binary, 3) != V8HOST_OK) {
+    if (client.post(capture.run, sbox_msg_kind_string, text, 5) != v8host_status_ok ||
+        client.post(capture.run, sbox_msg_kind_binary, binary, 3) != v8host_status_ok) {
       *detail = "public relay admission"; return false;
     }
     std::memset(text, 'x', 5); std::memset(binary, 0xFF, 3);
@@ -4658,16 +4658,16 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
       *detail = "public callbacks timed out round=" + std::to_string(round + 1); return false;
     }
     const std::vector<int32_t> events = round == 0
-        ? std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED}
-        : std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED,
-                              V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED};
+        ? std::vector<int32_t>{v8host_run_event_started, v8host_run_event_completed}
+        : std::vector<int32_t>{v8host_run_event_started, v8host_run_event_completed,
+                              v8host_run_event_started, v8host_run_event_completed};
     const size_t count = static_cast<size_t>(round + 1) * 2;
     if (!capture.valid || capture.terminal != round + 1 || capture.disconnects ||
-        capture.states != std::vector<int32_t>{V8HOST_SESSION_STATE_READY,
-            V8HOST_SESSION_STATE_WORKER_STARTUP_READY, V8HOST_SESSION_STATE_WORKER_SECURITY_READY} ||
-        capture.events != events || capture.statuses != std::vector<V8HostStatus>(count, V8HOST_OK) ||
+        capture.states != std::vector<int32_t>{v8host_session_state_ready,
+            v8host_session_state_worker_startup_ready, v8host_session_state_worker_security_ready} ||
+        capture.events != events || capture.statuses != std::vector<v8host_status>(count, v8host_status_ok) ||
         capture.kinds.size() != count || capture.messages.size() != count ||
-        capture.kinds[count - 2] != sbox_msg_string || capture.kinds[count - 1] != sbox_msg_binary ||
+        capture.kinds[count - 2] != sbox_msg_kind_string || capture.kinds[count - 1] != sbox_msg_kind_binary ||
         std::string(capture.messages[count - 2].begin(), capture.messages[count - 2].end()) !=
             (round ? "js echo: bravo" : "js echo: alpha") ||
         capture.messages[count - 1] != std::vector<uint8_t>{0x42, static_cast<uint8_t>(1 + round * 2),
@@ -4679,7 +4679,7 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
       return false;
     }
   }
-  if (!(mode == V8HOST_BROKER_SHARED ? broker.Reaped(1) : dedicated.Reaped())) {
+  if (!(mode == v8host_broker_mode_shared ? broker.Reaped(1) : dedicated.Reaped())) {
     { std::lock_guard<std::mutex> lock(broker.mutex); std::printf("[failure diagnostics] %s\n", broker.diagnostics.c_str()); }
     *detail = "public held broker/worker reaping"; return false;
   }
@@ -4696,10 +4696,10 @@ bool PublicRealCancelAndProfileBody(std::string* detail) {
   if (!client.Load()) { *detail = "public client load"; return false; }
   PublicCapture c; c.client = &client; c.close_in_terminal = false;
   V8HostSessionConfig config = {}; config.struct_size = sizeof(config);
-  config.broker_mode = V8HOST_BROKER_SHARED; config.tier = V8HOST_TIER_TRUSTED;
-  config.initial_token = sbox_token_restricted_same_access; config.delayed_integrity = sbox_integrity_untrusted;
-  if (client.create(&config, &c.session) != V8HOST_OK) return false;
-  auto callbacks = c.Table(); if (client.callbacks(c.session, &callbacks) != V8HOST_OK) return false;
+  config.broker_mode = v8host_broker_mode_shared; config.tier = v8host_tier_trusted;
+  config.initial_token = sbox_token_level_restricted_same_access; config.delayed_integrity = sbox_integrity_level_untrusted;
+  if (client.create(&config, &c.session) != v8host_status_ok) return false;
+  auto callbacks = c.Table(); if (client.callbacks(c.session, &callbacks) != v8host_status_ok) return false;
   DWORD worker_pid = 0;
   auto same_worker = [&] {
     std::lock_guard<std::mutex> lock(broker.mutex);
@@ -4711,35 +4711,35 @@ bool PublicRealCancelAndProfileBody(std::string* detail) {
   for (int round = 0; round < 4; ++round) {
     std::string guest = round == 0 ? "host.onmessage=function(m){};host.postMessage('armed');" :
         "host.postMessage('done');host.complete();";
-    V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = round == 2 ? V8HOST_TIER_UNTRUSTED : -1;
+    V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = round == 2 ? v8host_tier_untrusted : -1;
     input.payload = guest.data(); input.payload_len = guest.size();
     input.engine_dll_override = round == 2 ? L"missing-profile-engine.dll" : L"v8jsisb.dll";
     if (round == 0) c.startup_started = ::GetTickCount64();
-    if (client.start(c.session, &input, &c.run) != V8HOST_OK || !c.run) { *detail = "public negative start"; return false; }
+    if (client.start(c.session, &input, &c.run) != v8host_status_ok || !c.run) { *detail = "public negative start"; return false; }
     if (round == 0) {
       if (!PumpPublic([&] { return !c.messages.empty() || c.disconnects; }) || c.messages.empty() ||
           std::string(c.messages[0].begin(), c.messages[0].end()) != "armed" ||
-          !PumpPublic(same_worker) || client.cancel(c.run) != V8HOST_OK) {
+          !PumpPublic(same_worker) || client.cancel(c.run) != v8host_status_ok) {
         *detail = "public armed/cancel/worker observation messages=" + std::to_string(c.messages.size()) +
             " terminals=" + std::to_string(c.terminal) + " disconnects=" + std::to_string(c.disconnects) +
             " status=" + std::to_string(c.statuses.empty() ? -1 : c.statuses.back()); return false;
       }
     }
     if (!PumpPublic([&] { return c.terminal >= round + 1 || c.disconnects; })) { *detail = "public negative terminal timeout"; return false; }
-    const int32_t expected_event = round == 0 ? V8HOST_RUN_EVENT_CANCELLED : round == 2 ? V8HOST_RUN_EVENT_FAILED : V8HOST_RUN_EVENT_COMPLETED;
-    const V8HostStatus expected_status = round == 2 ? V8HOST_E_PROFILE_ALREADY_BOUND : V8HOST_OK;
-    const std::vector<int32_t> expected_events = round == 0 ? std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_CANCELLED} :
-        round == 1 ? std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_CANCELLED, V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED} :
-        round == 2 ? std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_CANCELLED, V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED, V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_FAILED} :
-        std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_CANCELLED, V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED, V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_FAILED, V8HOST_RUN_EVENT_STARTED, V8HOST_RUN_EVENT_COMPLETED};
+    const int32_t expected_event = round == 0 ? v8host_run_event_cancelled : round == 2 ? v8host_run_event_failed : v8host_run_event_completed;
+    const v8host_status expected_status = round == 2 ? v8host_status_profile_already_bound : v8host_status_ok;
+    const std::vector<int32_t> expected_events = round == 0 ? std::vector<int32_t>{v8host_run_event_started, v8host_run_event_cancelled} :
+        round == 1 ? std::vector<int32_t>{v8host_run_event_started, v8host_run_event_cancelled, v8host_run_event_started, v8host_run_event_completed} :
+        round == 2 ? std::vector<int32_t>{v8host_run_event_started, v8host_run_event_cancelled, v8host_run_event_started, v8host_run_event_completed, v8host_run_event_started, v8host_run_event_failed} :
+        std::vector<int32_t>{v8host_run_event_started, v8host_run_event_cancelled, v8host_run_event_started, v8host_run_event_completed, v8host_run_event_started, v8host_run_event_failed, v8host_run_event_started, v8host_run_event_completed};
     if (!c.valid || c.disconnects || c.terminal != round + 1 || c.events != expected_events ||
         c.events.back() != expected_event || c.statuses.back() != expected_status || !same_worker() ||
-        client.cancel(c.run) != V8HOST_E_RUN_TERMINAL || client.post(c.run, sbox_msg_string, "late", 4) != V8HOST_E_RUN_TERMINAL) {
+        client.cancel(c.run) != v8host_status_run_terminal || client.post(c.run, sbox_msg_kind_string, "late", 4) != v8host_status_run_terminal) {
       *detail = "public cancel/profile/terminal/reuse round=" + std::to_string(round); return false;
     }
   }
   if (c.messages != std::vector<std::vector<uint8_t>>{{'a','r','m','e','d'}, {'d','o','n','e'}, {'d','o','n','e'}} ||
-      c.statuses != std::vector<V8HostStatus>{V8HOST_OK,V8HOST_OK,V8HOST_OK,V8HOST_OK,V8HOST_OK,V8HOST_E_PROFILE_ALREADY_BOUND,V8HOST_OK,V8HOST_OK}) {
+      c.statuses != std::vector<v8host_status>{v8host_status_ok,v8host_status_ok,v8host_status_ok,v8host_status_ok,v8host_status_ok,v8host_status_profile_already_bound,v8host_status_ok,v8host_status_ok}) {
     *detail = "profile failure ran guest or wrong terminal status"; return false;
   }
   client.close(c.session); c.closed = true;
@@ -4748,20 +4748,20 @@ bool PublicRealCancelAndProfileBody(std::string* detail) {
   return c.valid && c.terminal == 4 && c.disconnects == 0;
 }
 struct ProcessRunRecord {
-  V8HostRun* handle = nullptr;
+  v8host_run_s* handle = nullptr;
   std::string token;
   std::vector<int32_t> events, kinds;
-  std::vector<V8HostStatus> statuses;
+  std::vector<v8host_status> statuses;
   std::vector<std::vector<uint8_t>> messages;
   unsigned terminals = 0;
 };
 struct ProcessSessionRecord {
   ContractCClient& client = PublicClient();
-  V8HostSession* handle = nullptr;
+  v8host_session_s* handle = nullptr;
   DWORD thread = ::GetCurrentThreadId();
   std::deque<ProcessRunRecord> runs;
   std::vector<int32_t> states;
-  std::vector<V8HostStatus> state_statuses;
+  std::vector<v8host_status> state_statuses;
   unsigned disconnects = 0;
   ULONGLONG startup_started = 0;
   bool valid = true, closed = false, close_on_terminal = false;
@@ -4769,41 +4769,41 @@ struct ProcessSessionRecord {
   void Close() {
     if (handle && !closed) { client.close(handle); closed = true; }
   }
-  ProcessRunRecord* Find(V8HostRun* run) {
+  ProcessRunRecord* Find(v8host_run_s* run) {
     valid &= ::GetCurrentThreadId() == thread && !closed;
     for (auto& r : runs) if (r.handle == run) return &r;
     valid = false; return nullptr;
   }
-  static void V8HOST_CALL State(void* context, V8HostSession* session, int32_t state, V8HostStatus status) {
+  static void V8HOST_CDECL State(void* context, v8host_session_s* session, int32_t state, v8host_status status) {
     auto& c = *static_cast<ProcessSessionRecord*>(context);
     c.valid &= ::GetCurrentThreadId() == c.thread && session == c.handle && !c.closed;
     if (c.states.size() >= 8) { c.valid = false; return; }
     c.states.push_back(state); c.state_statuses.push_back(status);
-    if (state == V8HOST_SESSION_STATE_WORKER_SECURITY_READY && c.startup_started)
+    if (state == v8host_session_state_worker_security_ready && c.startup_started)
       std::printf("[client startup] session=%p duration_ms=%llu\n", session, ::GetTickCount64() - c.startup_started);
   }
-  static void V8HOST_CALL Event(void* context, V8HostRun* run, int32_t event, V8HostStatus status) {
+  static void V8HOST_CDECL Event(void* context, v8host_run_s* run, int32_t event, v8host_status status) {
     auto& c = *static_cast<ProcessSessionRecord*>(context);
     auto* r = c.Find(run); if (!r) return;
     if (r->events.size() >= 8) { c.valid = false; return; }
     r->events.push_back(event); r->statuses.push_back(status);
-    if (event != V8HOST_RUN_EVENT_STARTED) {
+    if (event != v8host_run_event_started) {
       ++r->terminals; c.valid &= r->terminals == 1;
       std::printf("[terminal] session=%p run=%p token=%s event=%d status=%d count=%u\n",
           c.handle, run, r->token.c_str(), event, status, r->terminals);
       if (c.close_on_terminal) c.Close();
     }
   }
-  static void V8HOST_CALL Message(void* context, V8HostRun* run, int32_t kind, const void* data, size_t len) {
+  static void V8HOST_CDECL Message(void* context, v8host_run_s* run, int32_t kind, const void* data, size_t len) {
     auto& c = *static_cast<ProcessSessionRecord*>(context);
     auto* r = c.Find(run); if (!r) return;
-    c.valid &= r->terminals == 0 && c.states == std::vector<int32_t>{V8HOST_SESSION_STATE_READY,
-        V8HOST_SESSION_STATE_WORKER_STARTUP_READY, V8HOST_SESSION_STATE_WORKER_SECURITY_READY};
+    c.valid &= r->terminals == 0 && c.states == std::vector<int32_t>{v8host_session_state_ready,
+        v8host_session_state_worker_startup_ready, v8host_session_state_worker_security_ready};
     const auto* bytes = static_cast<const uint8_t*>(data);
     if (r->messages.size() >= 32 || len > 1024) { c.valid = false; return; }
     r->kinds.push_back(kind); r->messages.emplace_back(bytes, bytes + len);
   }
-  static void V8HOST_CALL Disconnect(void* context) {
+  static void V8HOST_CDECL Disconnect(void* context) {
     auto& c = *static_cast<ProcessSessionRecord*>(context);
     c.valid &= ::GetCurrentThreadId() == c.thread && !c.closed;
     ++c.disconnects; c.valid &= c.disconnects == 1;
@@ -4811,13 +4811,13 @@ struct ProcessSessionRecord {
   bool Create() {
     if (!client.Load()) return false;
     V8HostSessionConfig config = {}; config.struct_size = sizeof(config);
-    config.broker_mode = V8HOST_BROKER_SHARED; config.tier = V8HOST_TIER_UNTRUSTED;
-    config.prohibit_dynamic_code = 1; config.initial_token = sbox_token_restricted_same_access;
-    config.delayed_integrity = sbox_integrity_untrusted;
-    if (client.create(&config, &handle) != V8HOST_OK || !handle) return false;
-    V8HostCallbacks cb = {}; cb.struct_size = sizeof(cb); cb.context = this;
+    config.broker_mode = v8host_broker_mode_shared; config.tier = v8host_tier_untrusted;
+    config.prohibit_dynamic_code = 1; config.initial_token = sbox_token_level_restricted_same_access;
+    config.delayed_integrity = sbox_integrity_level_untrusted;
+    if (client.create(&config, &handle) != v8host_status_ok || !handle) return false;
+    v8host_callbacks cb = {}; cb.struct_size = sizeof(cb); cb.context = this;
     cb.on_session_state = State; cb.on_run_event = Event; cb.on_relay_message = Message; cb.on_broker_disconnect = Disconnect;
-    return client.callbacks(handle, &cb) == V8HOST_OK;
+    return client.callbacks(handle, &cb) == v8host_status_ok;
   }
   bool Start(const std::string& token, bool finish_immediately = false) {
     std::string guest = finish_immediately ? "host.postMessage('" + token + "');host.complete();" :
@@ -4828,7 +4828,7 @@ struct ProcessSessionRecord {
     input.payload = guest.data(); input.payload_len = guest.size();
     if (runs.empty()) startup_started = ::GetTickCount64();
     runs.emplace_back(); auto& r = runs.back(); r.token = token;
-    if (client.start(handle, &input, &r.handle) != V8HOST_OK || !r.handle) { runs.pop_back(); return false; }
+    if (client.start(handle, &input, &r.handle) != v8host_status_ok || !r.handle) { runs.pop_back(); return false; }
     if (std::any_of(runs.begin(), runs.end() - 1, [&](const auto& prior) { return prior.handle == r.handle; })) {
       valid = false; return false;
     }
@@ -4837,32 +4837,32 @@ struct ProcessSessionRecord {
   bool Armed(size_t index) {
     auto& r = runs[index];
     return PumpPublic([&] { return !r.messages.empty() || r.terminals || disconnects; }) && valid &&
-        !disconnects && r.events == std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED} && r.terminals == 0 &&
-        r.statuses == std::vector<V8HostStatus>{V8HOST_OK} && r.kinds == std::vector<int32_t>{sbox_msg_string} &&
+        !disconnects && r.events == std::vector<int32_t>{v8host_run_event_started} && r.terminals == 0 &&
+        r.statuses == std::vector<v8host_status>{v8host_status_ok} && r.kinds == std::vector<int32_t>{sbox_msg_kind_string} &&
         r.messages == std::vector<std::vector<uint8_t>>{Text(r.token + ":armed")} &&
-        state_statuses == std::vector<V8HostStatus>(3, V8HOST_OK);
+        state_statuses == std::vector<v8host_status>(3, v8host_status_ok);
   }
   static std::vector<uint8_t> Text(const std::string& s) { return {s.begin(), s.end()}; }
   bool Echo(size_t index, const std::string& text, uint8_t value) {
     auto& r = runs[index]; size_t before = r.messages.size();
     uint8_t binary[] = {value, 0, 0xff};
-    if (client.post(r.handle, sbox_msg_string, text.data(), text.size()) != V8HOST_OK ||
-        client.post(r.handle, sbox_msg_binary, binary, sizeof(binary)) != V8HOST_OK ||
+    if (client.post(r.handle, sbox_msg_kind_string, text.data(), text.size()) != v8host_status_ok ||
+        client.post(r.handle, sbox_msg_kind_binary, binary, sizeof(binary)) != v8host_status_ok ||
         !PumpPublic([&] { return r.messages.size() >= before + 2 || r.terminals || disconnects; })) return false;
     return valid && !disconnects && !r.terminals && r.messages.size() == before + 2 &&
-        r.kinds[before] == sbox_msg_string && r.kinds[before + 1] == sbox_msg_binary &&
+        r.kinds[before] == sbox_msg_kind_string && r.kinds[before + 1] == sbox_msg_kind_binary &&
         r.messages[before] == Text(r.token + ":" + text) &&
         r.messages[before + 1] == std::vector<uint8_t>{static_cast<uint8_t>(value ^ 0x5a), 0, 0xff};
   }
-  bool Terminal(size_t index, int32_t event, V8HostStatus status) {
+  bool Terminal(size_t index, int32_t event, v8host_status status) {
     auto& r = runs[index];
     return PumpPublic([&] { return r.terminals != 0; }) && valid && r.terminals == 1 &&
-        r.events == std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED, event} &&
-        r.statuses == std::vector<V8HostStatus>{V8HOST_OK, status};
+        r.events == std::vector<int32_t>{v8host_run_event_started, event} &&
+        r.statuses == std::vector<v8host_status>{v8host_status_ok, status};
   }
   bool Finish(size_t index) {
-    return client.post(runs[index].handle, sbox_msg_string, "finish", 6) == V8HOST_OK &&
-        Terminal(index, V8HOST_RUN_EVENT_COMPLETED, V8HOST_OK);
+    return client.post(runs[index].handle, sbox_msg_kind_string, "finish", 6) == v8host_status_ok &&
+        Terminal(index, v8host_run_event_completed, v8host_status_ok);
   }
   size_t CallbackCount() const {
     size_t count = states.size() + disconnects;
@@ -4923,7 +4923,7 @@ bool PublicWorkerExitBody(std::string* detail) {
       !sibling.Create() || !sibling.Start("survivor") || !MapPublicWorker(broker, sibling, 1) ||
       !crashed.Start("crashed-active") || !crashed.Armed(1) || !crashed.Start("crashed-pending") ||
       !PumpPublic([&] { return !crashed.runs[2].events.empty(); })) return false;
-  if (crashed.runs[2].events != std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED} ||
+  if (crashed.runs[2].events != std::vector<int32_t>{v8host_run_event_started} ||
       !crashed.runs[2].messages.empty() || crashed.runs[2].terminals) return false;
   HANDLE killed = broker.Worker(0), healthy = broker.Worker(1);
   if (!killed || !healthy || ::WaitForSingleObject(killed, 0) != WAIT_TIMEOUT ||
@@ -4932,15 +4932,15 @@ bool PublicWorkerExitBody(std::string* detail) {
   if (!::GetExitCodeProcess(killed, &code) || code != 0xfa17) return false;
   std::printf("[fault] broker=%lu worker=%lu exit=%lu owned-handle\n",
       ::GetProcessId(broker.process), ::GetProcessId(killed), code);
-  if (!crashed.Terminal(1, V8HOST_RUN_EVENT_WORKER_EXITED, V8HOST_E_RUN_TERMINAL) ||
-      !crashed.Terminal(2, V8HOST_RUN_EVENT_WORKER_EXITED, V8HOST_E_RUN_TERMINAL) ||
+  if (!crashed.Terminal(1, v8host_run_event_worker_exited, v8host_status_run_terminal) ||
+      !crashed.Terminal(2, v8host_run_event_worker_exited, v8host_status_run_terminal) ||
       !crashed.runs[2].messages.empty() || crashed.runs[0].terminals != 1 ||
-      crashed.runs[0].events.back() != V8HOST_RUN_EVENT_COMPLETED || crashed.disconnects) {
+      crashed.runs[0].events.back() != v8host_run_event_completed || crashed.disconnects) {
     *detail = "completed/active/queued worker-exit arbitration"; return false;
   }
   for (size_t i : {size_t{1}, size_t{2}}) {
-    if (crashed.client.post(crashed.runs[i].handle, sbox_msg_string, "late", 4) != V8HOST_E_RUN_TERMINAL ||
-        crashed.client.cancel(crashed.runs[i].handle) != V8HOST_E_RUN_TERMINAL) return false;
+    if (crashed.client.post(crashed.runs[i].handle, sbox_msg_kind_string, "late", 4) != v8host_status_run_terminal ||
+        crashed.client.cancel(crashed.runs[i].handle) != v8host_status_run_terminal) return false;
   }
   crashed.Close(); size_t frozen = crashed.CallbackCount();
   if (::WaitForSingleObject(broker.process, 0) != WAIT_TIMEOUT ||
@@ -4978,7 +4978,7 @@ bool PublicDisconnectBody(std::string* detail) {
       if (!c.Finish(0) || !c.closed) return false;
     } else {
       // Completion may race EOF, but explicit close suppresses queued delivery.
-      if (c.client.post(c.runs[0].handle, sbox_msg_string, "finish", 6) != V8HOST_OK) return false;
+      if (c.client.post(c.runs[0].handle, sbox_msg_kind_string, "finish", 6) != v8host_status_ok) return false;
       c.Close();
     }
     size_t frozen = c.CallbackCount();
@@ -5014,7 +5014,7 @@ bool PublicBrokerKillBody(std::string* detail) {
     if (!c.Create() || !c.Start("old-active" + std::to_string(i)) || !MapPublicWorker(old_broker, c, i) ||
         !c.Start("old-queued-side-effect" + std::to_string(i)) ||
         !PumpPublic([&] { return !c.runs[1].events.empty(); }) ||
-        c.runs[1].events != std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED} ||
+        c.runs[1].events != std::vector<int32_t>{v8host_run_event_started} ||
         !c.runs[1].messages.empty() || c.runs[1].terminals) return false;
   }
   DWORD pid = ::GetProcessId(old_broker.process);
@@ -5024,12 +5024,12 @@ bool PublicBrokerKillBody(std::string* detail) {
   std::printf("[fault] owned broker=%lu killed; every old worker exited before replacement\n", pid);
   for (auto& c : old) {
     for (size_t i = 0; i < c.runs.size(); ++i) {
-      if (!c.Terminal(i, V8HOST_RUN_EVENT_BROKER_LOST, V8HOST_E_BROKER_LOST) ||
-          c.client.post(c.runs[i].handle, sbox_msg_string, "old-late", 8) != V8HOST_E_RUN_TERMINAL ||
-          c.client.cancel(c.runs[i].handle) != V8HOST_E_RUN_TERMINAL) return false;
+      if (!c.Terminal(i, v8host_run_event_broker_lost, v8host_status_broker_lost) ||
+          c.client.post(c.runs[i].handle, sbox_msg_kind_string, "old-late", 8) != v8host_status_run_terminal ||
+          c.client.cancel(c.runs[i].handle) != v8host_status_run_terminal) return false;
     }
     if (!PumpPublic([&] { return c.disconnects != 0; }) || !c.valid || c.disconnects != 1 ||
-        c.states.back() != V8HOST_SESSION_STATE_CLOSED || c.state_statuses.back() != V8HOST_E_BROKER_LOST ||
+        c.states.back() != v8host_session_state_closed || c.state_statuses.back() != v8host_status_broker_lost ||
         c.runs[0].messages.size() != 1 || !c.runs[1].messages.empty()) return false;
   }
   CapturedBroker replacement;
@@ -5046,9 +5046,9 @@ bool PublicBrokerKillBody(std::string* detail) {
     std::string guest = "host.postMessage('old-retry-side-effect');host.complete();";
     V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = -1;
     input.payload = guest.data(); input.payload_len = guest.size();
-    V8HostRun* run = nullptr;
-    if (c.client.start(c.handle, &input, &run) != V8HOST_E_CONNECT || run ||
-        c.client.post(c.runs[0].handle, sbox_msg_string, "old", 3) != V8HOST_E_RUN_TERMINAL) {
+    v8host_run_s* run = nullptr;
+    if (c.client.start(c.handle, &input, &run) != v8host_status_connect_failed || run ||
+        c.client.post(c.runs[0].handle, sbox_msg_kind_string, "old", 3) != v8host_status_run_terminal) {
       *detail = "old terminal session/run accepted replay"; return false;
     }
   }
@@ -5085,7 +5085,7 @@ bool SameConnectionWorkerExitBody(std::string* detail) {
       other.connection.broker_pid() != ::GetProcessId(broker.process) ||
       other.hello.conn_id == siblings.hello.conn_id) return false;
   auto config = LogicalConfig(); config.broker_mode = 1;
-  config.initial_token = sbox_token_restricted_same_access; config.delayed_integrity = sbox_integrity_untrusted;
+  config.initial_token = sbox_token_level_restricted_same_access; config.delayed_integrity = sbox_integrity_level_untrusted;
   if (!siblings.Send(protocol::BuildCreateSessionFrame(siblings.Header(2, 2), config)) ||
       !siblings.Expect(protocol::MessageType::ACK, 2, 2) || !siblings.Expect(protocol::MessageType::SESSION_READY, 0, 2) ||
       !other.Send(protocol::BuildCreateSessionFrame(other.Header(1), config)) ||
@@ -5095,7 +5095,7 @@ bool SameConnectionWorkerExitBody(std::string* detail) {
     return h.Send(protocol::BuildRelayFrame(header, kind, body.data(), body.size()));
   };
   auto text = [&](WireHarness& h, uint32_t session, uint32_t run, const std::string& body) {
-    return relay(h, session, run, sbox_msg_string, {body.begin(), body.end()});
+    return relay(h, session, run, sbox_msg_kind_string, {body.begin(), body.end()});
   };
   auto message = [&](WireHarness& h, uint32_t session, uint32_t run, int32_t kind, const std::vector<uint8_t>& expected) {
     std::vector<uint8_t> bytes; protocol::FrameHeader header; int32_t received_kind;
@@ -5107,7 +5107,7 @@ bool SameConnectionWorkerExitBody(std::string* detail) {
         std::vector<uint8_t>(body, body + size) == expected;
   };
   auto token = [&](WireHarness& h, uint32_t session, uint32_t run, const std::string& expected) {
-    return message(h, session, run, sbox_msg_string, {expected.begin(), expected.end()});
+    return message(h, session, run, sbox_msg_kind_string, {expected.begin(), expected.end()});
   };
   auto start = [&](WireHarness& h, uint32_t request, uint32_t session, uint32_t run, const std::string& tag, bool first) {
     const std::string guest = "host.onmessage=function(m){if(typeof m==='string'){if(m==='finish'){host.complete();return;}"
@@ -5147,8 +5147,8 @@ bool SameConnectionWorkerExitBody(std::string* detail) {
     const std::string sent = "unique" + std::to_string(i + round * 3);
     const uint8_t value = static_cast<uint8_t>(i + round * 16);
     if (!text(h, ids[i], run, sent) || !token(h, ids[i], run, tag + ":" + sent) ||
-        !relay(h, ids[i], run, sbox_msg_binary, {value, 0, 0xff}) ||
-        !message(h, ids[i], run, sbox_msg_binary, {static_cast<uint8_t>(value ^ 0x5a), 0, 0xff}) ||
+        !relay(h, ids[i], run, sbox_msg_kind_binary, {value, 0, 0xff}) ||
+        !message(h, ids[i], run, sbox_msg_kind_binary, {static_cast<uint8_t>(value ^ 0x5a), 0, 0xff}) ||
         !finish(h, ids[i], run) || !broker.Observe(3) || ::WaitForSingleObject(broker.Worker(i), 0) != WAIT_TIMEOUT) return false;
   }
   *detail = "same-connection worker fault/active+queued terminal";
@@ -5207,7 +5207,7 @@ bool ProcessToken(WireHarness& h, uint32_t session, uint32_t run, const std::str
       header.conn_id == h.hello.conn_id && header.session_id == session && header.run_id == run && !header.request_id &&
       header.version_major == h.hello.selected_major && header.version_minor == h.hello.selected_minor &&
       protocol::DecodeRelayPayload(bytes.data() + protocol::kFrameHeaderSize,
-          bytes.size() - protocol::kFrameHeaderSize, &kind, &body, &size) && kind == sbox_msg_string &&
+          bytes.size() - protocol::kFrameHeaderSize, &kind, &body, &size) && kind == sbox_msg_kind_string &&
       std::string(reinterpret_cast<const char*>(body), size) == expected;
 }
 bool ProcessEof(WireHarness& h) {
@@ -5230,7 +5230,7 @@ bool ProcessEof(WireHarness& h) {
 }
 protocol::CreateSessionPayload ProcessConfig() {
   auto config = LogicalConfig(); config.broker_mode = 1;
-  config.initial_token = sbox_token_restricted_same_access; config.delayed_integrity = sbox_integrity_untrusted;
+  config.initial_token = sbox_token_level_restricted_same_access; config.delayed_integrity = sbox_integrity_level_untrusted;
   return config;
 }
 bool ProcessCreate(WireHarness& h, uint32_t request, uint32_t session) {
@@ -5246,7 +5246,7 @@ bool ProcessStart(WireHarness& h, uint32_t request, uint32_t session, uint32_t r
 }
 bool ProcessEcho(WireHarness& h, uint32_t session, uint32_t run, const std::string& text) {
   auto header = h.Header(0, session, run); header.type = protocol::MessageType::RELAY_TO_WORKER;
-  return h.Send(protocol::BuildRelayFrame(header, sbox_msg_string,
+  return h.Send(protocol::BuildRelayFrame(header, sbox_msg_kind_string,
       reinterpret_cast<const uint8_t*>(text.data()), text.size())) && ProcessToken(h, session, run, text);
 }
 bool FillProcessInbound(WireHarness& h, uint32_t session, uint32_t run, size_t bytes, size_t* charged) {
@@ -5260,7 +5260,7 @@ bool FillProcessInbound(WireHarness& h, uint32_t session, uint32_t run, size_t b
     if (part < overhead || ++frames > 256) return false;
     std::vector<uint8_t> payload(part - overhead, 7);
     auto header = h.Header(0, session, run); header.type = protocol::MessageType::RELAY_TO_WORKER;
-    auto frame = protocol::BuildRelayFrame(header, sbox_msg_binary, payload.data(), payload.size());
+    auto frame = protocol::BuildRelayFrame(header, sbox_msg_kind_binary, payload.data(), payload.size());
     if (frame.size() > protocol::kMaxFrameSize || !h.Send(std::move(frame))) return false;
     *charged += v8host::EncodeRunEnvelope(GuestRelay(payload.size(), run)).size();
     bytes -= part;
@@ -5312,7 +5312,7 @@ bool RealInboundAggregateBody(std::string* detail) {
       auto header = pressured.Header(0, 6, 3); header.type = protocol::MessageType::RELAY_TO_WORKER;
       const size_t rejected = v8host::EncodeRunEnvelope(GuestRelay(0, 3)).size();
       if (charged + rejected != cap + 1 ||
-          !pressured.Send(protocol::BuildRelayFrame(header, sbox_msg_binary, nullptr, 0))) return false;
+          !pressured.Send(protocol::BuildRelayFrame(header, sbox_msg_kind_binary, nullptr, 0))) return false;
       if (variant == 2) {
         std::vector<uint8_t> bytes; protocol::FrameHeader error_header; protocol::ErrorPayload error;
         if (!pressured.Receive(&bytes, &error_header) || error_header.type != protocol::MessageType::ERROR ||
@@ -5352,21 +5352,21 @@ bool RealNoncooperativeFallbackBody(std::string* detail) {
   V8HostRunInputs input = {}; input.struct_size = sizeof(input); input.tier_override = -1;
   input.payload = guest.data(); input.payload_len = guest.size();
   blocked.runs.emplace_back(); blocked.runs[0].token = "entered";
-  if (blocked.client.start(blocked.handle, &input, &blocked.runs[0].handle) != V8HOST_OK ||
+  if (blocked.client.start(blocked.handle, &input, &blocked.runs[0].handle) != v8host_status_ok ||
       !PumpPublic([&] { return !blocked.runs[0].messages.empty() || blocked.runs[0].terminals || blocked.disconnects; }) ||
       !blocked.valid || blocked.disconnects || blocked.runs[0].terminals ||
-      blocked.runs[0].events != std::vector<int32_t>{V8HOST_RUN_EVENT_STARTED} ||
+      blocked.runs[0].events != std::vector<int32_t>{v8host_run_event_started} ||
       blocked.runs[0].messages != std::vector<std::vector<uint8_t>>{ProcessSessionRecord::Text("entered")} ||
-      blocked.runs[0].kinds != std::vector<int32_t>{sbox_msg_string} || !broker.Observe(1)) return false;
+      blocked.runs[0].kinds != std::vector<int32_t>{sbox_msg_kind_string} || !broker.Observe(1)) return false;
   HANDLE worker = broker.Worker(0);
   if (!worker || ::WaitForSingleObject(worker, 0) != WAIT_TIMEOUT || !blocked.Start("pending-never-execute") ||
       !PumpPublic([&] { return !blocked.runs[1].events.empty(); }) || !sibling.Create() ||
       !sibling.Start("survivor") || !MapPublicWorker(broker, sibling, 1)) return false;
   HANDLE healthy = broker.Worker(1);
   const ULONGLONG cancelled = ::GetTickCount64();
-  if (blocked.client.cancel(blocked.runs[0].handle) != V8HOST_OK ||
-      !blocked.Terminal(0, V8HOST_RUN_EVENT_WORKER_EXITED, V8HOST_E_RUN_TERMINAL) ||
-      !blocked.Terminal(1, V8HOST_RUN_EVENT_WORKER_EXITED, V8HOST_E_RUN_TERMINAL) ||
+  if (blocked.client.cancel(blocked.runs[0].handle) != v8host_status_ok ||
+      !blocked.Terminal(0, v8host_run_event_worker_exited, v8host_status_run_terminal) ||
+      !blocked.Terminal(1, v8host_run_event_worker_exited, v8host_status_run_terminal) ||
       !blocked.runs[1].messages.empty() || blocked.disconnects ||
       ::WaitForSingleObject(worker, 0) != WAIT_TIMEOUT) { *detail = "fallback must retire once before kernel death"; return false; }
   const ULONGLONG retired = ::GetTickCount64();
@@ -5390,11 +5390,11 @@ bool RealNoncooperativeFallbackBody(std::string* detail) {
   std::printf("[reaped] noncooperative worker=%lu exit=%lu cancel_to_exit_ms=%llu harness_kill=0 budget_ms=60000\n",
       ::GetProcessId(worker), code, ::GetTickCount64() - cancelled);
   for (auto& run : blocked.runs)
-    if (blocked.client.post(run.handle, sbox_msg_string, "late", 4) != V8HOST_E_RUN_TERMINAL ||
-        blocked.client.cancel(run.handle) != V8HOST_E_RUN_TERMINAL) return false;
+    if (blocked.client.post(run.handle, sbox_msg_kind_string, "late", 4) != v8host_status_run_terminal ||
+        blocked.client.cancel(run.handle) != v8host_status_run_terminal) return false;
   blocked.Close(); const size_t frozen = blocked.CallbackCount();
-  V8HostRun* forbidden = nullptr;
-  if (blocked.client.start(blocked.handle, &input, &forbidden) == V8HOST_OK || forbidden ||
+  v8host_run_s* forbidden = nullptr;
+  if (blocked.client.start(blocked.handle, &input, &forbidden) == v8host_status_ok || forbidden ||
       !sibling.Echo(0, "after-reap", 0x33) || !sibling.Finish(0) || !sibling.Start("fresh-js") ||
       !sibling.Armed(1) || !sibling.Echo(1, "original-pid", 0x34) || !sibling.Finish(1) ||
       !broker.Observe(2) || ::WaitForSingleObject(healthy, 0) != WAIT_TIMEOUT) return false;
@@ -5630,8 +5630,8 @@ int main(int argc, char** argv) {
     bool ok = name == "real-noncooperative-fallback" ? RealNoncooperativeFallbackBody(&detail) :
         name == "real-idle-lifecycle" ? RealIdleLifecycleBody(&detail) :
         name == "real-inbound-aggregate" ? RealInboundAggregateBody(&detail) :
-        name == "real-js" ? PublicRealJsMode(V8HOST_BROKER_SHARED, &detail) :
-        name == "real-dedicated-js" ? PublicRealJsMode(V8HOST_BROKER_DEDICATED, &detail) :
+        name == "real-js" ? PublicRealJsMode(v8host_broker_mode_shared, &detail) :
+        name == "real-dedicated-js" ? PublicRealJsMode(v8host_broker_mode_dedicated, &detail) :
         name == "real-cancel-and-profile" ? PublicRealCancelAndProfileBody(&detail) :
         name == "n-session-n-pid" ? PublicNSessionBody(&detail) :
         name == "worker-exit-isolation" ? PublicWorkerExitBody(&detail) :

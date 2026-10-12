@@ -151,7 +151,7 @@ source_set("client_persona") {
     ":protocol",
   ]
   public_configs = [ ":v8host_common_config" ]
-  defines = [ "V8HOST_CLIENT_IMPL" ]
+  defines = [ "V8HOST_IMPL" ]
   libs = [ "user32.lib" ]
 }
 
@@ -221,7 +221,7 @@ source_set("engine_persona") {
     ":run_envelope",
     ":spawn_config",
   ]
-  defines = [ "SBOX_PLUGIN_IMPL" ]
+  defines = [ "SBOX_IMPL" ]
 
   configs -= [ "//build/config/compiler:no_exceptions" ]
   configs += [ "//build/config/compiler:exceptions" ]
@@ -238,7 +238,7 @@ shared_library("v8host") {
     ":engine_persona",
   ]
   defines = [
-    "SBOX_PLUGIN_IMPL",
+    "SBOX_IMPL",
     "SBOX_DEV_ALLOW_UNSIGNED",
   ]
   configs -= [ "//build/config/compiler:no_exceptions" ]

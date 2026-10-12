@@ -82,10 +82,10 @@ V8HostWorkerProfileV1 SampleWorkerProfile() {
 V8HostSpawnConfigV1 SampleSpawnConfig() {
   V8HostSpawnConfigV1 s;
   s.tier = v8host::kTierUntrusted;
-  s.integrity = sbox_integrity_low;
-  s.delayed_integrity = sbox_integrity_untrusted;
-  s.initial_token = sbox_token_restricted_same_access;
-  s.lockdown_token = sbox_token_lockdown;
+  s.integrity = sbox_integrity_level_low;
+  s.delayed_integrity = sbox_integrity_level_untrusted;
+  s.initial_token = sbox_token_level_restricted_same_access;
+  s.lockdown_token = sbox_token_level_lockdown;
   s.prohibit_dynamic_code = true;  // ACG on (matches jitless)
   s.use_app_container = true;
   s.low_privilege_app_container = true;
@@ -701,10 +701,10 @@ bool ApplyTrustedConsistent(std::string* detail) {
   s.tier = v8host::kTierTrusted;
   s.effective_tier = v8host::kTierTrusted;
   s.prohibit_dynamic_code = false;
-  s.integrity = sbox_integrity_low;
-  s.delayed_integrity = sbox_integrity_untrusted;
-  s.initial_token = sbox_token_restricted_same_access;
-  s.lockdown_token = sbox_token_lockdown;
+  s.integrity = sbox_integrity_level_low;
+  s.delayed_integrity = sbox_integrity_level_untrusted;
+  s.initial_token = sbox_token_level_restricted_same_access;
+  s.lockdown_token = sbox_token_level_lockdown;
   s.engine_dll = "v8jsi.dll";
   const sbox_config_api api = MakeConfigApi();
   sbox_config_s cfg;
@@ -725,10 +725,10 @@ bool ApplyRejectsTrustedUnderAcg(std::string* detail) {
   s.tier = v8host::kTierTrusted;
   s.effective_tier = v8host::kTierTrusted;
   s.prohibit_dynamic_code = true;  // ACG on -> inconsistent with JIT
-  s.integrity = sbox_integrity_low;
-  s.delayed_integrity = sbox_integrity_untrusted;
-  s.initial_token = sbox_token_restricted_same_access;
-  s.lockdown_token = sbox_token_lockdown;
+  s.integrity = sbox_integrity_level_low;
+  s.delayed_integrity = sbox_integrity_level_untrusted;
+  s.initial_token = sbox_token_level_restricted_same_access;
+  s.lockdown_token = sbox_token_level_lockdown;
   s.engine_dll = "v8jsi.dll";
   const sbox_config_api api = MakeConfigApi();
   sbox_config_s cfg;
@@ -743,10 +743,10 @@ bool ApplyRejectsJitlessWithoutAcg(std::string* detail) {
   s.tier = v8host::kTierUntrusted;
   s.effective_tier = v8host::kTierUntrusted;
   s.prohibit_dynamic_code = false;  // ACG off -> inconsistent with jitless
-  s.integrity = sbox_integrity_low;
-  s.delayed_integrity = sbox_integrity_untrusted;
-  s.initial_token = sbox_token_restricted_same_access;
-  s.lockdown_token = sbox_token_lockdown;
+  s.integrity = sbox_integrity_level_low;
+  s.delayed_integrity = sbox_integrity_level_untrusted;
+  s.initial_token = sbox_token_level_restricted_same_access;
+  s.lockdown_token = sbox_token_level_lockdown;
   s.engine_dll = "v8jsisb.dll";
   const sbox_config_api api = MakeConfigApi();
   sbox_config_s cfg;
@@ -786,19 +786,19 @@ bool ApplyLowersNonDefaultTokens(std::string* detail) {
   // unnoticed there. Use tokens that DIFFER from the defaults so the lowering is
   // actually observed end-to-end (builder + marshaled policy).
   V8HostSpawnConfigV1 s = SampleSpawnConfig();
-  s.initial_token = sbox_token_restricted_non_admin;
-  s.lockdown_token = sbox_token_limited;
+  s.initial_token = sbox_token_level_restricted_non_admin;
+  s.lockdown_token = sbox_token_level_limited;
   const sbox_config_api api = MakeConfigApi();
   sbox_config_s cfg;
   CHECK(v8host::ApplySpawnConfig(s, &api, &cfg), "apply must succeed");
-  CHECK(cfg.initial_token == sbox_token_restricted_non_admin,
+  CHECK(cfg.initial_token == sbox_token_level_restricted_non_admin,
         "non-default initial token lowered");
-  CHECK(cfg.lockdown_token == sbox_token_limited,
+  CHECK(cfg.lockdown_token == sbox_token_level_limited,
         "non-default lockdown token lowered");
   SboxConfigMarshal m;
   CHECK(MarshalSboxConfig(cfg, L"v8host.dll", m), "marshal must succeed");
-  CHECK(m.policy.initial_token == sbox_token_restricted_non_admin &&
-            m.policy.lockdown_token == sbox_token_limited,
+  CHECK(m.policy.initial_token == sbox_token_level_restricted_non_admin &&
+            m.policy.lockdown_token == sbox_token_level_limited,
         "policy carries the non-default tokens");
   return true;
 }

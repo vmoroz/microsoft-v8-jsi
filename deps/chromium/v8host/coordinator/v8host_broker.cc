@@ -139,10 +139,10 @@ class BrokerService {
 
   sbox_status Run() {
     if (!security_.Initialize(sid_))
-      return sbox_error;
+      return sbox_status_failed;
     bool first = true;
     bool first_accept = false;
-    sbox_status result = sbox_ok;
+    sbox_status result = sbox_status_ok;
     auto zero_since = std::chrono::steady_clock::now();
     bool zero_timing = false;
     std::chrono::steady_clock::time_point listen_start;
@@ -165,12 +165,12 @@ class BrokerService {
           const bool winner_ok = AuthenticateWinningBroker();
           if (!winner_ok)
             printf("[v8host] shared race: winner authentication failed\n");
-          return winner_ok ? sbox_ok : sbox_error;
+          return winner_ok ? sbox_status_ok : sbox_status_failed;
         }
         printf("[v8host] pipe creation failed category=%lu first=%d\n",
                pipe_error, first ? 1 : 0);
         CancelConnections();
-        result = sbox_error;
+        result = sbox_status_failed;
         break;
       }
       if (first)
@@ -181,7 +181,7 @@ class BrokerService {
       if (!overlapped.hEvent) {
         ::CloseHandle(pipe);
         CancelConnections();
-        result = sbox_error;
+        result = sbox_status_failed;
         break;
       }
       bool connected = false;
@@ -251,7 +251,7 @@ class BrokerService {
     tasks_.clear();
     std::lock_guard<std::mutex> lock(mutex_);
     if (setup_count_ || connection_count_ || !connections_.empty()) drain_failed_ = true;
-    return drain_failed_ ? sbox_error : result;
+    return drain_failed_ ? sbox_status_failed : result;
   }
 
  private:
@@ -469,36 +469,36 @@ sbox_status RunBrokerApiOwnershipTest(sbox_broker broker,
   int32_t exit_code = 0;
   const std::vector<uint8_t> oversize(64 * 1024 + 1, 0);
   if (api->configure_and_spawn(nullptr, nullptr, 0, nullptr, nullptr,
-                               &worker) != sbox_error_args ||
+                               &worker) != sbox_status_invalid_arg ||
       api->configure_and_spawn(broker, nullptr, 0, nullptr, nullptr, nullptr) !=
-          sbox_error_args ||
+          sbox_status_invalid_arg ||
       api->configure_and_spawn(broker, oversize.data(), oversize.size(),
-                               nullptr, nullptr, &worker) != sbox_error_args ||
-      api->post_message(nullptr, sbox_msg_string, "x", 1) != sbox_error_args ||
-      api->close(nullptr) != sbox_error_args ||
-      api->wait(nullptr, &exit_code) != sbox_error_args)
-    return sbox_error;
+                               nullptr, nullptr, &worker) != sbox_status_invalid_arg ||
+      api->post_message(nullptr, sbox_msg_kind_string, "x", 1) != sbox_status_invalid_arg ||
+      api->close(nullptr) != sbox_status_invalid_arg ||
+      api->wait(nullptr, &exit_code) != sbox_status_invalid_arg)
+    return sbox_status_failed;
 
   if (mode[0] == L'l') {  // "leak": abandon a spawned worker for host cleanup.
     worker = nullptr;
     if (api->configure_and_spawn(broker, nullptr, 0, nullptr, nullptr,
-                                 &worker) != sbox_ok ||
+                                 &worker) != sbox_status_ok ||
         !worker)
-      return sbox_error;
-    return sbox_ok;
+      return sbox_status_failed;
+    return sbox_status_ok;
   }
 
   worker = nullptr;
   if (api->configure_and_spawn(broker, nullptr, 0, nullptr, nullptr, &worker) !=
-          sbox_ok ||
+          sbox_status_ok ||
       !worker)
-    return sbox_error;
-  api->post_message(worker, sbox_msg_string, "ping", 4);
-  if (api->close(worker) != sbox_ok || api->close(worker) != sbox_ok)
-    return sbox_error;  // close is idempotent
-  if (api->wait(worker, &exit_code) != sbox_ok)
-    return sbox_error;  // single destructive wait
-  return sbox_ok;
+    return sbox_status_failed;
+  api->post_message(worker, sbox_msg_kind_string, "ping", 4);
+  if (api->close(worker) != sbox_status_ok || api->close(worker) != sbox_status_ok)
+    return sbox_status_failed;  // close is idempotent
+  if (api->wait(worker, &exit_code) != sbox_status_ok)
+    return sbox_status_failed;  // single destructive wait
+  return sbox_status_ok;
 }
 #endif  // SBOX_DEV_ALLOW_UNSIGNED
 
@@ -522,7 +522,7 @@ sbox_status V8HostBrokerRun(sbox_broker broker,
       !start->plugin_final_path ||
       (start->mode != sbox_broker_mode_shared &&
        start->mode != sbox_broker_mode_dedicated))
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
 
   DWORD error = ERROR_SUCCESS;
   v8host::PayloadIdentity payload;
@@ -541,20 +541,20 @@ sbox_status V8HostBrokerRun(sbox_broker broker,
       !v8host::ComputePluginSetId(
           start->native_machine, payload.container.sha256(),
           payload.plugin.sha256(), &payload.plugin_set_id))
-    return sbox_error;
+    return sbox_status_failed;
   payload.native_machine = start->native_machine;
   if (!v8host::DeriveInstallRoot(payload.container.final_path(),
                                  payload.native_machine, &payload.install_root))
-    return sbox_error;
+    return sbox_status_failed;
   std::vector<uint8_t> sid;
   LUID session = {};
   if (!v8host::QueryCurrentSidAndSession(&sid, &session, &error))
-    return sbox_error;
+    return sbox_status_failed;
   std::array<uint8_t, 16> nonce = {};
   const std::array<uint8_t, 16>* nonce_ptr = nullptr;
   if (start->mode == sbox_broker_mode_dedicated) {
     if (!start->dedicated_nonce || start->dedicated_nonce_size != nonce.size())
-      return sbox_error_args;
+      return sbox_status_invalid_arg;
     std::memcpy(nonce.data(), start->dedicated_nonce, nonce.size());
     nonce_ptr = &nonce;
   }
@@ -567,7 +567,7 @@ sbox_status V8HostBrokerRun(sbox_broker broker,
               : v8host::BrokerMode::kDedicated,
           nonce_ptr, &expected_endpoint, &endpoint_key) ||
       expected_endpoint != start->endpoint_name)
-    return sbox_error;
+    return sbox_status_failed;
   printf("[v8host] broker endpoint=%s mode=%s pid=%lu\n",
          v8host::HexPrefix(endpoint_key, 6).c_str(),
          start->mode == sbox_broker_mode_shared ? "shared" : "dedicated",

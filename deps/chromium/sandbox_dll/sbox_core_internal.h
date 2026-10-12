@@ -32,11 +32,11 @@
 // sbox_* ABI is resolved at link time, not across a DLL boundary. Plain
 // extern "C" keeps the symbols out of the export table (the EXE must export
 // nothing). Checked BEFORE SBOX_DLL_IMPL because sbox_dll.cc self-defines that.
-#define SBOX_API extern "C"
+#define SBOX_CORE_API extern "C"
 #elif defined(SBOX_DLL_IMPL)
-#define SBOX_API extern "C" __declspec(dllexport)
+#define SBOX_CORE_API extern "C" __declspec(dllexport)
 #else
-#define SBOX_API extern "C" __declspec(dllimport)
+#define SBOX_CORE_API extern "C" __declspec(dllimport)
 #endif
 
 // --- abstract, ABI-safe levels (mapped to sandbox enums inside the DLL) ---
@@ -117,7 +117,7 @@ typedef struct SboxPolicy {
 // Spawn `target_exe` as a locked-down sandbox target per `policy`, wire the
 // broker<->target IPC channel, relay the bootstrap, run it to completion, and
 // return the target's exit code (0 = the target reported success).
-SBOX_API int sbox_broker_run(const wchar_t* target_exe, const SboxPolicy* policy);
+SBOX_CORE_API int sbox_broker_run(const wchar_t* target_exe, const SboxPolicy* policy);
 
 // Opaque handles (defined inside sbox.dll).
 typedef struct SboxTarget SboxTarget;
@@ -158,21 +158,21 @@ typedef void (*SboxMessageCb)(void* ctx, int kind, const void* data, size_t len)
 typedef struct SboxSession SboxSession;
 // Creation returns nullptr on unsupported platforms or invalid policies and
 // writes a broker diagnostic. No target is resumed after setup failure.
-SBOX_API SboxSession* sbox_broker_spawn(const wchar_t* target_exe,
+SBOX_CORE_API SboxSession* sbox_broker_spawn(const wchar_t* target_exe,
                                         const SboxPolicy* policy,
                                         SboxMessageCb on_message, void* ctx);
-SBOX_API int sbox_broker_post_message(SboxSession* session, int kind,
+SBOX_CORE_API int sbox_broker_post_message(SboxSession* session, int kind,
                                       const void* data, size_t len);
 // Signal the target to close the channel (host-initiated, out-of-band). A target
 // running an event loop on the channel can wait on sbox_target_close_event and
 // exit cleanly when this fires. Idempotent (the close event is manual-reset).
-SBOX_API int sbox_broker_close(SboxSession* session);
-SBOX_API int sbox_broker_wait(SboxSession* session);  // -> target exit code
+SBOX_CORE_API int sbox_broker_close(SboxSession* session);
+SBOX_CORE_API int sbox_broker_wait(SboxSession* session);  // -> target exit code
 
 // Target message API. Post is fire-and-forget; inbound messages are delivered by
 // the target draining its inbound ring whenever its inbound event is signaled
 // (so the host controls which thread runs the handler — e.g. the JS thread).
-SBOX_API int sbox_target_post_message(SboxTarget* target, int kind,
+SBOX_CORE_API int sbox_target_post_message(SboxTarget* target, int kind,
                                       const void* data, size_t len);
 // Container-only readiness markers posted on the worker->broker ring with kind
 // SBOX_MSG_LIFECYCLE and a u32 phase payload. Emitted by the generic RunWorker at
@@ -182,14 +182,14 @@ using SboxLifecyclePhase = sbox_lifecycle_phase;
 #if defined(SBOX_DEV_ALLOW_UNSIGNED)
 extern uint32_t g_sbox_lifecycle_test_failure;
 #endif
-SBOX_API int sbox_target_post_lifecycle(SboxTarget* target, uint32_t phase);
-SBOX_API void* sbox_target_inbound_event(SboxTarget* target);  // HANDLE to wait on
-SBOX_API int sbox_target_drain_messages(SboxTarget* target, SboxMessageCb cb,
+SBOX_CORE_API int sbox_target_post_lifecycle(SboxTarget* target, uint32_t phase);
+SBOX_CORE_API void* sbox_target_inbound_event(SboxTarget* target);  // HANDLE to wait on
+SBOX_CORE_API int sbox_target_drain_messages(SboxTarget* target, SboxMessageCb cb,
                                         void* ctx);
 // HANDLE the broker SIGNALS (via sbox_broker_close) to ask the target to shut
 // down its channel loop. Manual-reset, so once closed it stays signaled. NULL if
 // the channel was not mapped.
-SBOX_API void* sbox_target_close_event(SboxTarget* target);
+SBOX_CORE_API void* sbox_target_close_event(SboxTarget* target);
 
 // --- target role (used by the app-defined target EXE, e.g. v8host.exe) ---
 
@@ -198,28 +198,28 @@ SBOX_API void* sbox_target_close_event(SboxTarget* target);
 // up the IPC client. Returns NULL on failure, including a missing seed (fail
 // closed). Call BEFORE doing any guest warmup; the returned handle is used for
 // the calls below.
-SBOX_API SboxTarget* sbox_target_begin(void);
+SBOX_CORE_API SboxTarget* sbox_target_begin(void);
 
 // Prove the broker<->target IPC channel (a cross-call ping). Returns 1 on OK.
-SBOX_API int sbox_target_test_ipc(SboxTarget* target);
+SBOX_CORE_API int sbox_target_test_ipc(SboxTarget* target);
 
 // Install the ntdll file interceptions (so denied, policy-allowed opens auto-
 // route to the broker) and drop to the restricted token + delayed integrity +
 // mitigations. Call AFTER all guest warmup (ACG forbids patching/codegen after).
-SBOX_API int sbox_target_lower_token(SboxTarget* target);
+SBOX_CORE_API int sbox_target_lower_token(SboxTarget* target);
 
 // Worker-only: return the broker's opaque plugin_data blob (carried inline in
 // the same-image seed), or (nullptr, 0) if none was set. The bytes live for the
 // worker's lifetime; the generic core never interprets them. Returns 1 on
 // success, 0 on bad args.
-SBOX_API int sbox_target_plugin_data(SboxTarget* target, const void** data,
+SBOX_CORE_API int sbox_target_plugin_data(SboxTarget* target, const void** data,
                                      size_t* len);
 
 // Worker-only: 1 if ACG (dynamic-code-disable) is armed for this worker (from
 // the delayed mitigations the broker seeded), else 0.
-SBOX_API int sbox_target_acg_enabled(SboxTarget* target);
+SBOX_CORE_API int sbox_target_acg_enabled(SboxTarget* target);
 
 // Release the target handle (does not terminate the process).
-SBOX_API void sbox_target_end(SboxTarget* target);
+SBOX_CORE_API void sbox_target_end(SboxTarget* target);
 
 #endif  // SANDBOX_DLL_SBOX_CORE_INTERNAL_H_

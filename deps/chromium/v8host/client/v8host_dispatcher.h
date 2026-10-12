@@ -17,7 +17,7 @@
 //   - Producers POST work (never block) to the window; callbacks run ONLY on
 //     the app thread, drained by the window procedure, never under a lock.
 //   - Each session has a bounded FIFO; overflow fails the session with one
-//     terminal V8HOST_E_CALLBACK_BACKPRESSURE and drops later events.
+//     terminal v8host_status_callback_backpressure and drops later events.
 //   - Each queued event carries the callback-table snapshot captured when it
 //     was queued; set_callbacks atomically replaces the table for FUTURE posts.
 //   - close marks the session closed immediately, suppresses pending callbacks,
@@ -51,7 +51,7 @@ void FailNextCallbackCopyForTesting();
 // Fixed, documented cap on the number of callback events buffered per session
 // before the app thread must drain. Reaching it means the consumer stopped
 // pumping its message loop; the session is failed with one terminal
-// V8HOST_E_CALLBACK_BACKPRESSURE rather than growing unbounded or blocking an
+// v8host_status_callback_backpressure rather than growing unbounded or blocking an
 // I/O thread. 256 is large enough to absorb normal bursts yet bounds a stalled
 // consumer to a small, fixed footprint.
 inline constexpr size_t kSessionQueueCapacity = 256;
@@ -78,9 +78,9 @@ class Dispatcher {
   // on it (the caller must own a Windows message queue). Later calls succeed
   // without changing the captured thread. Calls racing the first initialize
   // from another thread wait on a condition variable until it finishes; they do
-  // not pump messages. Returns V8HOST_OK on success, V8HOST_E_INTERNAL if the
+  // not pump messages. Returns v8host_status_ok on success, v8host_status_internal_error if the
   // window could not be created.
-  V8HostStatus Initialize();
+  v8host_status Initialize();
 
   bool IsInitialized() const { return ready_.load(std::memory_order_acquire); }
 
@@ -109,26 +109,26 @@ class Dispatcher {
   // Releases the scoped reference. A session whose owner called CloseAndRelease
   // is unregistered first (also under `sessions_mutex_`), so a racing producer
   // either acquires a live reference before the removal or finds nothing after
-  // it and drops with V8HOST_E_INVALID_STATE -- it never dereferences a freed
+  // it and drops with v8host_status_invalid_state -- it never dereferences a freed
   // object. `sessions_mutex_` is always released before the per-session `mutex_`
   // is taken, so there is no lock-order inversion with UnregisterSession.
   //
-  // Each returns V8HOST_E_INVALID_STATE if `id` is unknown (never created or
+  // Each returns v8host_status_invalid_state if `id` is unknown (never created or
   // already closed); otherwise the status of the underlying per-session call.
-  V8HostStatus PostSessionState(uint64_t id, int32_t state, V8HostStatus status);
-  V8HostStatus PostRunEvent(uint64_t id,
-                            V8HostRun* run,
+  v8host_status PostSessionState(uint64_t id, int32_t state, v8host_status status);
+  v8host_status PostRunEvent(uint64_t id,
+                            v8host_run_s* run,
                             RunTerminalArbiter* arbiter,
                             bool terminal,
                             int32_t event,
-                            V8HostStatus status);
-  V8HostStatus PostRelay(uint64_t id,
-                         V8HostRun* run,
+                            v8host_status status);
+  v8host_status PostRelay(uint64_t id,
+                         v8host_run_s* run,
                          int32_t kind,
                          const void* data,
                          size_t len);
-  V8HostStatus PostDisconnect(uint64_t id);
-  V8HostStatus SetCallbacks(uint64_t id, const V8HostCallbacks* callbacks);
+  v8host_status PostDisconnect(uint64_t id);
+  v8host_status SetCallbacks(uint64_t id, const v8host_callbacks* callbacks);
 
   // Session registry management (internal). AllocateSessionId + RegisterSession
   // are called by SessionDispatch::Create; UnregisterSession by CloseAndRelease.
@@ -214,13 +214,13 @@ class RunTerminalArbiter {
 class SessionDispatch {
  public:
   // Creates a session dispatch bound to `dispatcher` (which must be
-  // initialized). `handle` is the opaque V8HostSession* echoed to on_session_
+  // initialized). `handle` is the opaque v8host_session_s* echoed to on_session_
   // state (a cookie to this layer; the public client binds it to the real handle).
   // `failed_state` is the session-state code delivered with the synthetic
   // backpressure terminal (the client's "session failed/closed" state value).
   // Returns nullptr on bad arguments or allocation failure (fail closed).
   static SessionDispatch* Create(Dispatcher* dispatcher,
-                                 V8HostSession* handle,
+                                 v8host_session_s* handle,
                                  int32_t failed_state);
 
   SessionDispatch(const SessionDispatch&) = delete;
@@ -251,7 +251,7 @@ class SessionDispatch {
   // surface — producers post by id through the Dispatcher.
   bool closed() const;
 
-  V8HostSession* handle() const { return handle_; }
+  v8host_session_s* handle() const { return handle_; }
 
   // Diagnostic: number of live SessionDispatch objects, for leak/use-after-free
   // checks in tests.
@@ -275,25 +275,25 @@ class SessionDispatch {
   // context) are copied; no consumer pointer is retained. NULL members decline
   // their callback. Rejects a null pointer (INVALID_ARG), an undersized struct
   // (STRUCT_SIZE), or a closed session (INVALID_STATE).
-  V8HostStatus SetCallbacks(const V8HostCallbacks* callbacks);
+  v8host_status SetCallbacks(const v8host_callbacks* callbacks);
 
   // Each snapshots the current table, enqueues one event, and schedules an
-  // app-thread drain. Return V8HOST_OK when accepted,
-  // V8HOST_E_CALLBACK_BACKPRESSURE if the queue overflowed (the session is now
-  // failed), V8HOST_E_RUN_TERMINAL if a terminal run event lost arbitration,
-  // V8HOST_E_INVALID_STATE if the session is closed, or V8HOST_E_INTERNAL if the
+  // app-thread drain. Return v8host_status_ok when accepted,
+  // v8host_status_callback_backpressure if the queue overflowed (the session is now
+  // failed), v8host_status_run_terminal if a terminal run event lost arbitration,
+  // v8host_status_invalid_state if the session is closed, or v8host_status_internal_error if the
   // drain could not be scheduled.
-  V8HostStatus PostSessionState(int32_t state, V8HostStatus status);
-  V8HostStatus PostRunEvent(V8HostRun* run,
+  v8host_status PostSessionState(int32_t state, v8host_status status);
+  v8host_status PostRunEvent(v8host_run_s* run,
                             RunTerminalArbiter* arbiter,
                             bool terminal,
                             int32_t event,
-                            V8HostStatus status);
-  V8HostStatus PostRelay(V8HostRun* run,
+                            v8host_status status);
+  v8host_status PostRelay(v8host_run_s* run,
                          int32_t kind,
                          const void* data,
                          size_t len);
-  V8HostStatus PostDisconnect();
+  v8host_status PostDisconnect();
 
   enum class EventKind : uint8_t {
     kSessionState,
@@ -304,20 +304,20 @@ class SessionDispatch {
 
   struct Event {
     EventKind kind = EventKind::kSessionState;
-    V8HostCallbacks table{};  // snapshot captured at post time (zero = decline)
-    V8HostRun* run = nullptr;
+    v8host_callbacks table{};  // snapshot captured at post time (zero = decline)
+    v8host_run_s* run = nullptr;
     int32_t code = 0;  // session state / run event / relay kind
-    V8HostStatus status = V8HOST_OK;
+    v8host_status status = v8host_status_ok;
     std::vector<uint8_t> data;  // owned copy of a relay payload
   };
 
   SessionDispatch(Dispatcher* dispatcher,
                   uint64_t id,
-                  V8HostSession* handle,
+                  v8host_session_s* handle,
                   int32_t failed_state);
   ~SessionDispatch();
 
-  V8HostStatus Enqueue(Event&& event,
+  v8host_status Enqueue(Event&& event,
                        bool terminal_run,
                        RunTerminalArbiter* arbiter);
   bool EnsureScheduledLocked();
@@ -327,13 +327,13 @@ class SessionDispatch {
 
   Dispatcher* const dispatcher_;
   const uint64_t id_;
-  V8HostSession* const handle_;
+  v8host_session_s* const handle_;
   const int32_t failed_state_;
 
   std::atomic<int> refcount_{1};
 
   mutable std::mutex mutex_;
-  V8HostCallbacks current_table_{};  // live table; copied into each event
+  v8host_callbacks current_table_{};  // live table; copied into each event
   std::deque<Event> queue_;
   bool closed_ = false;
   bool backpressure_failed_ = false;

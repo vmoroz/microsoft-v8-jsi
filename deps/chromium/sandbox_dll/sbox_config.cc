@@ -4,17 +4,17 @@
 
 // The plugin passes sbox.h's integrity constants straight into the builder; pin
 // them to the core's SboxIntegrityLevel enum so the SboxPolicy values are 1:1.
-static_assert(static_cast<int>(sbox_integrity_low) ==
+static_assert(static_cast<int>(sbox_integrity_level_low) ==
                       static_cast<int>(SBOX_INTEGRITY_LOW) &&
-                  static_cast<int>(sbox_integrity_untrusted) ==
+                  static_cast<int>(sbox_integrity_level_untrusted) ==
                       static_cast<int>(SBOX_INTEGRITY_UNTRUSTED),
               "sbox.h integrity levels must match SboxIntegrityLevel");
 
 // Pin sbox.h's public token levels to the core's SboxTokenLevel, so set_tokens'
 // ints lower 1:1 to the builder (mirrors the integrity pin above).
-static_assert(static_cast<int>(sbox_token_lockdown) ==
+static_assert(static_cast<int>(sbox_token_level_lockdown) ==
                       static_cast<int>(SBOX_TOKEN_LOCKDOWN) &&
-                  static_cast<int>(sbox_token_restricted_same_access) ==
+                  static_cast<int>(sbox_token_level_restricted_same_access) ==
                       static_cast<int>(SBOX_TOKEN_RESTRICTED_SAME_ACCESS),
               "sbox.h token levels must match SboxTokenLevel");
 
@@ -46,90 +46,90 @@ bool IsBareFilename(const std::wstring& name) {
 // --- sbox_config_api setters (contract in sbox.h). Each returns sbox_status and,
 // on rejection, poisons the builder so a later MarshalSboxConfig refuses to
 // spawn. A null builder is a caller bug (args) and does not poison anything. ---
-sbox_status SBOX_CALL CfgSetAcg(sbox_config c, int enable) {
+sbox_status SBOX_CDECL CfgSetAcg(sbox_config c, int enable) {
   if (!c)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   c->acg = enable != 0;
-  return sbox_ok;
+  return sbox_status_ok;
 }
-sbox_status SBOX_CALL CfgSetIntegrity(sbox_config c, int initial, int delayed) {
+sbox_status SBOX_CDECL CfgSetIntegrity(sbox_config c, int initial, int delayed) {
   if (!c)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   if (!IsKnownIntegrity(initial) || !IsKnownIntegrity(delayed))
-    return Poison(c, sbox_error_args);
+    return Poison(c, sbox_status_invalid_arg);
   c->initial_integrity = initial;
   c->delayed_integrity = delayed;
-  return sbox_ok;
+  return sbox_status_ok;
 }
-sbox_status SBOX_CALL CfgSetTokens(sbox_config c, int initial_token,
+sbox_status SBOX_CDECL CfgSetTokens(sbox_config c, int initial_token,
                                    int lockdown_token) {
   if (!c)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   if (!IsKnownToken(initial_token) || !IsKnownToken(lockdown_token))
-    return Poison(c, sbox_error_args);
+    return Poison(c, sbox_status_invalid_arg);
   c->initial_token = initial_token;
   c->lockdown_token = lockdown_token;
-  return sbox_ok;
+  return sbox_status_ok;
 }
-sbox_status SBOX_CALL CfgAddFileRule(sbox_config c, const wchar_t* pattern,
+sbox_status SBOX_CDECL CfgAddFileRule(sbox_config c, const wchar_t* pattern,
                                      int readonly) {
   if (!c)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   if (!pattern || !pattern[0])
-    return Poison(c, sbox_error_args);
+    return Poison(c, sbox_status_invalid_arg);
   if (c->file_patterns.size() >= kSboxMaxFileRules)
-    return Poison(c, sbox_error);  // quota
+    return Poison(c, sbox_status_failed);  // quota
   c->file_patterns.emplace_back(pattern);
   c->file_readonly.push_back(readonly ? 1 : 0);
-  return sbox_ok;
+  return sbox_status_ok;
 }
-sbox_status SBOX_CALL CfgAddCapability(sbox_config c, const wchar_t* sid) {
+sbox_status SBOX_CDECL CfgAddCapability(sbox_config c, const wchar_t* sid) {
   if (!c)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   if (!sid || !sid[0])
-    return Poison(c, sbox_error_args);
+    return Poison(c, sbox_status_invalid_arg);
   if (c->capabilities.size() >= kSboxMaxCapabilities)
-    return Poison(c, sbox_error);  // quota
+    return Poison(c, sbox_status_failed);  // quota
   c->capabilities.emplace_back(sid);
-  return sbox_ok;
+  return sbox_status_ok;
 }
-sbox_status SBOX_CALL CfgSetAppContainer(sbox_config c, int enable, int lpac,
+sbox_status SBOX_CDECL CfgSetAppContainer(sbox_config c, int enable, int lpac,
                                          const wchar_t* profile) {
   if (!c)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   const bool want_ac = enable != 0;
   const bool want_lpac = lpac != 0;
   const bool have_profile = profile && profile[0];
   // An empty profile is legal only when AppContainer is off; LPAC implies
   // AppContainer. Reject (and poison) the illegal single-call combinations.
   if (want_ac && !have_profile)
-    return Poison(c, sbox_error_args);
+    return Poison(c, sbox_status_invalid_arg);
   if (want_lpac && !want_ac)
-    return Poison(c, sbox_error_args);
+    return Poison(c, sbox_status_invalid_arg);
   c->use_app_container = want_ac;
   c->lpac = want_lpac;
   c->profile = have_profile ? profile : L"";
-  return sbox_ok;
+  return sbox_status_ok;
 }
-sbox_status SBOX_CALL CfgAllowEngineDll(sbox_config c, const wchar_t* filename) {
+sbox_status SBOX_CDECL CfgAllowEngineDll(sbox_config c, const wchar_t* filename) {
   if (!c)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   if (!filename || !IsBareFilename(filename))
-    return Poison(c, sbox_error_args);
+    return Poison(c, sbox_status_invalid_arg);
   c->engine_dlls.emplace_back(filename);
-  return sbox_ok;
+  return sbox_status_ok;
 }
-sbox_status SBOX_CALL CfgSetPluginData(sbox_config c, const void* data,
+sbox_status SBOX_CDECL CfgSetPluginData(sbox_config c, const void* data,
                                        size_t len) {
   if (!c)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   if (len > kSboxMaxPluginData)
-    return Poison(c, sbox_error);  // quota
+    return Poison(c, sbox_status_failed);  // quota
   if (data && len)
     c->plugin_data.assign(static_cast<const char*>(data), len);
   else
     c->plugin_data.clear();
-  return sbox_ok;
+  return sbox_status_ok;
 }
 
 sbox_config_api MakeConfigApi() {

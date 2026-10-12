@@ -38,11 +38,11 @@ class ClientTransport {
   // SendFrame copies and enqueues: OK is not delivery; QUOTA admits nothing,
   // CONNECT means closed/terminal, and PROTOCOL means an invalid frame.
   // Close is idempotent, nonblocking and callable from a callback.
-  virtual V8HostStatus Start() = 0;
-  virtual V8HostStatus Start(std::shared_ptr<ClientTransportDelegate> delegate) {
+  virtual v8host_status Start() = 0;
+  virtual v8host_status Start(std::shared_ptr<ClientTransportDelegate> delegate) {
     return Start();
   }
-  virtual V8HostStatus SendFrame(const uint8_t* bytes, size_t len) = 0;
+  virtual v8host_status SendFrame(const uint8_t* bytes, size_t len) = 0;
   virtual uint32_t conn_id() const = 0;
   virtual void Close() = 0;
 #ifdef V8HOST_CLIENT_TESTING
@@ -70,13 +70,13 @@ ClientTransport* CreateRealPipeClientTransport(const TransportParams& params,
 
 #ifdef V8HOST_CLIENT_TESTING
 void SetSubmissionHooksForTesting(void (*before)(), void (*admitted)());
-V8HostStatus SubmitCancelForTesting(V8HostSession* session, uint32_t run);
-void SetIdsForTesting(V8HostSession* session, uint32_t request, uint32_t run);
+v8host_status SubmitCancelForTesting(v8host_session_s* session, uint32_t run);
+void SetIdsForTesting(v8host_session_s* session, uint32_t request, uint32_t run);
 void SetTransportFactoryForTesting(ClientTransportFactory factory);
 void SetInitializeAfterDispatcherHookForTesting(void (*hook)());
 uint32_t LifecycleThreadIdForTesting();
 uint32_t LastSessionDeleteThreadIdForTesting();
-void SetInboundStatusObserverForTesting(void (*observer)(V8HostStatus));
+void SetInboundStatusObserverForTesting(void (*observer)(v8host_status));
 #endif
 
 }  // namespace v8host::client

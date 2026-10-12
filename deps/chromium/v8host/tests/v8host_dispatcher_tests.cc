@@ -41,12 +41,12 @@ bool Fail(std::string* detail, const char* message) {
 }
 
 // Opaque cookies echoed back to callbacks. Never dereferenced by the dispatcher;
-// they stand in for the real V8HostSession*/V8HostRun* a client would pass.
-V8HostSession* FakeSession(uintptr_t n) {
-  return reinterpret_cast<V8HostSession*>(0x5E550000u + n);
+// they stand in for the real v8host_session_s*/v8host_run_s* a client would pass.
+v8host_session_s* FakeSession(uintptr_t n) {
+  return reinterpret_cast<v8host_session_s*>(0x5E550000u + n);
 }
-V8HostRun* FakeRun(uintptr_t n) {
-  return reinterpret_cast<V8HostRun*>(0x4A040000u + n);
+v8host_run_s* FakeRun(uintptr_t n) {
+  return reinterpret_cast<v8host_run_s*>(0x4A040000u + n);
 }
 
 // Pumps the app-thread message loop until `done()` holds or the deadline
@@ -106,21 +106,21 @@ class ManualEvent {
 // because the pump predicate reads it.
 struct Recorder {
   std::vector<int32_t> session_states;
-  std::vector<V8HostStatus> session_status;
+  std::vector<v8host_status> session_status;
   std::vector<int32_t> run_events;
   std::vector<int32_t> relay_kinds;
   std::vector<std::string> relay_data;
   int disconnects = 0;
   uint32_t last_thread_id = 0;
-  V8HostSession* last_session = nullptr;
-  V8HostRun* last_run = nullptr;
+  v8host_session_s* last_session = nullptr;
+  v8host_run_s* last_run = nullptr;
   std::atomic<int> total{0};
 };
 
-void V8HOST_CALL OnSessionState(void* context,
-                                V8HostSession* session,
+void V8HOST_CDECL OnSessionState(void* context,
+                                v8host_session_s* session,
                                 int32_t state,
-                                V8HostStatus status) {
+                                v8host_status status) {
   auto* r = static_cast<Recorder*>(context);
   r->last_thread_id = ::GetCurrentThreadId();
   r->last_session = session;
@@ -129,10 +129,10 @@ void V8HOST_CALL OnSessionState(void* context,
   r->total.fetch_add(1, std::memory_order_relaxed);
 }
 
-void V8HOST_CALL OnRunEvent(void* context,
-                            V8HostRun* run,
+void V8HOST_CDECL OnRunEvent(void* context,
+                            v8host_run_s* run,
                             int32_t event,
-                            V8HostStatus status) {
+                            v8host_status status) {
   auto* r = static_cast<Recorder*>(context);
   r->last_thread_id = ::GetCurrentThreadId();
   r->last_run = run;
@@ -141,8 +141,8 @@ void V8HOST_CALL OnRunEvent(void* context,
   r->total.fetch_add(1, std::memory_order_relaxed);
 }
 
-void V8HOST_CALL OnRelay(void* context,
-                         V8HostRun* run,
+void V8HOST_CDECL OnRelay(void* context,
+                         v8host_run_s* run,
                          int32_t kind,
                          const void* data,
                          size_t len) {
@@ -159,16 +159,16 @@ void V8HOST_CALL OnRelay(void* context,
   r->total.fetch_add(1, std::memory_order_relaxed);
 }
 
-void V8HOST_CALL OnDisconnect(void* context) {
+void V8HOST_CDECL OnDisconnect(void* context) {
   auto* r = static_cast<Recorder*>(context);
   r->last_thread_id = ::GetCurrentThreadId();
   r->disconnects++;
   r->total.fetch_add(1, std::memory_order_relaxed);
 }
 
-V8HostCallbacks MakeTable(Recorder* r) {
-  V8HostCallbacks t = {};
-  t.struct_size = sizeof(V8HostCallbacks);
+v8host_callbacks MakeTable(Recorder* r) {
+  v8host_callbacks t = {};
+  t.struct_size = sizeof(v8host_callbacks);
   t.context = r;
   t.on_session_state = &OnSessionState;
   t.on_run_event = &OnRunEvent;
@@ -189,13 +189,13 @@ bool AppThreadDeliveryAndOrdering(std::string* detail) {
   if (!sd)
     return Fail(detail, "create failed");
   const uint64_t id = sd->id();
-  V8HostCallbacks table = MakeTable(&rec);
+  v8host_callbacks table = MakeTable(&rec);
   G().SetCallbacks(id, &table);
 
   constexpr int kCount = 64;
   std::thread worker([&] {
     for (int i = 0; i < kCount; ++i)
-      G().PostSessionState(id, 1000 + i, V8HOST_OK);
+      G().PostSessionState(id, 1000 + i, v8host_status_ok);
   });
   worker.join();  // all posts enqueued before we pump: deterministic
 
@@ -229,19 +229,19 @@ bool AllCallbackKinds(std::string* detail) {
   Recorder rec;
   SessionDispatch* sd = SessionDispatch::Create(&G(), FakeSession(13), 42);
   const uint64_t id = sd->id();
-  V8HostCallbacks table = MakeTable(&rec);
+  v8host_callbacks table = MakeTable(&rec);
   G().SetCallbacks(id, &table);
 
-  V8HostRun* run = FakeRun(2);
+  v8host_run_s* run = FakeRun(2);
   RunTerminalArbiter arbiter;
   char payload[12];
   std::memcpy(payload, "relay-bytes", 11);
 
   std::thread worker([&] {
-    G().PostSessionState(id, 5, V8HOST_OK);
-    G().PostRunEvent(id, run, nullptr, /*terminal=*/false, 6, V8HOST_OK);
+    G().PostSessionState(id, 5, v8host_status_ok);
+    G().PostRunEvent(id, run, nullptr, /*terminal=*/false, 6, v8host_status_ok);
     G().PostRelay(id, run, 9, payload, 11);
-    G().PostRunEvent(id, run, &arbiter, /*terminal=*/true, 7, V8HOST_OK);
+    G().PostRunEvent(id, run, &arbiter, /*terminal=*/true, 7, v8host_status_ok);
     G().PostDisconnect(id);
   });
   worker.join();
@@ -280,15 +280,15 @@ bool IdempotentInit(std::string* detail) {
   const uint32_t app = G().callback_thread_id();
   if (app != ::GetCurrentThreadId())
     return Fail(detail, "app thread is not the test main thread");
-  if (G().Initialize() != V8HOST_OK)
+  if (G().Initialize() != v8host_status_ok)
     return Fail(detail, "reinitialize on app thread failed");
   if (G().callback_thread_id() != app)
     return Fail(detail, "callback thread changed on reinitialize");
 
-  std::atomic<V8HostStatus> worker_status{V8HOST_E_INTERNAL};
+  std::atomic<v8host_status> worker_status{v8host_status_internal_error};
   std::thread worker([&] { worker_status = G().Initialize(); });
   worker.join();
-  if (worker_status.load() != V8HOST_OK)
+  if (worker_status.load() != v8host_status_ok)
     return Fail(detail, "initialize from worker failed");
   if (G().callback_thread_id() != app)
     return Fail(detail, "callback thread changed from worker initialize");
@@ -314,8 +314,8 @@ bool ConcurrentInitNoDeadlock(std::string* detail) {
     threads.emplace_back([&] {
       arrived.fetch_add(1);
       go.Wait();  // release all racers together
-      const V8HostStatus status = d.Initialize();
-      if (status == V8HOST_OK)
+      const v8host_status status = d.Initialize();
+      if (status == v8host_status_ok)
         ok_count.fetch_add(1);
       const bool winner = d.callback_thread_id() == ::GetCurrentThreadId();
       if (winner) {
@@ -369,13 +369,13 @@ bool TableSnapshotAndReplace(std::string* detail) {
   SessionDispatch* sd = SessionDispatch::Create(&G(), FakeSession(4), 42);
   const uint64_t id = sd->id();
 
-  V8HostCallbacks table_a = MakeTable(&rec_a);
+  v8host_callbacks table_a = MakeTable(&rec_a);
   G().SetCallbacks(id, &table_a);
-  G().PostSessionState(id, 111, V8HOST_OK);  // snapshot A (not yet pumped)
+  G().PostSessionState(id, 111, v8host_status_ok);  // snapshot A (not yet pumped)
 
-  V8HostCallbacks table_b = MakeTable(&rec_b);
+  v8host_callbacks table_b = MakeTable(&rec_b);
   G().SetCallbacks(id, &table_b);
-  G().PostSessionState(id, 222, V8HOST_OK);  // snapshot B
+  G().PostSessionState(id, 222, v8host_status_ok);  // snapshot B
 
   PumpUntil([&] { return rec_a.total.load() >= 1 && rec_b.total.load() >= 1; });
 
@@ -387,15 +387,15 @@ bool TableSnapshotAndReplace(std::string* detail) {
 
   if (ok) {
     // Clear with a valid table whose members are all NULL: declines cleanly.
-    V8HostCallbacks cleared = {};
-    cleared.struct_size = sizeof(V8HostCallbacks);
+    v8host_callbacks cleared = {};
+    cleared.struct_size = sizeof(v8host_callbacks);
     G().SetCallbacks(id, &cleared);
-    G().PostSessionState(id, 333, V8HOST_OK);  // should be dropped on delivery
+    G().PostSessionState(id, 333, v8host_status_ok);  // should be dropped on delivery
 
     // Reinstall A and post a sentinel; FIFO guarantees 333 is processed before
     // the sentinel, so if 333 were delivered it would appear somewhere.
     G().SetCallbacks(id, &table_a);
-    G().PostSessionState(id, 999, V8HOST_OK);
+    G().PostSessionState(id, 999, v8host_status_ok);
     PumpUntil([&] { return rec_a.total.load() >= 2; });
 
     if (rec_a.session_states.size() != 2 || rec_a.session_states[1] != 999)
@@ -417,7 +417,7 @@ bool Backpressure(std::string* detail) {
   Recorder rec;
   SessionDispatch* sd = SessionDispatch::Create(&G(), FakeSession(5), 77);
   const uint64_t id = sd->id();
-  V8HostCallbacks table = MakeTable(&rec);
+  v8host_callbacks table = MakeTable(&rec);
   G().SetCallbacks(id, &table);
 
   const int cap = static_cast<int>(kSessionQueueCapacity);
@@ -429,10 +429,10 @@ bool Backpressure(std::string* detail) {
   // join()), so nothing drains and the queue fills. The worker never blocks.
   std::thread worker([&] {
     for (int i = 0; i < cap + 5; ++i) {
-      const V8HostStatus s = G().PostSessionState(id, 2000 + i, V8HOST_OK);
-      if (s == V8HOST_OK)
+      const v8host_status s = G().PostSessionState(id, 2000 + i, v8host_status_ok);
+      if (s == v8host_status_ok)
         accepted.fetch_add(1);
-      else if (s == V8HOST_E_CALLBACK_BACKPRESSURE)
+      else if (s == v8host_status_callback_backpressure)
         backpressured.fetch_add(1);
       else
         other.fetch_add(1);
@@ -455,7 +455,7 @@ bool Backpressure(std::string* detail) {
     if (rec.total.load() != 1)
       ok = Fail(detail, "expected exactly one delivered callback");
     else if (rec.session_states[0] != 77 ||
-             rec.session_status[0] != V8HOST_E_CALLBACK_BACKPRESSURE)
+             rec.session_status[0] != v8host_status_callback_backpressure)
       ok = Fail(detail, "terminal is not the backpressure failure");
     else if (rec.last_session != FakeSession(5))
       ok = Fail(detail, "terminal session handle not echoed");
@@ -464,8 +464,8 @@ bool Backpressure(std::string* detail) {
   if (ok) {
     // Post-after-terminal: the session stays failed, so a further post is
     // rejected with BACKPRESSURE and delivers nothing (no second terminal).
-    const V8HostStatus after = G().PostSessionState(id, 2999, V8HOST_OK);
-    if (after != V8HOST_E_CALLBACK_BACKPRESSURE)
+    const v8host_status after = G().PostSessionState(id, 2999, v8host_status_ok);
+    if (after != v8host_status_callback_backpressure)
       ok = Fail(detail, "post after terminal not rejected with backpressure");
     else {
       DrainRemaining();
@@ -490,26 +490,26 @@ struct ReentryCtx {
   bool swapped = false;
   bool closed_once = false;
   bool alive_after_close = false;
-  const V8HostCallbacks* table_b = nullptr;
+  const v8host_callbacks* table_b = nullptr;
   uint32_t tid = 0;
   std::atomic<int> total{0};
 };
 
-void V8HOST_CALL ReentrySessionCb(void* context,
-                                  V8HostSession* /*session*/,
+void V8HOST_CDECL ReentrySessionCb(void* context,
+                                  v8host_session_s* /*session*/,
                                   int32_t /*state*/,
-                                  V8HostStatus /*status*/) {
+                                  v8host_status /*status*/) {
   auto* x = static_cast<ReentryCtx*>(context);
   x->tid = ::GetCurrentThreadId();
   x->total.fetch_add(1, std::memory_order_relaxed);
 
   if (x->mode == 0 && x->reenter_budget > 0) {
     --x->reenter_budget;
-    G().PostSessionState(x->id, 9000 + x->reenter_budget, V8HOST_OK);
+    G().PostSessionState(x->id, 9000 + x->reenter_budget, v8host_status_ok);
   } else if (x->mode == 1 && !x->swapped) {
     x->swapped = true;
     G().SetCallbacks(x->id, x->table_b);          // swap table for future posts
-    G().PostSessionState(x->id, 777, V8HOST_OK);  // captured under table B
+    G().PostSessionState(x->id, 777, v8host_status_ok);  // captured under table B
   } else if (x->mode == 2 && !x->closed_once) {
     x->closed_once = true;
     x->sd->CloseAndRelease();                     // close from inside a callback
@@ -519,9 +519,9 @@ void V8HOST_CALL ReentrySessionCb(void* context,
   }
 }
 
-V8HostCallbacks MakeReentryTable(ReentryCtx* ctx) {
-  V8HostCallbacks t = {};
-  t.struct_size = sizeof(V8HostCallbacks);
+v8host_callbacks MakeReentryTable(ReentryCtx* ctx) {
+  v8host_callbacks t = {};
+  t.struct_size = sizeof(v8host_callbacks);
   t.context = ctx;
   t.on_session_state = &ReentrySessionCb;
   return t;
@@ -536,10 +536,10 @@ bool ReentrantPost(std::string* detail) {
   SessionDispatch* sd = SessionDispatch::Create(&G(), FakeSession(6), 42);
   ctx.sd = sd;
   ctx.id = sd->id();
-  V8HostCallbacks table = MakeReentryTable(&ctx);
+  v8host_callbacks table = MakeReentryTable(&ctx);
   G().SetCallbacks(ctx.id, &table);
 
-  G().PostSessionState(ctx.id, 1, V8HOST_OK);
+  G().PostSessionState(ctx.id, 1, v8host_status_ok);
   PumpUntil([&] { return ctx.total.load() >= 4; });
 
   bool ok = true;
@@ -562,12 +562,12 @@ bool ReentrantSetCallbacks(std::string* detail) {
   SessionDispatch* sd = SessionDispatch::Create(&G(), FakeSession(9), 42);
   ctx.sd = sd;
   ctx.id = sd->id();
-  V8HostCallbacks table_b = MakeTable(&rec_b);
+  v8host_callbacks table_b = MakeTable(&rec_b);
   ctx.table_b = &table_b;
-  V8HostCallbacks table_a = MakeReentryTable(&ctx);
+  v8host_callbacks table_a = MakeReentryTable(&ctx);
   G().SetCallbacks(ctx.id, &table_a);
 
-  G().PostSessionState(ctx.id, 1, V8HOST_OK);  // under A -> swaps to B, posts 777
+  G().PostSessionState(ctx.id, 1, v8host_status_ok);  // under A -> swaps to B, posts 777
   PumpUntil([&] { return ctx.total.load() >= 1 && rec_b.total.load() >= 1; });
 
   bool ok = true;
@@ -591,11 +591,11 @@ bool ReentrantClose(std::string* detail) {
   SessionDispatch* sd = SessionDispatch::Create(&G(), FakeSession(7), 42);
   ctx.sd = sd;
   ctx.id = sd->id();
-  V8HostCallbacks table = MakeReentryTable(&ctx);
+  v8host_callbacks table = MakeReentryTable(&ctx);
   G().SetCallbacks(ctx.id, &table);
 
   for (int i = 0; i < 5; ++i)
-    G().PostSessionState(ctx.id, 500 + i, V8HOST_OK);
+    G().PostSessionState(ctx.id, 500 + i, v8host_status_ok);
 
   // The first delivery closes the session; the remaining four are suppressed.
   PumpUntil([&] { return ctx.total.load() >= 1; });
@@ -622,11 +622,11 @@ bool OneTerminalPerRun(std::string* detail) {
   Recorder rec;
   SessionDispatch* sd = SessionDispatch::Create(&G(), FakeSession(10), 42);
   const uint64_t id = sd->id();
-  V8HostCallbacks table = MakeTable(&rec);
+  v8host_callbacks table = MakeTable(&rec);
   G().SetCallbacks(id, &table);
 
   RunTerminalArbiter arbiter;
-  V8HostRun* run = FakeRun(1);
+  v8host_run_s* run = FakeRun(1);
   constexpr int kThreads = 8;
   std::atomic<int> accepted{0};
   std::atomic<int> rejected{0};
@@ -634,12 +634,12 @@ bool OneTerminalPerRun(std::string* detail) {
   std::vector<std::thread> threads;
   for (int i = 0; i < kThreads; ++i) {
     threads.emplace_back([&, i] {
-      const V8HostStatus s = G().PostRunEvent(id, run, &arbiter,
+      const v8host_status s = G().PostRunEvent(id, run, &arbiter,
                                               /*terminal=*/true, 7000 + i,
-                                              V8HOST_OK);
-      if (s == V8HOST_OK)
+                                              v8host_status_ok);
+      if (s == v8host_status_ok)
         accepted.fetch_add(1);
-      else if (s == V8HOST_E_RUN_TERMINAL)
+      else if (s == v8host_status_run_terminal)
         rejected.fetch_add(1);
     });
   }
@@ -672,11 +672,11 @@ bool CloseSuppression(std::string* detail) {
   Recorder rec;
   SessionDispatch* sd = SessionDispatch::Create(&G(), FakeSession(11), 42);
   const uint64_t id = sd->id();
-  V8HostCallbacks table = MakeTable(&rec);
+  v8host_callbacks table = MakeTable(&rec);
   G().SetCallbacks(id, &table);
 
   for (int i = 0; i < 20; ++i)
-    G().PostSessionState(id, i, V8HOST_OK);  // queued, not pumped
+    G().PostSessionState(id, i, v8host_status_ok);  // queued, not pumped
   sd->CloseAndRelease();                     // non-blocking; suppresses the queue
 
   DrainRemaining();  // stray drain sees closed_, releases, delivers nothing
@@ -699,12 +699,12 @@ bool CloseFromCallbackStress(std::string* detail) {
     SessionDispatch* sd = SessionDispatch::Create(&G(), FakeSession(12), 42);
     ctx.sd = sd;
     ctx.id = sd->id();
-    V8HostCallbacks table = MakeReentryTable(&ctx);
+    v8host_callbacks table = MakeReentryTable(&ctx);
     G().SetCallbacks(ctx.id, &table);
 
     std::thread worker([&] {
       for (int i = 0; i < 10; ++i)
-        G().PostSessionState(ctx.id, i, V8HOST_OK);
+        G().PostSessionState(ctx.id, i, v8host_status_ok);
     });
     worker.join();
 
@@ -730,7 +730,7 @@ bool CloseFromCallbackStress(std::string* detail) {
 // Routing posts through the never-freed Dispatcher by SESSION ID is what makes
 // this memory-safe: the producer either resolves the id to a counted reference
 // before the owner unregisters it (the post rides or is suppressed) or finds the
-// id already gone and drops with V8HOST_E_INVALID_STATE -- it never dereferences
+// id already gone and drops with v8host_status_invalid_state -- it never dereferences
 // a freed SessionDispatch. The pre-fix design posted to a raw `sd` pointer and
 // was a heap-use-after-free on exactly this interleaving (finding C1), so this
 // case FAILS under AddressSanitizer against the old code. Determinism: bounded
@@ -753,9 +753,9 @@ bool ConcurrentPostVsClose(std::string* detail) {
         // Each post is accepted (session open), dropped with INVALID_STATE
         // (already closed), or -- defensively -- BACKPRESSURE; never a crash and
         // never any other status.
-        const V8HostStatus s = G().PostRelay(id, FakeRun(1), i, nullptr, 0);
-        if (s != V8HOST_OK && s != V8HOST_E_INVALID_STATE &&
-            s != V8HOST_E_CALLBACK_BACKPRESSURE)
+        const v8host_status s = G().PostRelay(id, FakeRun(1), i, nullptr, 0);
+        if (s != v8host_status_ok && s != v8host_status_invalid_state &&
+            s != v8host_status_callback_backpressure)
           bad_status.store(true, std::memory_order_relaxed);
       }
     });
@@ -771,7 +771,7 @@ bool ConcurrentPostVsClose(std::string* detail) {
       return Fail(detail, "producer saw an unexpected post status");
     // After close + join the id is unregistered: a further post is dropped with
     // INVALID_STATE, never a crash.
-    if (G().PostRelay(id, FakeRun(1), 0, nullptr, 0) != V8HOST_E_INVALID_STATE)
+    if (G().PostRelay(id, FakeRun(1), 0, nullptr, 0) != v8host_status_invalid_state)
       return Fail(detail, "post after close did not return INVALID_STATE");
 
     // Release any drain this cycle scheduled (it sees closed_ and just releases),
@@ -788,7 +788,7 @@ bool ConcurrentPostVsClose(std::string* detail) {
 int main(int argc, char** argv) {
   // The test main thread IS the app/callback thread: initialize here so every
   // delivery test has a valid message-only window to pump.
-  if (G().Initialize() != V8HOST_OK) {
+  if (G().Initialize() != v8host_status_ok) {
     std::printf("fatal: dispatcher initialize failed\n");
     return 2;
   }

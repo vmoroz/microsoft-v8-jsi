@@ -33,14 +33,14 @@ using v8host::test::TestCase;
 // capabilities, so MarshalSboxConfig accepts it. Used as the spawnable baseline
 // the poison/cross-field cases perturb.
 bool BuildValid(const sbox_config_api& api, sbox_config c) {
-  return api.set_acg(c, 1) == sbox_ok &&
-         api.set_integrity(c, sbox_integrity_low, sbox_integrity_untrusted) ==
-             sbox_ok &&
+  return api.set_acg(c, 1) == sbox_status_ok &&
+         api.set_integrity(c, sbox_integrity_level_low, sbox_integrity_level_untrusted) ==
+             sbox_status_ok &&
          api.set_tokens(c, SBOX_TOKEN_RESTRICTED_SAME_ACCESS,
-                        SBOX_TOKEN_LOCKDOWN) == sbox_ok &&
-         api.add_file_rule(c, L"C:\\app\\data\\*", 1) == sbox_ok &&
-         api.allow_engine_dll(c, L"v8jsi.dll") == sbox_ok &&
-         api.set_plugin_data(c, "blob", 4) == sbox_ok && !c->invalid;
+                        SBOX_TOKEN_LOCKDOWN) == sbox_status_ok &&
+         api.add_file_rule(c, L"C:\\app\\data\\*", 1) == sbox_status_ok &&
+         api.allow_engine_dll(c, L"v8jsi.dll") == sbox_status_ok &&
+         api.set_plugin_data(c, "blob", 4) == sbox_status_ok && !c->invalid;
 }
 
 // ---- setters: success + null-arg + invalid-value ----
@@ -49,18 +49,18 @@ bool SettersSuccess(std::string* detail) {
   sbox_config_s cfg;
   const sbox_config_api api = MakeConfigApi();
   CHECK(api.set_tokens != nullptr, "set_tokens must be wired into the vtable");
-  CHECK(api.set_acg(&cfg, 1) == sbox_ok && cfg.acg, "set_acg(1)");
-  CHECK(api.set_acg(&cfg, 0) == sbox_ok && !cfg.acg, "set_acg(0)");
-  CHECK(api.set_integrity(&cfg, sbox_integrity_low, sbox_integrity_untrusted) ==
-            sbox_ok,
+  CHECK(api.set_acg(&cfg, 1) == sbox_status_ok && cfg.acg, "set_acg(1)");
+  CHECK(api.set_acg(&cfg, 0) == sbox_status_ok && !cfg.acg, "set_acg(0)");
+  CHECK(api.set_integrity(&cfg, sbox_integrity_level_low, sbox_integrity_level_untrusted) ==
+            sbox_status_ok,
         "set_integrity valid");
   CHECK(api.set_tokens(&cfg, SBOX_TOKEN_LOCKDOWN,
-                       SBOX_TOKEN_RESTRICTED_SAME_ACCESS) == sbox_ok,
+                       SBOX_TOKEN_RESTRICTED_SAME_ACCESS) == sbox_status_ok,
         "set_tokens valid");
-  CHECK(api.add_file_rule(&cfg, L"C:\\x\\*", 0) == sbox_ok, "add_file_rule");
-  CHECK(api.allow_engine_dll(&cfg, L"v8jsi.dll") == sbox_ok, "allow_engine_dll");
-  CHECK(api.set_plugin_data(&cfg, "data", 4) == sbox_ok, "set_plugin_data");
-  CHECK(api.set_plugin_data(&cfg, nullptr, 0) == sbox_ok, "set_plugin_data clear");
+  CHECK(api.add_file_rule(&cfg, L"C:\\x\\*", 0) == sbox_status_ok, "add_file_rule");
+  CHECK(api.allow_engine_dll(&cfg, L"v8jsi.dll") == sbox_status_ok, "allow_engine_dll");
+  CHECK(api.set_plugin_data(&cfg, "data", 4) == sbox_status_ok, "set_plugin_data");
+  CHECK(api.set_plugin_data(&cfg, nullptr, 0) == sbox_status_ok, "set_plugin_data clear");
   CHECK(!cfg.invalid, "valid setters must not poison the builder");
   return true;
 }
@@ -68,16 +68,16 @@ bool SettersSuccess(std::string* detail) {
 bool SettersNullArg(std::string* detail) {
   const sbox_config_api api = MakeConfigApi();
   // A null builder is a caller bug (args), reported but un-poisonable.
-  CHECK(api.set_acg(nullptr, 1) == sbox_error_args, "set_acg(null)");
-  CHECK(api.set_integrity(nullptr, 0, 0) == sbox_error_args, "set_integrity(null)");
-  CHECK(api.set_tokens(nullptr, 0, 0) == sbox_error_args, "set_tokens(null)");
-  CHECK(api.add_file_rule(nullptr, L"x", 0) == sbox_error_args, "add_file_rule(null)");
-  CHECK(api.add_capability(nullptr, L"S-1-1") == sbox_error_args, "add_capability(null)");
-  CHECK(api.set_app_container(nullptr, 0, 0, nullptr) == sbox_error_args,
+  CHECK(api.set_acg(nullptr, 1) == sbox_status_invalid_arg, "set_acg(null)");
+  CHECK(api.set_integrity(nullptr, 0, 0) == sbox_status_invalid_arg, "set_integrity(null)");
+  CHECK(api.set_tokens(nullptr, 0, 0) == sbox_status_invalid_arg, "set_tokens(null)");
+  CHECK(api.add_file_rule(nullptr, L"x", 0) == sbox_status_invalid_arg, "add_file_rule(null)");
+  CHECK(api.add_capability(nullptr, L"S-1-1") == sbox_status_invalid_arg, "add_capability(null)");
+  CHECK(api.set_app_container(nullptr, 0, 0, nullptr) == sbox_status_invalid_arg,
         "set_app_container(null)");
-  CHECK(api.allow_engine_dll(nullptr, L"v8jsi.dll") == sbox_error_args,
+  CHECK(api.allow_engine_dll(nullptr, L"v8jsi.dll") == sbox_status_invalid_arg,
         "allow_engine_dll(null)");
-  CHECK(api.set_plugin_data(nullptr, "x", 1) == sbox_error_args, "set_plugin_data(null)");
+  CHECK(api.set_plugin_data(nullptr, "x", 1) == sbox_status_invalid_arg, "set_plugin_data(null)");
   return true;
 }
 
@@ -86,11 +86,11 @@ bool IntegrityInvalid(std::string* detail) {
   const int bad[] = {-1, 2, 5, 100};
   for (int level : bad) {
     sbox_config_s cfg;
-    CHECK(api.set_integrity(&cfg, level, sbox_integrity_low) == sbox_error_args,
+    CHECK(api.set_integrity(&cfg, level, sbox_integrity_level_low) == sbox_status_invalid_arg,
           "bad initial integrity must be rejected");
     CHECK(cfg.invalid, "bad integrity must poison the builder");
     sbox_config_s cfg2;
-    CHECK(api.set_integrity(&cfg2, sbox_integrity_low, level) == sbox_error_args,
+    CHECK(api.set_integrity(&cfg2, sbox_integrity_level_low, level) == sbox_status_invalid_arg,
           "bad delayed integrity must be rejected");
     CHECK(cfg2.invalid, "bad delayed integrity must poison the builder");
   }
@@ -102,11 +102,11 @@ bool TokensInvalid(std::string* detail) {
   const int bad[] = {-1, 5, 100};
   for (int level : bad) {
     sbox_config_s cfg;
-    CHECK(api.set_tokens(&cfg, level, SBOX_TOKEN_LOCKDOWN) == sbox_error_args,
+    CHECK(api.set_tokens(&cfg, level, SBOX_TOKEN_LOCKDOWN) == sbox_status_invalid_arg,
           "bad initial token must be rejected");
     CHECK(cfg.invalid, "bad token must poison the builder");
     sbox_config_s cfg2;
-    CHECK(api.set_tokens(&cfg2, SBOX_TOKEN_LOCKDOWN, level) == sbox_error_args,
+    CHECK(api.set_tokens(&cfg2, SBOX_TOKEN_LOCKDOWN, level) == sbox_status_invalid_arg,
           "bad lockdown token must be rejected");
     CHECK(cfg2.invalid, "bad lockdown token must poison the builder");
   }
@@ -116,10 +116,10 @@ bool TokensInvalid(std::string* detail) {
 bool FileRuleBadPattern(std::string* detail) {
   const sbox_config_api api = MakeConfigApi();
   sbox_config_s cfg;
-  CHECK(api.add_file_rule(&cfg, nullptr, 0) == sbox_error_args, "null pattern");
+  CHECK(api.add_file_rule(&cfg, nullptr, 0) == sbox_status_invalid_arg, "null pattern");
   CHECK(cfg.invalid, "null pattern must poison");
   sbox_config_s cfg2;
-  CHECK(api.add_file_rule(&cfg2, L"", 0) == sbox_error_args, "empty pattern");
+  CHECK(api.add_file_rule(&cfg2, L"", 0) == sbox_status_invalid_arg, "empty pattern");
   CHECK(cfg2.invalid, "empty pattern must poison");
   return true;
 }
@@ -127,10 +127,10 @@ bool FileRuleBadPattern(std::string* detail) {
 bool CapabilityBadSid(std::string* detail) {
   const sbox_config_api api = MakeConfigApi();
   sbox_config_s cfg;
-  CHECK(api.add_capability(&cfg, nullptr) == sbox_error_args, "null sid");
+  CHECK(api.add_capability(&cfg, nullptr) == sbox_status_invalid_arg, "null sid");
   CHECK(cfg.invalid, "null sid must poison");
   sbox_config_s cfg2;
-  CHECK(api.add_capability(&cfg2, L"") == sbox_error_args, "empty sid");
+  CHECK(api.add_capability(&cfg2, L"") == sbox_status_invalid_arg, "empty sid");
   CHECK(cfg2.invalid, "empty sid must poison");
   return true;
 }
@@ -141,12 +141,12 @@ bool EngineDllBadName(std::string* detail) {
                           L"."};
   for (const wchar_t* name : bad) {
     sbox_config_s cfg;
-    CHECK(api.allow_engine_dll(&cfg, name) == sbox_error_args,
+    CHECK(api.allow_engine_dll(&cfg, name) == sbox_status_invalid_arg,
           "non-bare engine name must be rejected");
     CHECK(cfg.invalid, "non-bare engine name must poison");
   }
   sbox_config_s cfg;
-  CHECK(api.allow_engine_dll(&cfg, nullptr) == sbox_error_args, "null engine name");
+  CHECK(api.allow_engine_dll(&cfg, nullptr) == sbox_status_invalid_arg, "null engine name");
   CHECK(cfg.invalid, "null engine name must poison");
   return true;
 }
@@ -157,13 +157,13 @@ bool FileRuleQuota(std::string* detail) {
   const sbox_config_api api = MakeConfigApi();
   sbox_config_s cfg;
   for (size_t i = 0; i < kSboxMaxFileRules; ++i)
-    CHECK(api.add_file_rule(&cfg, L"C:\\x\\*", 0) == sbox_ok, "64 rules must fit");
+    CHECK(api.add_file_rule(&cfg, L"C:\\x\\*", 0) == sbox_status_ok, "64 rules must fit");
   CHECK(!cfg.invalid, "exactly 64 file rules must not poison");
   SboxConfigMarshal marshal;
   CHECK(MarshalSboxConfig(cfg, L"v8host.dll", marshal), "64 file rules marshal");
   CHECK(marshal.policy.file_rule_count == kSboxMaxFileRules, "64 rules in policy");
   // The 65th exceeds the quota: rejected, poisoned, and never spawnable.
-  CHECK(api.add_file_rule(&cfg, L"C:\\x\\*", 0) == sbox_error,
+  CHECK(api.add_file_rule(&cfg, L"C:\\x\\*", 0) == sbox_status_failed,
         "65th file rule must be rejected");
   CHECK(cfg.invalid, "65th file rule must poison");
   SboxConfigMarshal after;
@@ -175,14 +175,14 @@ bool CapabilityQuota(std::string* detail) {
   const sbox_config_api api = MakeConfigApi();
   sbox_config_s cfg;
   // Capabilities are only spawnable under AppContainer.
-  CHECK(api.set_app_container(&cfg, 1, 0, L"profile") == sbox_ok, "enable AC");
+  CHECK(api.set_app_container(&cfg, 1, 0, L"profile") == sbox_status_ok, "enable AC");
   for (size_t i = 0; i < kSboxMaxCapabilities; ++i)
-    CHECK(api.add_capability(&cfg, L"S-1-15-3-1") == sbox_ok, "64 caps must fit");
+    CHECK(api.add_capability(&cfg, L"S-1-15-3-1") == sbox_status_ok, "64 caps must fit");
   CHECK(!cfg.invalid, "exactly 64 capabilities must not poison");
   SboxConfigMarshal marshal;
   CHECK(MarshalSboxConfig(cfg, L"v8host.dll", marshal), "64 caps marshal");
   CHECK(marshal.policy.capability_count == kSboxMaxCapabilities, "64 caps in policy");
-  CHECK(api.add_capability(&cfg, L"S-1-15-3-1") == sbox_error,
+  CHECK(api.add_capability(&cfg, L"S-1-15-3-1") == sbox_status_failed,
         "65th capability must be rejected");
   CHECK(cfg.invalid, "65th capability must poison");
   SboxConfigMarshal after;
@@ -195,14 +195,14 @@ bool PluginDataQuota(std::string* detail) {
   const std::string ok_blob(kSboxMaxPluginData, 'x');
   const std::string big_blob(kSboxMaxPluginData + 1, 'x');
   sbox_config_s cfg;
-  CHECK(api.set_plugin_data(&cfg, ok_blob.data(), ok_blob.size()) == sbox_ok,
+  CHECK(api.set_plugin_data(&cfg, ok_blob.data(), ok_blob.size()) == sbox_status_ok,
         "4096 bytes must fit");
   CHECK(!cfg.invalid, "4096-byte plugin data must not poison");
   SboxConfigMarshal marshal;
   CHECK(MarshalSboxConfig(cfg, L"v8host.dll", marshal), "4096 bytes marshal");
   CHECK(marshal.policy.plugin_data_len == kSboxMaxPluginData,
         "4096-byte blob preserved in policy");
-  CHECK(api.set_plugin_data(&cfg, big_blob.data(), big_blob.size()) == sbox_error,
+  CHECK(api.set_plugin_data(&cfg, big_blob.data(), big_blob.size()) == sbox_status_failed,
         "4097 bytes must be rejected");
   CHECK(cfg.invalid, "4097-byte plugin data must poison");
   SboxConfigMarshal after;
@@ -216,22 +216,22 @@ bool AppContainerCombos(std::string* detail) {
   const sbox_config_api api = MakeConfigApi();
   {  // AppContainer on with a profile: ok.
     sbox_config_s cfg;
-    CHECK(api.set_app_container(&cfg, 1, 0, L"profile") == sbox_ok, "AC+profile");
+    CHECK(api.set_app_container(&cfg, 1, 0, L"profile") == sbox_status_ok, "AC+profile");
     CHECK(!cfg.invalid, "AC+profile must not poison");
   }
   {  // AppContainer off with an empty profile: ok (empty profile legal iff off).
     sbox_config_s cfg;
-    CHECK(api.set_app_container(&cfg, 0, 0, nullptr) == sbox_ok, "no-AC+empty");
+    CHECK(api.set_app_container(&cfg, 0, 0, nullptr) == sbox_status_ok, "no-AC+empty");
     CHECK(!cfg.invalid, "no-AC+empty must not poison");
   }
   {  // LPAC implies AppContainer, so LPAC+AC+profile: ok.
     sbox_config_s cfg;
-    CHECK(api.set_app_container(&cfg, 1, 1, L"profile") == sbox_ok, "LPAC+AC");
+    CHECK(api.set_app_container(&cfg, 1, 1, L"profile") == sbox_status_ok, "LPAC+AC");
     CHECK(cfg.lpac && cfg.use_app_container, "LPAC+AC stored");
   }
   {  // AppContainer on but empty profile: rejected + poisoned.
     sbox_config_s cfg;
-    CHECK(api.set_app_container(&cfg, 1, 0, nullptr) == sbox_error_args,
+    CHECK(api.set_app_container(&cfg, 1, 0, nullptr) == sbox_status_invalid_arg,
           "AC+empty-profile must be rejected");
     CHECK(cfg.invalid, "AC+empty-profile must poison");
     SboxConfigMarshal m;
@@ -239,7 +239,7 @@ bool AppContainerCombos(std::string* detail) {
   }
   {  // LPAC without AppContainer: rejected + poisoned.
     sbox_config_s cfg;
-    CHECK(api.set_app_container(&cfg, 0, 1, L"profile") == sbox_error_args,
+    CHECK(api.set_app_container(&cfg, 0, 1, L"profile") == sbox_status_invalid_arg,
           "LPAC-without-AC must be rejected");
     CHECK(cfg.invalid, "LPAC-without-AC must poison");
   }
@@ -251,25 +251,25 @@ bool AppContainerCombos(std::string* detail) {
 bool MarshalFieldFidelity(std::string* detail) {
   const sbox_config_api api = MakeConfigApi();
   sbox_config_s cfg;
-  CHECK(api.set_acg(&cfg, 1) == sbox_ok, "acg");
-  CHECK(api.set_integrity(&cfg, sbox_integrity_low, sbox_integrity_untrusted) ==
-            sbox_ok,
+  CHECK(api.set_acg(&cfg, 1) == sbox_status_ok, "acg");
+  CHECK(api.set_integrity(&cfg, sbox_integrity_level_low, sbox_integrity_level_untrusted) ==
+            sbox_status_ok,
         "integrity");
-  CHECK(api.set_tokens(&cfg, SBOX_TOKEN_INTERACTIVE, SBOX_TOKEN_LIMITED) == sbox_ok,
+  CHECK(api.set_tokens(&cfg, SBOX_TOKEN_INTERACTIVE, SBOX_TOKEN_LIMITED) == sbox_status_ok,
         "tokens");
-  CHECK(api.add_file_rule(&cfg, L"C:\\a\\*", 1) == sbox_ok, "rule0");
-  CHECK(api.add_file_rule(&cfg, L"C:\\b\\*", 0) == sbox_ok, "rule1");
-  CHECK(api.set_app_container(&cfg, 1, 1, L"com.example.profile") == sbox_ok, "ac");
-  CHECK(api.add_capability(&cfg, L"S-1-15-3-1") == sbox_ok, "cap");
-  CHECK(api.set_plugin_data(&cfg, "payload", 7) == sbox_ok, "plugin_data");
+  CHECK(api.add_file_rule(&cfg, L"C:\\a\\*", 1) == sbox_status_ok, "rule0");
+  CHECK(api.add_file_rule(&cfg, L"C:\\b\\*", 0) == sbox_status_ok, "rule1");
+  CHECK(api.set_app_container(&cfg, 1, 1, L"com.example.profile") == sbox_status_ok, "ac");
+  CHECK(api.add_capability(&cfg, L"S-1-15-3-1") == sbox_status_ok, "cap");
+  CHECK(api.set_plugin_data(&cfg, "payload", 7) == sbox_status_ok, "plugin_data");
 
   SboxConfigMarshal m;
   CHECK(MarshalSboxConfig(cfg, L"v8host.dll", m), "valid config must marshal");
   const SboxPolicy& p = m.policy;
   CHECK(p.struct_size == sizeof(SboxPolicy), "struct_size");
   CHECK(p.prohibit_dynamic_code == 1, "acg -> prohibit_dynamic_code");
-  CHECK(p.integrity == sbox_integrity_low, "integrity field");
-  CHECK(p.delayed_integrity == sbox_integrity_untrusted, "delayed integrity field");
+  CHECK(p.integrity == sbox_integrity_level_low, "integrity field");
+  CHECK(p.delayed_integrity == sbox_integrity_level_untrusted, "delayed integrity field");
   CHECK(p.initial_token == SBOX_TOKEN_INTERACTIVE, "initial token field");
   CHECK(p.lockdown_token == SBOX_TOKEN_LIMITED, "lockdown token field");
   CHECK(p.file_rule_count == 2, "file rule count");
@@ -316,7 +316,7 @@ bool PoisonedBuilderNeverMarshals(std::string* detail) {
                               std::function<void(const sbox_config_api&, sbox_config)>>>
       injections = {
           {"integrity", [](const sbox_config_api& a, sbox_config c) {
-             a.set_integrity(c, 99, sbox_integrity_low);
+             a.set_integrity(c, 99, sbox_integrity_level_low);
            }},
           {"tokens", [](const sbox_config_api& a, sbox_config c) {
              a.set_tokens(c, 99, SBOX_TOKEN_LOCKDOWN);
@@ -363,7 +363,7 @@ bool MarshalCrossFieldGate(std::string* detail) {
      // so only the marshal gate catches it.
     const sbox_config_api api = MakeConfigApi();
     sbox_config_s cfg;
-    CHECK(api.add_capability(&cfg, L"S-1-15-3-1") == sbox_ok, "cap add ok");
+    CHECK(api.add_capability(&cfg, L"S-1-15-3-1") == sbox_status_ok, "cap add ok");
     CHECK(!cfg.invalid, "add_capability must not poison on its own");
     SboxConfigMarshal m;
     CHECK(!MarshalSboxConfig(cfg, L"v8host.dll", m), "cap-without-AC: no spawn");

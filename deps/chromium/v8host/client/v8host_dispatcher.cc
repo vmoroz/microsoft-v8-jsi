@@ -95,14 +95,14 @@ Dispatcher::Dispatcher() = default;
 
 Dispatcher::~Dispatcher() = default;
 
-V8HostStatus Dispatcher::Initialize() {
+v8host_status Dispatcher::Initialize() {
   std::unique_lock<std::mutex> lock(init_mutex_);
   for (;;) {
     switch (state_) {
       case State::kReady:
-        return V8HOST_OK;
+        return v8host_status_ok;
       case State::kFailed:
-        return V8HOST_E_INTERNAL;
+        return v8host_status_internal_error;
       case State::kInitializing:
         // Another thread is creating the window. Wait without pumping: a
         // condition variable parks this thread until the first initializer
@@ -119,7 +119,7 @@ V8HostStatus Dispatcher::Initialize() {
         lock.lock();
         state_ = ok ? State::kReady : State::kFailed;
         init_cv_.notify_all();
-        return ok ? V8HOST_OK : V8HOST_E_INTERNAL;
+        return ok ? v8host_status_ok : v8host_status_internal_error;
     }
   }
 }
@@ -210,51 +210,51 @@ SessionDispatch* Dispatcher::AcquireSession(uint64_t id) {
 // Id-keyed producer API: resolve the id to a counted reference (AddRef'd under
 // sessions_mutex_), release that lock, dispatch to the per-session method, then
 // Release on scope exit. An unknown id (never created or already closed) drops
-// with V8HOST_E_INVALID_STATE -- no freed object is ever dereferenced.
-V8HostStatus Dispatcher::PostSessionState(uint64_t id,
+// with v8host_status_invalid_state -- no freed object is ever dereferenced.
+v8host_status Dispatcher::PostSessionState(uint64_t id,
                                           int32_t state,
-                                          V8HostStatus status) {
+                                          v8host_status status) {
   SessionRef session(AcquireSession(id));
   if (!session)
-    return V8HOST_E_INVALID_STATE;
+    return v8host_status_invalid_state;
   return session->PostSessionState(state, status);
 }
 
-V8HostStatus Dispatcher::PostRunEvent(uint64_t id,
-                                      V8HostRun* run,
+v8host_status Dispatcher::PostRunEvent(uint64_t id,
+                                      v8host_run_s* run,
                                       RunTerminalArbiter* arbiter,
                                       bool terminal,
                                       int32_t event,
-                                      V8HostStatus status) {
+                                      v8host_status status) {
   SessionRef session(AcquireSession(id));
   if (!session)
-    return V8HOST_E_INVALID_STATE;
+    return v8host_status_invalid_state;
   return session->PostRunEvent(run, arbiter, terminal, event, status);
 }
 
-V8HostStatus Dispatcher::PostRelay(uint64_t id,
-                                   V8HostRun* run,
+v8host_status Dispatcher::PostRelay(uint64_t id,
+                                   v8host_run_s* run,
                                    int32_t kind,
                                    const void* data,
                                    size_t len) {
   SessionRef session(AcquireSession(id));
   if (!session)
-    return V8HOST_E_INVALID_STATE;
+    return v8host_status_invalid_state;
   return session->PostRelay(run, kind, data, len);
 }
 
-V8HostStatus Dispatcher::PostDisconnect(uint64_t id) {
+v8host_status Dispatcher::PostDisconnect(uint64_t id) {
   SessionRef session(AcquireSession(id));
   if (!session)
-    return V8HOST_E_INVALID_STATE;
+    return v8host_status_invalid_state;
   return session->PostDisconnect();
 }
 
-V8HostStatus Dispatcher::SetCallbacks(uint64_t id,
-                                      const V8HostCallbacks* callbacks) {
+v8host_status Dispatcher::SetCallbacks(uint64_t id,
+                                      const v8host_callbacks* callbacks) {
   SessionRef session(AcquireSession(id));
   if (!session)
-    return V8HOST_E_INVALID_STATE;
+    return v8host_status_invalid_state;
   return session->SetCallbacks(callbacks);
 }
 
@@ -263,7 +263,7 @@ V8HostStatus Dispatcher::SetCallbacks(uint64_t id,
 // ---------------------------------------------------------------------------
 
 SessionDispatch* SessionDispatch::Create(Dispatcher* dispatcher,
-                                         V8HostSession* handle,
+                                         v8host_session_s* handle,
                                          int32_t failed_state) {
   if (dispatcher == nullptr || !dispatcher->IsInitialized())
     return nullptr;
@@ -281,7 +281,7 @@ SessionDispatch* SessionDispatch::Create(Dispatcher* dispatcher,
 
 SessionDispatch::SessionDispatch(Dispatcher* dispatcher,
                                  uint64_t id,
-                                 V8HostSession* handle,
+                                 v8host_session_s* handle,
                                  int32_t failed_state)
     : dispatcher_(dispatcher),
       id_(id),
@@ -307,22 +307,22 @@ void SessionDispatch::Release() {
     delete this;
 }
 
-V8HostStatus SessionDispatch::SetCallbacks(const V8HostCallbacks* callbacks) {
+v8host_status SessionDispatch::SetCallbacks(const v8host_callbacks* callbacks) {
   if (callbacks == nullptr)
-    return V8HOST_E_INVALID_ARG;
+    return v8host_status_invalid_arg;
   // For version 1 every member is required, so the required size equals the
   // struct size. A larger struct_size (a future version) is accepted and only
   // the known fields are read.
-  if (callbacks->struct_size < sizeof(V8HostCallbacks))
-    return V8HOST_E_STRUCT_SIZE;
+  if (callbacks->struct_size < sizeof(v8host_callbacks))
+    return v8host_status_invalid_struct_size;
 
 #ifdef V8HOST_DISPATCHER_TESTING
   if (FailNextCallbackCopy().exchange(false, std::memory_order_acq_rel))
-    return V8HOST_E_NO_MEMORY;
+    return v8host_status_no_memory;
 #endif
 
-  V8HostCallbacks copy = {};
-  copy.struct_size = sizeof(V8HostCallbacks);
+  v8host_callbacks copy = {};
+  copy.struct_size = sizeof(v8host_callbacks);
   copy.context = callbacks->context;
   copy.on_session_state = callbacks->on_session_state;
   copy.on_run_event = callbacks->on_run_event;
@@ -331,13 +331,13 @@ V8HostStatus SessionDispatch::SetCallbacks(const V8HostCallbacks* callbacks) {
 
   std::lock_guard<std::mutex> lock(mutex_);
   if (closed_)
-    return V8HOST_E_INVALID_STATE;
+    return v8host_status_invalid_state;
   current_table_ = copy;
-  return V8HOST_OK;
+  return v8host_status_ok;
 }
 
-V8HostStatus SessionDispatch::PostSessionState(int32_t state,
-                                               V8HostStatus status) {
+v8host_status SessionDispatch::PostSessionState(int32_t state,
+                                               v8host_status status) {
   Event event;
   event.kind = EventKind::kSessionState;
   event.code = state;
@@ -345,11 +345,11 @@ V8HostStatus SessionDispatch::PostSessionState(int32_t state,
   return Enqueue(std::move(event), /*terminal_run=*/false, /*arbiter=*/nullptr);
 }
 
-V8HostStatus SessionDispatch::PostRunEvent(V8HostRun* run,
+v8host_status SessionDispatch::PostRunEvent(v8host_run_s* run,
                                            RunTerminalArbiter* arbiter,
                                            bool terminal,
                                            int32_t event,
-                                           V8HostStatus status) {
+                                           v8host_status status) {
   Event entry;
   entry.kind = EventKind::kRunEvent;
   entry.run = run;
@@ -358,12 +358,12 @@ V8HostStatus SessionDispatch::PostRunEvent(V8HostRun* run,
   return Enqueue(std::move(entry), terminal, arbiter);
 }
 
-V8HostStatus SessionDispatch::PostRelay(V8HostRun* run,
+v8host_status SessionDispatch::PostRelay(v8host_run_s* run,
                                         int32_t kind,
                                         const void* data,
                                         size_t len) {
   if (len > 0 && data == nullptr)
-    return V8HOST_E_INVALID_ARG;
+    return v8host_status_invalid_arg;
   Event event;
   event.kind = EventKind::kRelay;
   event.run = run;
@@ -377,29 +377,29 @@ V8HostStatus SessionDispatch::PostRelay(V8HostRun* run,
   return Enqueue(std::move(event), /*terminal_run=*/false, /*arbiter=*/nullptr);
 }
 
-V8HostStatus SessionDispatch::PostDisconnect() {
+v8host_status SessionDispatch::PostDisconnect() {
   Event event;
   event.kind = EventKind::kDisconnect;
   return Enqueue(std::move(event), /*terminal_run=*/false, /*arbiter=*/nullptr);
 }
 
-V8HostStatus SessionDispatch::Enqueue(Event&& event,
+v8host_status SessionDispatch::Enqueue(Event&& event,
                                       bool terminal_run,
                                       RunTerminalArbiter* arbiter) {
-  V8HostStatus result = V8HOST_OK;
+  v8host_status result = v8host_status_ok;
   bool need_post = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (closed_)
-      return V8HOST_E_INVALID_STATE;
+      return v8host_status_invalid_state;
     if (backpressure_failed_)
-      return V8HOST_E_CALLBACK_BACKPRESSURE;
+      return v8host_status_callback_backpressure;
 
     if (queue_.size() >= kSessionQueueCapacity) {
       // The app thread is not draining. Fail the session: drop everything
       // pending and deliver exactly one terminal backpressure notification.
       // Backpressure SUPERSEDES run-terminal arbitration: a terminal
-      // PostRunEvent that overflows returns V8HOST_E_CALLBACK_BACKPRESSURE and
+      // PostRunEvent that overflows returns v8host_status_callback_backpressure and
       // does NOT claim the run arbiter (the arbiter check below is skipped on
       // this path) -- the session failure subsumes the run's terminal, and
       // backpressure_failed_ is sticky so no second terminal is ever delivered.
@@ -409,17 +409,17 @@ V8HostStatus SessionDispatch::Enqueue(Event&& event,
       terminal.kind = EventKind::kSessionState;
       terminal.table = current_table_;
       terminal.code = failed_state_;
-      terminal.status = V8HOST_E_CALLBACK_BACKPRESSURE;
+      terminal.status = v8host_status_callback_backpressure;
       queue_.push_back(std::move(terminal));
-      result = V8HOST_E_CALLBACK_BACKPRESSURE;
+      result = v8host_status_callback_backpressure;
     } else {
       // Claim run-terminal arbitration only when the event is actually
       // enqueued, so a lost arbitration leaves the queue untouched.
       if (terminal_run && arbiter != nullptr && !arbiter->TryClaimTerminal())
-        return V8HOST_E_RUN_TERMINAL;
+        return v8host_status_run_terminal;
       event.table = current_table_;  // snapshot at post time
       queue_.push_back(std::move(event));
-      result = V8HOST_OK;
+      result = v8host_status_ok;
     }
     need_post = EnsureScheduledLocked();
   }
@@ -429,7 +429,7 @@ V8HostStatus SessionDispatch::Enqueue(Event&& event,
   // exists. On failure revert and fail closed.
   if (need_post && !dispatcher_->PostDrain(this)) {
     OnPostFailed();
-    return V8HOST_E_INTERNAL;
+    return v8host_status_internal_error;
   }
   return result;
 }

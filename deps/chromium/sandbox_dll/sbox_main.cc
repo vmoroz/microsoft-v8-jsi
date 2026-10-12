@@ -15,7 +15,7 @@
 //                       : invoke the plugin-owned coordinator service.
 //   sbox.exe --pipe-bench : developer transport-latency probe.
 //
-// SBOX_API is plain extern "C" here (the target defines SBOX_STATIC), so the
+// SBOX_CORE_API is plain extern "C" here (the target defines SBOX_STATIC), so the
 // sbox_* core compiled into this EXE stays out of its export table.
 #include "sbox_core_internal.h"
 #include "sbox_harden.h"
@@ -68,7 +68,7 @@ struct sbox_broker_worker_s {
 struct sbox_broker_s {
   std::wstring self_path;
   std::wstring plugin_name;
-  const sbox_plugin* plugin = nullptr;
+  const sbox_plugin_api* plugin = nullptr;
   HMODULE plugin_module = nullptr;
   std::mutex mutex;
   std::set<sbox_broker_worker_s*> workers;
@@ -88,7 +88,7 @@ enum WorkerExit {
   kWarmupFailed = 14,
   kLowerTokenFailed = 15,
   kPingPostFailed = 16,
-  kRunFailed = 17,  // plugin.run returned non-sbox_ok (see worker log; e.g. ACG not enforced)
+  kRunFailed = 17,  // plugin.run returned non-sbox_status_ok (see worker log; e.g. ACG not enforced)
 };
 
 std::wstring SelfPath() {
@@ -194,52 +194,52 @@ std::wstring ParsePluginName(int argc, char** argv) {
 // calls it as SboxMessageCb; the two differ only in the kind parameter type
 // (sbox_msg_kind vs int), so that must stay ABI-identical.
 static_assert(sizeof(sbox_msg_kind) == sizeof(int) &&
-                  static_cast<int>(sbox_msg_string) ==
+                  static_cast<int>(sbox_msg_kind_string) ==
                       static_cast<int>(SBOX_MSG_STRING) &&
-                  static_cast<int>(sbox_msg_binary) ==
+                  static_cast<int>(sbox_msg_kind_binary) ==
                       static_cast<int>(SBOX_MSG_BINARY) &&
-                  static_cast<int>(sbox_msg_lifecycle) ==
+                  static_cast<int>(sbox_msg_kind_lifecycle) ==
                       static_cast<int>(SBOX_MSG_LIFECYCLE),
               "sbox_msg_kind must match SboxMsgKind for the drain cast");
 
 // --- sbox_worker_api: worker services the plugin's warmup()/run() call, bridged
 // to the sandbox core's sbox_target_* message channel ---
-sbox_status SBOX_CALL WkGetPluginData(sbox_worker w, const void** data,
+sbox_status SBOX_CDECL WkGetPluginData(sbox_worker w, const void** data,
                                       size_t* len) {
   if (!w || !w->target || !data || !len)
-    return sbox_error_args;
-  return sbox_target_plugin_data(w->target, data, len) ? sbox_ok : sbox_error;
+    return sbox_status_invalid_arg;
+  return sbox_target_plugin_data(w->target, data, len) ? sbox_status_ok : sbox_status_failed;
 }
-int SBOX_CALL WkAcgEnabled(sbox_worker w) {
+int SBOX_CDECL WkAcgEnabled(sbox_worker w) {
   return (w && w->target) ? sbox_target_acg_enabled(w->target) : 0;
 }
-sbox_status SBOX_CALL WkPostMessage(sbox_worker w, sbox_msg_kind kind,
+sbox_status SBOX_CDECL WkPostMessage(sbox_worker w, sbox_msg_kind kind,
                                     const void* data, size_t len) {
   if (!w || !w->target)
-    return sbox_error_args;
-  // The engine/guest may post only opaque string/binary frames. sbox_msg_lifecycle
+    return sbox_status_invalid_arg;
+  // The engine/guest may post only opaque string/binary frames. sbox_msg_kind_lifecycle
   // (and any other kind) is container-only, so reject it here — a readiness marker
   // can never be forged by the plugin or a guest.
-  if (kind != sbox_msg_string && kind != sbox_msg_binary)
-    return sbox_error_args;
+  if (kind != sbox_msg_kind_string && kind != sbox_msg_kind_binary)
+    return sbox_status_invalid_arg;
   return sbox_target_post_message(w->target, static_cast<int>(kind), data,
                                   len) == 0
-             ? sbox_ok
-             : sbox_error;
+             ? sbox_status_ok
+             : sbox_status_failed;
 }
-void* SBOX_CALL WkInboundEvent(sbox_worker w) {
+void* SBOX_CDECL WkInboundEvent(sbox_worker w) {
   return (w && w->target) ? sbox_target_inbound_event(w->target) : nullptr;
 }
-sbox_status SBOX_CALL WkDrainMessages(sbox_worker w, sbox_message_cb cb,
+sbox_status SBOX_CDECL WkDrainMessages(sbox_worker w, sbox_message_cb cb,
                                       void* ctx) {
   if (!w || !w->target || !cb)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   // sbox_message_cb and SboxMessageCb differ only in the kind parameter's type
   // (sbox_msg_kind vs int) — ABI-identical, so the reinterpret_cast is safe.
   sbox_target_drain_messages(w->target, reinterpret_cast<SboxMessageCb>(cb), ctx);
-  return sbox_ok;
+  return sbox_status_ok;
 }
-void* SBOX_CALL WkCloseEvent(sbox_worker w) {
+void* SBOX_CDECL WkCloseEvent(sbox_worker w) {
   return (w && w->target) ? sbox_target_close_event(w->target) : nullptr;
 }
 
@@ -255,14 +255,14 @@ sbox_worker_api MakeWorkerApi() {
   return api;
 }
 
-// Load a --plugin DLL and hand back its validated sbox_plugin vtable. The broker
+// Load a --plugin DLL and hand back its validated sbox_plugin_api vtable. The broker
 // runs UNRESTRICTED, so IT (not the sandbox worker, which cannot reliably reach
 // the crypto/catalog services once locked down) Authenticode-verifies the DLL
 // BEFORE load; the worker re-resolves the already-verified DLL with verify=false.
 // Dev builds tolerate UNSIGNED only via SBOX_DEV_ALLOW_UNSIGNED (no runtime
 // bypass).
 bool LoadPlugin(const std::wstring& plugin_name, bool verify, const char* tag,
-                HMODULE* out_mod, const sbox_plugin** out_vtable,
+                HMODULE* out_mod, const sbox_plugin_api** out_vtable,
                 v8host::HeldFile* out_file) {
   if (!IsBareFilename(plugin_name)) {
     printf("[sbox] %s: invalid --plugin name (bare app-dir filename only)\n",
@@ -290,14 +290,14 @@ bool LoadPlugin(const std::wstring& plugin_name, bool verify, const char* tag,
   }
   auto entry = reinterpret_cast<sbox_plugin_main_fn>(
       ::GetProcAddress(mod, SBOX_PLUGIN_ENTRY));
-  const sbox_plugin* vtable = nullptr;
-  if (!entry || entry(SBOX_ABI_VERSION, &vtable) != sbox_ok || !vtable) {
+  const sbox_plugin_api* vtable = nullptr;
+  if (!entry || entry(SBOX_ABI_VERSION, &vtable) != sbox_status_ok || !vtable) {
     printf("[sbox] %s: %s did not return a plugin\n", tag, SBOX_PLUGIN_ENTRY);
     ::FreeLibrary(mod);
     return false;
   }
   if (vtable->abi_version != SBOX_ABI_VERSION ||
-      vtable->struct_size < sizeof(sbox_plugin) || !vtable->configure ||
+      vtable->struct_size < sizeof(sbox_plugin_api) || !vtable->configure ||
       !vtable->broker_run || !vtable->warmup || !vtable->run ||
       !vtable->shutdown) {
     printf("[sbox] %s: plugin ABI mismatch (abi=%u host=%u) or incomplete "
@@ -319,7 +319,7 @@ bool LoadPlugin(const std::wstring& plugin_name, bool verify, const char* tag,
 // after PrepareSandbox fills it.
 struct PreparedSandbox {
   HMODULE plugin_mod = nullptr;
-  const sbox_plugin* plugin = nullptr;
+  const sbox_plugin_api* plugin = nullptr;
   std::wstring plugin_name;
   v8host::HeldFile plugin_file;
   sbox_config_s cfg;          // collected by configure()
@@ -351,7 +351,7 @@ bool PrepareSandbox(const std::wstring& plugin_name,
   sbox_config_api api = MakeConfigApi();
   const sbox_status cs = out.plugin->configure(
       &out.cfg, &api, configure_data, configure_data_size);
-  if (cs != sbox_ok) {
+  if (cs != sbox_status_ok) {
     printf("[sbox] plugin.configure failed: status=%d\n", cs);
     return false;
   }
@@ -395,7 +395,7 @@ int RunWorker(const std::wstring& plugin_name) {
   // lockdown: the lowered token can no longer open it) and resolve its vtable.
   // The broker already Authenticode-verified it, so the worker just re-resolves.
   HMODULE plugin_mod = nullptr;
-  const sbox_plugin* plugin = nullptr;
+  const sbox_plugin_api* plugin = nullptr;
   if (!LoadPlugin(plugin_name, /*verify=*/false, "worker-plugin", &plugin_mod,
                   &plugin, nullptr)) {
     sbox_target_end(target);
@@ -409,7 +409,7 @@ int RunWorker(const std::wstring& plugin_name) {
   // warmup (PRE-lockdown) -> lower_token -> run (POST-lockdown) -> shutdown.
   const sbox_status warmup_rc = plugin->warmup(&wk, &wapi);
   printf("[sbox] worker: plugin.warmup -> %d\n", warmup_rc);
-  if (warmup_rc != sbox_ok) {
+  if (warmup_rc != sbox_status_ok) {
     plugin->shutdown(&wk);
     sbox_target_end(target);
     return kWarmupFailed;
@@ -434,7 +434,7 @@ int RunWorker(const std::wstring& plugin_name) {
 #endif
     return sbox_target_post_lifecycle(target, phase);
   };
-  if (post_lifecycle(SBOX_LIFECYCLE_STARTUP) != 0)
+  if (post_lifecycle(sbox_lifecycle_phase_startup) != 0)
     return finish(kWarmupFailed);
 
   ++lower_calls;
@@ -457,7 +457,7 @@ int RunWorker(const std::wstring& plugin_name) {
   // runtime so the coordinator can gate the first run on observed lockdown.
   if (!ping_post)
     return finish(kPingPostFailed);
-  if (post_lifecycle(SBOX_LIFECYCLE_SECURITY) != 0)
+  if (post_lifecycle(sbox_lifecycle_phase_security) != 0)
     return finish(kRunFailed);
 
   const sbox_status run_rc = plugin->run(&wk, &wapi);
@@ -468,7 +468,7 @@ int RunWorker(const std::wstring& plugin_name) {
 
   if (!ping_pre)
     return kPingPreFailed;
-  if (run_rc != sbox_ok)
+  if (run_rc != sbox_status_ok)
     return kRunFailed;
   return kOk;
 }
@@ -491,7 +491,7 @@ void OnBrokerReply(void* ctx, int kind, const void* data, size_t len) {
       const auto* bytes = static_cast<const uint8_t*>(data);
       const uint32_t phase = bytes[0] | (uint32_t(bytes[1]) << 8) |
           (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
-      if (phase == SBOX_LIFECYCLE_STARTUP || phase == SBOX_LIFECYCLE_SECURITY)
+      if (phase == sbox_lifecycle_phase_startup || phase == sbox_lifecycle_phase_security)
         ++c->lifecycle_markers;
     }
     return;
@@ -696,7 +696,7 @@ void OnBrokerWorkerMessage(void* context, int kind, const void* data, size_t len
                      static_cast<sbox_msg_kind>(kind), data, len);
 }
 
-sbox_status SBOX_CALL BrokerConfigureAndSpawn(
+sbox_status SBOX_CDECL BrokerConfigureAndSpawn(
     sbox_broker broker,
     const void* configure_data,
     size_t configure_data_size,
@@ -705,7 +705,7 @@ sbox_status SBOX_CALL BrokerConfigureAndSpawn(
     sbox_broker_worker* out_worker) {
   if (!broker || !out_worker || (configure_data_size && !configure_data) ||
       configure_data_size > 64 * 1024) {
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   }
   *out_worker = nullptr;
   std::vector<uint8_t> copied;
@@ -716,13 +716,13 @@ sbox_status SBOX_CALL BrokerConfigureAndSpawn(
   {
     std::lock_guard<std::mutex> lock(broker->mutex);
     if (broker->stopping)
-      return sbox_error;
+      return sbox_status_failed;
   }
   PreparedSandbox sandbox;
   if (!PrepareSandbox(broker->plugin_name,
                       copied.empty() ? nullptr : copied.data(), copied.size(),
                       sandbox))
-    return sbox_error;
+    return sbox_status_failed;
   auto worker = std::make_unique<sbox_broker_worker_s>();
   worker->broker = broker;
   worker->callback = on_message;
@@ -731,45 +731,45 @@ sbox_status SBOX_CALL BrokerConfigureAndSpawn(
       sbox_broker_spawn(broker->self_path.c_str(), &sandbox.marshal.policy,
                         &OnBrokerWorkerMessage, worker.get());
   if (!worker->session)
-    return sbox_error;
+    return sbox_status_failed;
   {
     std::lock_guard<std::mutex> lock(broker->mutex);
     if (broker->stopping) {
       sbox_broker_close(worker->session);
       sbox_broker_wait(worker->session);
-      return sbox_error;
+      return sbox_status_failed;
     }
     broker->workers.insert(worker.get());
   }
   *out_worker = worker.release();
-  return sbox_ok;
+  return sbox_status_ok;
 }
 
-sbox_status SBOX_CALL BrokerPostMessage(sbox_broker_worker worker,
+sbox_status SBOX_CDECL BrokerPostMessage(sbox_broker_worker worker,
                                         sbox_msg_kind kind,
                                         const void* data,
                                         size_t size) {
   if (!worker || !worker->session || (size && !data))
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   return sbox_broker_post_message(worker->session, static_cast<int>(kind), data,
                                   size) == 0
-             ? sbox_ok
-             : sbox_error;
+             ? sbox_status_ok
+             : sbox_status_failed;
 }
 
-sbox_status SBOX_CALL BrokerClose(sbox_broker_worker worker) {
+sbox_status SBOX_CDECL BrokerClose(sbox_broker_worker worker) {
   if (!worker || !worker->session)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   if (worker->close_called)
-    return sbox_ok;
+    return sbox_status_ok;
   worker->close_called = true;
-  return sbox_broker_close(worker->session) == 0 ? sbox_ok : sbox_error;
+  return sbox_broker_close(worker->session) == 0 ? sbox_status_ok : sbox_status_failed;
 }
 
-sbox_status SBOX_CALL BrokerWait(sbox_broker_worker worker,
+sbox_status SBOX_CDECL BrokerWait(sbox_broker_worker worker,
                                  int32_t* out_exit_code) {
   if (!worker || !worker->session || worker->wait_called)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   worker->wait_called = true;
   sbox_broker_s* broker = worker->broker;
   const int exit_code = sbox_broker_wait(worker->session);
@@ -780,7 +780,7 @@ sbox_status SBOX_CALL BrokerWait(sbox_broker_worker worker,
   if (out_exit_code)
     *out_exit_code = exit_code;
   delete worker;
-  return sbox_ok;
+  return sbox_status_ok;
 }
 
 sbox_broker_api MakeBrokerApi() {
@@ -852,7 +852,7 @@ int RunBrokerPlugin(int argc,
     printf("[sbox] broker: plugin returned with live workers\n");
     return 4;
   }
-  return status == sbox_ok ? 0 : 1;
+  return status == sbox_status_ok ? 0 : 1;
 }
 
 // Role dispatch. Kept deliberately dumb and FIRST so neither persona can fall
@@ -931,7 +931,7 @@ bool SboxTestWorkerKindGuard() {
   worker.target = reinterpret_cast<SboxTarget*>(1);
   const auto api = MakeWorkerApi();
   const uint8_t bytes[] = {1,0,0,0};
-  return api.post_message(&worker, sbox_msg_lifecycle, bytes, 4) == sbox_error_args &&
-      api.post_message(&worker, static_cast<sbox_msg_kind>(99), bytes, 4) == sbox_error_args;
+  return api.post_message(&worker, sbox_msg_kind_lifecycle, bytes, 4) == sbox_status_invalid_arg &&
+      api.post_message(&worker, static_cast<sbox_msg_kind>(99), bytes, 4) == sbox_status_invalid_arg;
 }
 #endif

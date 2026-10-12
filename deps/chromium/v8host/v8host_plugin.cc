@@ -7,26 +7,26 @@
 
 namespace {
 
-sbox_status SBOX_CALL BrokerRun(sbox_broker broker,
+sbox_status SBOX_CDECL BrokerRun(sbox_broker broker,
                                 const sbox_broker_api* api,
                                 const sbox_broker_start* start) {
   return V8HostBrokerRun(broker, api, start);
 }
 
-const sbox_plugin kPlugin = {
-    sizeof(sbox_plugin),       SBOX_ABI_VERSION,      &V8HostEngineConfigure,
+const sbox_plugin_api kPlugin = {
+    sizeof(sbox_plugin_api),       SBOX_ABI_VERSION,      &V8HostEngineConfigure,
     &BrokerRun,                &V8HostEngineWarmup,   &V8HostEngineRun,
     &V8HostEngineShutdown,
 };
 
 }  // namespace
 
-extern "C" __declspec(dllexport) sbox_status SBOX_CALL sbox_plugin_main(
-    uint32_t host_abi_version, const sbox_plugin** out) {
+extern "C" __declspec(dllexport) sbox_status SBOX_CDECL sbox_plugin_main(
+    uint32_t host_abi_version, const sbox_plugin_api** out) {
   if (!out)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   if (host_abi_version != SBOX_ABI_VERSION)
-    return sbox_error_version;
+    return sbox_status_version_mismatch;
   *out = &kPlugin;
-  return sbox_ok;
+  return sbox_status_ok;
 }

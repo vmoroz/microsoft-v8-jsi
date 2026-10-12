@@ -92,7 +92,7 @@ struct Pump {
       if (status == RendezvousStatus::kOk) break;
       connection.Close();
       if (status != RendezvousStatus::kIoFailed ||
-          params.broker_mode != V8HOST_BROKER_SHARED) break;
+          params.broker_mode != v8host_broker_mode_shared) break;
       const ULONGLONG now = ::GetTickCount64();
       if (now >= deadline) break;
       ::WaitForSingleObject(stop, static_cast<DWORD>((std::min)(deadline - now, ULONGLONG{10})));
@@ -235,39 +235,39 @@ class PipeClientTransport final : public ClientTransport {
   explicit PipeClientTransport(TransportParams params)
       : state_(std::make_shared<Pump>(std::move(params))) {}
   ~PipeClientTransport() override { Close(); }
-  V8HostStatus Start() override { return V8HOST_E_CONNECT; }
-  V8HostStatus Start(std::shared_ptr<ClientTransportDelegate> delegate) override {
+  v8host_status Start() override { return v8host_status_connect_failed; }
+  v8host_status Start(std::shared_ptr<ClientTransportDelegate> delegate) override {
     auto& state = *state_;
     std::lock_guard<std::mutex> lock(state.mutex);
     if (state.started || state.terminal || state.closed || !state.stop || !state.wake || !state.launched)
-      return V8HOST_E_CONNECT;
-    if (!delegate) return V8HOST_E_INVALID_ARG;
+      return v8host_status_connect_failed;
+    if (!delegate) return v8host_status_invalid_arg;
     if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-         reinterpret_cast<LPCWSTR>(&RunPump), &state.module)) return V8HOST_E_CONNECT;
+         reinterpret_cast<LPCWSTR>(&RunPump), &state.module)) return v8host_status_connect_failed;
     auto* holder = new (std::nothrow) std::shared_ptr<Pump>(state_);
     HANDLE cleanup = holder ? ::CreateThread(nullptr, 0, CleanupPump, holder, 0, nullptr) : nullptr;
     if (!cleanup) {
       delete holder;
       ::FreeLibrary(state.module);
       state.module = nullptr;
-      return V8HOST_E_CONNECT;
+      return v8host_status_connect_failed;
     }
     ::CloseHandle(cleanup);
     state.delegate = std::move(delegate);
     state.started = true;
     state.thread = ::CreateThread(nullptr, 0, RunPump, &state, 0, nullptr);
     ::SetEvent(state.launched);
-    return state.thread ? V8HOST_OK : V8HOST_E_CONNECT;
+    return state.thread ? v8host_status_ok : v8host_status_connect_failed;
   }
-  V8HostStatus SendFrame(const uint8_t* bytes, size_t len) override {
+  v8host_status SendFrame(const uint8_t* bytes, size_t len) override {
     wire::FrameHeader header;
     const uint8_t* payload = nullptr;
     size_t payload_len = 0;
     if (wire::DecodeAndValidateFrame(bytes, len, &header, &payload, &payload_len) != wire::DecodeStatus::kOk)
-      return V8HOST_E_PROTOCOL;
+      return v8host_status_protocol_error;
     auto& state = *state_;
     std::lock_guard<std::mutex> lock(state.mutex);
-    if (state.closed || state.terminal) return V8HOST_E_CONNECT;
+    if (state.closed || state.terminal) return v8host_status_connect_failed;
     const bool relay = header.type == wire::MessageType::RELAY_TO_WORKER;
     const uint64_t key = (uint64_t{header.session_id} << 32) | header.run_id;
     const size_t charge = len;
@@ -276,10 +276,10 @@ class PipeClientTransport final : public ClientTransport {
     if (relay) {
       if (charge > wire::kMaxQueuedRelayBytesPerRun - run_bytes ||
           charge > wire::kMaxQueuedRelayBytesPerConnection - state.relay_bytes)
-        return V8HOST_E_QUOTA;
+        return v8host_status_quota_exceeded;
     } else if (state.controls >= wire::kMaxControlQueueRequests ||
                charge > wire::kMaxControlQueueBytes - state.control_bytes) {
-      return V8HOST_E_QUOTA;
+      return v8host_status_quota_exceeded;
     }
     Outbound item;
     item.bytes.assign(bytes, bytes + len);
@@ -296,7 +296,7 @@ class PipeClientTransport final : public ClientTransport {
       state.control_bytes += charge;
     }
     ::SetEvent(state.wake);
-    return V8HOST_OK;
+    return v8host_status_ok;
   }
 #ifdef V8HOST_CLIENT_TESTING
   size_t QueuedBytesForTesting() override {

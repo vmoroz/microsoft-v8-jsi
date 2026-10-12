@@ -106,7 +106,7 @@ inline void HostLog(const char* fmt, ...) {
       reinterpret_cast<decltype(&name)>(::GetProcAddress((mod), #name)); \
   if (!p_##name) {                                                       \
     printf("[v8host] missing v8jsi export: %s\n", #name);                \
-    return sbox_error;                                                   \
+    return sbox_status_failed;                                                   \
   }
 
 void PrintAcgStatus() {
@@ -386,7 +386,7 @@ jsi_error_code JSI_CDECL ConfigureRuntime(void* /*cb_data*/, jsi_config cfg) {
 // (design §8.3), so the carrier kind is not itself semantic.
 sbox_status PostEnvelope(const v8host::RunEnvelope& env) {
   const std::vector<uint8_t> frame = v8host::EncodeRunEnvelope(env);
-  return g_api->post_message(g_worker, sbox_msg_binary, frame.data(),
+  return g_api->post_message(g_worker, sbox_msg_kind_binary, frame.data(),
                              frame.size());
 }
 
@@ -448,8 +448,8 @@ void InstallHostObject(Runtime& rt) {
             if (count >= 1 && args[0].isString()) {
               std::string s = args[0].getString(rt).utf8(rt);
               const sbox_status result =
-                  PostGuestOutput(sbox_msg_string, s.data(), s.size());
-              if (result != sbox_ok) {
+                  PostGuestOutput(sbox_msg_kind_string, s.data(), s.size());
+              if (result != sbox_status_ok) {
                 throw JSError(rt, "host.postMessage failed: result=" +
                                      std::to_string(static_cast<int>(result)));
               }
@@ -469,8 +469,8 @@ void InstallHostObject(Runtime& rt) {
               if (o.isArrayBuffer(rt)) {
                 ArrayBuffer ab = o.getArrayBuffer(rt);
                 const sbox_status result =
-                    PostGuestOutput(sbox_msg_binary, ab.data(rt), ab.size(rt));
-                if (result != sbox_ok) {
+                    PostGuestOutput(sbox_msg_kind_binary, ab.data(rt), ab.size(rt));
+                if (result != sbox_status_ok) {
                   throw JSError(rt, "host.postMessageBinary failed: result=" +
                                        std::to_string(static_cast<int>(result)));
                 }
@@ -493,12 +493,12 @@ void InstallHostObject(Runtime& rt) {
             if (count >= 1) {
               if (args[0].isString()) {
                 std::string s = args[0].getString(rt).utf8(rt);
-                PostGuestOutput(sbox_msg_string, s.data(), s.size());
+                PostGuestOutput(sbox_msg_kind_string, s.data(), s.size());
               } else if (args[0].isObject()) {
                 Object o = args[0].getObject(rt);
                 if (o.isArrayBuffer(rt)) {
                   ArrayBuffer ab = o.getArrayBuffer(rt);
-                  PostGuestOutput(sbox_msg_binary, ab.data(rt), ab.size(rt));
+                  PostGuestOutput(sbox_msg_kind_binary, ab.data(rt), ab.size(rt));
                 }
               }
             }
@@ -525,7 +525,7 @@ void DeliverToJs(Runtime& rt, sbox_msg_kind kind, const void* data,
     return;
   Function cb = cb_obj.getFunction(rt);
 
-  if (kind == sbox_msg_string) {
+  if (kind == sbox_msg_kind_string) {
     cb.call(rt, String::createFromUtf8(rt, static_cast<const uint8_t*>(data),
                                        len));
   } else {
@@ -592,9 +592,9 @@ struct RunLoopCtx {
 // before the run-dispatch rework.
 void DeliverAmbient(RunLoopCtx* c, sbox_msg_kind kind, const void* data,
                     size_t len) {
-  if (kind == sbox_msg_string)
+  if (kind == sbox_msg_kind_string)
     ++c->strings;
-  else if (kind == sbox_msg_binary)
+  else if (kind == sbox_msg_kind_binary)
     ++c->binaries;
   else {
     printf("[v8host] invalid inbound message kind=%d\n", kind);
@@ -616,7 +616,7 @@ void DeliverAmbient(RunLoopCtx* c, sbox_msg_kind kind, const void* data,
 // back into C, so catch everything here. Branches each frame (design §10.3): a
 // bare frame (no envelope magic) is the dev-ambient path; an envelope is a
 // coordinator-driven START/RELAY/CANCEL.
-void SBOX_CALL OnInbound(void* ctx, sbox_msg_kind kind, const void* data,
+void SBOX_CDECL OnInbound(void* ctx, sbox_msg_kind kind, const void* data,
                          size_t len) {
   auto* c = static_cast<RunLoopCtx*>(ctx);
   if (c->failed)
@@ -675,9 +675,9 @@ void SBOX_CALL OnInbound(void* ctx, sbox_msg_kind kind, const void* data,
         break;
       }
       const sbox_msg_kind rk =
-          env.relay_kind == static_cast<int32_t>(sbox_msg_binary)
-              ? sbox_msg_binary
-              : sbox_msg_string;
+          env.relay_kind == static_cast<int32_t>(sbox_msg_kind_binary)
+              ? sbox_msg_kind_binary
+              : sbox_msg_kind_string;
       try {
         DeliverToJs(*c->rt, rk, env.payload.data(), env.payload.size());
       } catch (const std::exception& e) {
@@ -779,7 +779,7 @@ void ServicePendingStarts(RunLoopCtx *c, bool closing) {
       c->run_error = true;
     c->replaying = true;
     for (auto &frame : pending.frames)
-      OnInbound(c, sbox_msg_binary, frame.data(), frame.size());
+      OnInbound(c, sbox_msg_kind_binary, frame.data(), frame.size());
     c->replaying = false;
     c->rt->drainMicrotasks();
     ServiceActiveRunTerminal(c);
@@ -807,7 +807,7 @@ bool V8HostEngineTestBatch(const std::vector<v8host::RunEnvelope> &batch, bool c
   *peak_bytes = *peak_frames = 0;
   for (const auto &env : batch) {
     auto bytes = v8host::EncodeRunEnvelope(env);
-    OnInbound(&context, sbox_msg_binary, bytes.data(), bytes.size());
+    OnInbound(&context, sbox_msg_kind_binary, bytes.data(), bytes.size());
     *peak_bytes = (std::max)(*peak_bytes, context.bridge_bytes);
     *peak_frames = (std::max)(*peak_frames, context.bridge_frames);
   }
@@ -824,12 +824,12 @@ bool V8HostEngineTestBatch(const std::vector<v8host::RunEnvelope> &batch, bool c
 // PRE-lockdown. Load the engine, create the JSI runtime, install the `host`
 // object. ACG forbids codegen/patching after this returns, so ALL engine setup
 // (DLL load, --jitless, snapshot deserialize, runtime create) happens here.
-// Returns sbox_ok on success, non-zero (fail-closed) otherwise.
+// Returns sbox_status_ok on success, non-zero (fail-closed) otherwise.
 //==========================================================================
-sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
+sbox_status SBOX_CDECL V8HostEngineWarmup(sbox_worker w,
                                          const sbox_worker_api* api) {
   if (!w || !api || api->struct_size < sizeof(sbox_worker_api))
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   g_worker = w;
   g_api = api;
   g_perf.init();
@@ -848,11 +848,11 @@ sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
   {
     const void* pd = nullptr;
     size_t pd_len = 0;
-    if (api->get_plugin_data(w, &pd, &pd_len) != sbox_ok || !pd || pd_len == 0 ||
+    if (api->get_plugin_data(w, &pd, &pd_len) != sbox_status_ok || !pd || pd_len == 0 ||
         !v8host::V8HostWorkerProfileV1::Decode(
             static_cast<const uint8_t*>(pd), pd_len, &prof)) {
       printf("[v8host] warmup: missing/invalid worker profile plugin_data\n");
-      return sbox_error;
+      return sbox_status_failed;
     }
   }
   const bool jitless = prof.jitless != 0;
@@ -862,7 +862,7 @@ sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
          jitless ? "Untrusted (jitless + ACG)" : "Trusted (JIT, ACG off)");
   if (engine_dll.empty()) {
     printf("[v8host] warmup: empty engine DLL in run profile\n");
-    return sbox_error;
+    return sbox_status_failed;
   }
 
   // Startup snapshot from the run profile (read NOW, pre-lockdown). A bound
@@ -878,7 +878,7 @@ sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
     } else {
       printf("[v8host] warmup: bound startup snapshot %ls could not be read; "
              "failing closed\n", snapshot_path.c_str());
-      return sbox_error;
+      return sbox_status_failed;
     }
   }
 
@@ -891,14 +891,14 @@ sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
   if (!ReadGuestPath(guest_js_path)) {
     printf("[v8host] stage=guest-input environment query failed: error=%lu\n",
            ::GetLastError());
-    return sbox_error;
+    return sbox_status_failed;
   }
   g_use_guest_file = !guest_js_path.empty();
   if (g_use_guest_file) {
     if (!ReadFileBytes(guest_js_path, g_guest_src)) {
       printf("[v8host] stage=guest-input cannot read %ls: error=%lu\n",
              guest_js_path.c_str(), ::GetLastError());
-      return sbox_error;
+      return sbox_status_failed;
     }
     printf("[v8host] guest JS from %ls (%zu bytes)\n", guest_js_path.c_str(),
            g_guest_src.size());
@@ -923,7 +923,7 @@ sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
   if (!g_engine) {
     printf("[v8host] LoadLibrary(%ls) failed: %lu\n", engine_dll.c_str(),
            ::GetLastError());
-    return sbox_error;
+    return sbox_status_failed;
   }
   const LONGLONG t_engine_loaded = g_perf.now();
   g_perf.emit("engine-load", t_entry, t_engine_loaded);
@@ -962,7 +962,7 @@ sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
                "closed\n", why);
         g_snapshot_blob.clear();
         g_snapshot_blob.shrink_to_fit();
-        return sbox_error;
+        return sbox_status_failed;
       }
       printf("[v8host] startup snapshot compatible with engine\n");
     }
@@ -989,7 +989,7 @@ sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
         p_v8_create_runtime, &ConfigureRuntime, nullptr);
     if (!rt_owner) {
       printf("[v8host] makeJsiAbiRuntime failed\n");
-      return sbox_error;
+      return sbox_status_failed;
     }
     g_rt = rt_owner.release();  // ownership moves to g_rt; deleted in shutdown
     const LONGLONG t_runtime_created = g_perf.now();
@@ -998,24 +998,24 @@ sbox_status SBOX_CALL V8HostEngineWarmup(sbox_worker w,
     InstallHostObject(*g_rt);
   } catch (const JSError& e) {
     printf("[v8host] warmup JS error: %s\n", e.getMessage().c_str());
-    return sbox_error;
+    return sbox_status_failed;
   } catch (const std::exception& e) {
     printf("[v8host] warmup exception: %s\n", e.what());
-    return sbox_error;
+    return sbox_status_failed;
   }
-  return sbox_ok;
+  return sbox_status_ok;
 }
 
 //==========================================================================
 // POST-lockdown. ACG MUST now be in force. Prove it with a FAILED executable
 // allocation (observable kernel state), then evaluate the guest (interpreted
 // under jitless, safe post-ACG) and own the JS thread in the message loop until
-// the host closes the channel. Returns sbox_ok on clean completion.
+// the host closes the channel. Returns sbox_status_ok on clean completion.
 //==========================================================================
-sbox_status SBOX_CALL V8HostEngineRun(sbox_worker worker,
+sbox_status SBOX_CDECL V8HostEngineRun(sbox_worker worker,
                                       const sbox_worker_api* api) {
   if (!worker || !api || api->struct_size < sizeof(sbox_worker_api))
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   g_worker = worker;
   g_api = api;
 
@@ -1030,13 +1030,13 @@ sbox_status SBOX_CALL V8HostEngineRun(sbox_worker worker,
   // in force post-lockdown (executable alloc blocked -> error 1655); trusted (JIT)
   // MUST be able to allocate executable memory. Either inconsistency fails closed.
   if (g_expect_acg && exec_post)
-    return sbox_error;  // untrusted but dynamic code allowed -> ACG failure
+    return sbox_status_failed;  // untrusted but dynamic code allowed -> ACG failure
   if (!g_expect_acg && !exec_post)
-    return sbox_error;  // trusted but executable alloc blocked -> inconsistent
+    return sbox_status_failed;  // trusted but executable alloc blocked -> inconsistent
 
   if (!g_rt) {
     printf("[v8host] run: no runtime (warmup did not complete)\n");
-    return sbox_error;
+    return sbox_status_failed;
   }
   Runtime& rt = *g_rt;
 
@@ -1070,7 +1070,7 @@ sbox_status SBOX_CALL V8HostEngineRun(sbox_worker worker,
     HANDLE close_evt = static_cast<HANDLE>(g_api->close_event(g_worker));
     if (!inbound || !close_evt) {
       printf("[v8host] run: channel handles missing\n");
-      return sbox_error;
+      return sbox_status_failed;
     }
     HANDLE waits[3] = {inbound, g_tasks->wake, close_evt};
     printf("[v8host] entering JS message loop (until host closes channel)\n");
@@ -1110,7 +1110,7 @@ sbox_status SBOX_CALL V8HostEngineRun(sbox_worker worker,
                  "(postMessage/onmessage) under lockdown (jitless + ACG) via "
                  "the JSI C++ API over a generic, V8-agnostic container"
                : "FAIL");
-  return js_ok ? sbox_ok : sbox_error;
+  return js_ok ? sbox_status_ok : sbox_status_failed;
 }
 
 //==========================================================================
@@ -1118,7 +1118,7 @@ sbox_status SBOX_CALL V8HostEngineRun(sbox_worker worker,
 // destruction fires TaskRunnerDeleteCb, which touches g_tasks), then free the
 // engine handle.
 //==========================================================================
-void SBOX_CALL V8HostEngineShutdown(sbox_worker /*w*/) {
+void SBOX_CDECL V8HostEngineShutdown(sbox_worker /*w*/) {
   if (g_rt) {
     delete g_rt;
     g_rt = nullptr;
@@ -1160,25 +1160,25 @@ static void BuildDevSpawnConfig(v8host::V8HostSpawnConfigV1& spawn) {
   spawn.tier = trusted ? v8host::kTierTrusted : v8host::kTierUntrusted;
   spawn.effective_tier = spawn.tier;
   spawn.prohibit_dynamic_code = !trusted;
-  spawn.integrity = sbox_integrity_low;
-  spawn.delayed_integrity = sbox_integrity_untrusted;
-  spawn.initial_token = sbox_token_restricted_same_access;
-  spawn.lockdown_token = sbox_token_lockdown;
+  spawn.integrity = sbox_integrity_level_low;
+  spawn.delayed_integrity = sbox_integrity_level_untrusted;
+  spawn.initial_token = sbox_token_level_restricted_same_access;
+  spawn.lockdown_token = sbox_token_level_lockdown;
   spawn.use_app_container = false;
   spawn.low_privilege_app_container = false;
   spawn.engine_dll = WideToUtf8(engine);
   spawn.snapshot_path = WideToUtf8(EnvW(L"V8HOST_SNAPSHOT"));
 }
 
-sbox_status SBOX_CALL V8HostEngineConfigure(sbox_config cfg,
+sbox_status SBOX_CDECL V8HostEngineConfigure(sbox_config cfg,
                                             const sbox_config_api* api,
                                             const void* configure_data,
                                             size_t configure_data_size) {
   if (!cfg || !api || api->struct_size < sizeof(sbox_config_api))
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
   if ((configure_data_size && !configure_data) ||
       configure_data_size > 64 * 1024)
-    return sbox_error_args;
+    return sbox_status_invalid_arg;
 
   v8host::V8HostSpawnConfigV1 spawn;
   if (configure_data && configure_data_size) {
@@ -1188,7 +1188,7 @@ sbox_status SBOX_CALL V8HostEngineConfigure(sbox_config cfg,
             static_cast<const uint8_t*>(configure_data), configure_data_size,
             &spawn)) {
       printf("[v8host] configure: bad V8HostSpawnConfigV1\n");
-      return sbox_error;
+      return sbox_status_failed;
     }
   } else {
     BuildDevSpawnConfig(spawn);
@@ -1199,7 +1199,7 @@ sbox_status SBOX_CALL V8HostEngineConfigure(sbox_config cfg,
   // opaque plugin_data. Any rejected setter or inconsistency fails closed.
   if (!v8host::ApplySpawnConfig(spawn, api, cfg)) {
     printf("[v8host] configure: ApplySpawnConfig failed (fail closed)\n");
-    return sbox_error;
+    return sbox_status_failed;
   }
-  return sbox_ok;
+  return sbox_status_ok;
 }

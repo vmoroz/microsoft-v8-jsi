@@ -492,11 +492,11 @@ bool EnvelopeFits(v8host::RunEnvelopeType type, size_t size) {
 }
 bool ValidateSessionConfig(const SessionConfig &config, BrokerMode mode) {
   if ((config.broker_mode != 0 && config.broker_mode != 1) || config.broker_mode != static_cast<int32_t>(mode) ||
-      (config.tier != kTierUntrusted && config.tier != kTierTrusted) || config.integrity < sbox_integrity_low ||
-      config.integrity > sbox_integrity_untrusted || config.delayed_integrity < sbox_integrity_low ||
-      config.delayed_integrity > sbox_integrity_untrusted || config.initial_token < sbox_token_lockdown ||
-      config.initial_token > sbox_token_restricted_same_access || config.lockdown_token < sbox_token_lockdown ||
-      config.lockdown_token > sbox_token_restricted_same_access ||
+      (config.tier != kTierUntrusted && config.tier != kTierTrusted) || config.integrity < sbox_integrity_level_low ||
+      config.integrity > sbox_integrity_level_untrusted || config.delayed_integrity < sbox_integrity_level_low ||
+      config.delayed_integrity > sbox_integrity_level_untrusted || config.initial_token < sbox_token_level_lockdown ||
+      config.initial_token > sbox_token_level_restricted_same_access || config.lockdown_token < sbox_token_level_lockdown ||
+      config.lockdown_token > sbox_token_level_restricted_same_access ||
       (config.tier == kTierUntrusted) != config.prohibit_dynamic_code)
     return false;
   if (config.file_rules.size() > protocol::kMaxFileRules || config.capabilities.size() > protocol::kMaxCapabilities ||
@@ -646,7 +646,7 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
     const uint8_t *body = nullptr;
     size_t body_size = 0;
     if (!protocol::DecodeRelayPayload(payload, payload_size, &kind, &body, &body_size) ||
-        (kind != sbox_msg_string && kind != sbox_msg_binary))
+        (kind != sbox_msg_kind_string && kind != sbox_msg_kind_binary))
       return false;
     Pump(conn);
     auto sit = conn.sessions.find(h.session_id);
@@ -854,7 +854,7 @@ void Worker::DiscardMailbox() {
     mailbox[head % mailbox.size()].credit.Reset();
   mailbox_head = tail; byte_head = byte_tail.load();
 }
-void SBOX_CALL Worker::OnMessage(void *context, sbox_msg_kind kind, const void *data, size_t size) {
+void SBOX_CDECL Worker::OnMessage(void *context, sbox_msg_kind kind, const void *data, size_t size) {
   auto &worker = *static_cast<Worker *>(context);
   auto &conn = *worker.session->conn;
   // One core reader produces; ordinary strand bookkeeping never excludes it.
@@ -879,9 +879,9 @@ void SBOX_CALL Worker::OnMessage(void *context, sbox_msg_kind kind, const void *
     std::shared_ptr<RelayLedger> ledger;
     size_t charged = size + protocol::kFrameHeaderSize;
     bool late = false;
-    if (kind == sbox_msg_binary && size >= v8host::kRunEnvelopeHeaderSize + 4 && v8host::IsRunEnvelope(bytes, size) &&
+    if (kind == sbox_msg_kind_binary && size >= v8host::kRunEnvelopeHeaderSize + 4 && v8host::IsRunEnvelope(bytes, size) &&
         bytes[4] == static_cast<uint8_t>(v8host::RunEnvelopeType::kRelay) && !bytes[5] && !bytes[6] && !bytes[7] &&
-        (bytes[12] == sbox_msg_string || bytes[12] == sbox_msg_binary) && !bytes[13] && !bytes[14] && !bytes[15]) {
+        (bytes[12] == sbox_msg_kind_string || bytes[12] == sbox_msg_kind_binary) && !bytes[13] && !bytes[14] && !bytes[15]) {
       const uint32_t id = bytes[8] | (uint32_t(bytes[9]) << 8) | (uint32_t(bytes[10]) << 16) | (uint32_t(bytes[11]) << 24);
       for (const auto &slot : worker.published) {
         auto *candidate = slot.load();
@@ -906,7 +906,7 @@ void SBOX_CALL Worker::OnMessage(void *context, sbox_msg_kind kind, const void *
         return;
       }
     }
-    if (kind == sbox_msg_lifecycle && size == 4) charged = protocol::kFrameHeaderSize;
+    if (kind == sbox_msg_kind_lifecycle && size == 4) charged = protocol::kFrameHeaderSize;
     credit = conn.ChargeOutput(charged, std::move(ledger));
     // A run overflow is owned by its ledger and does not close sibling sessions.
     if (!credit.conn && ::WaitForSingleObject(conn.stop, 0) != WAIT_OBJECT_0) {
@@ -970,7 +970,7 @@ bool Router::Spawn(Session &session) {
     return false;
   sbox_broker_worker handle = nullptr;
   if (api_->configure_and_spawn(broker_, config.data(), config.size(), &Worker::OnMessage, &worker, &handle) !=
-          sbox_ok ||
+          sbox_status_ok ||
       !handle)
     return false;
   worker.handle = handle;
@@ -1017,11 +1017,11 @@ PostOutcome Router::Post(Session &session, const std::vector<uint8_t> &bytes) {
 #if defined(V8HOST_ROUTER_TESTING)
   if (test_post) return test_post(bytes);
 #endif
-  const auto status = api_->post_message(worker.handle, sbox_msg_binary, bytes.data(), bytes.size());
-  // The generic host adapter maps core not-written failures to sbox_error;
+  const auto status = api_->post_message(worker.handle, sbox_msg_kind_binary, bytes.data(), bytes.size());
+  // The generic host adapter maps core not-written failures to sbox_status_failed;
   // this requires a validated size and an unreaped handle.
-  return status == sbox_ok ? PostOutcome::kWritten
-      : status == sbox_error ? PostOutcome::kNotWritten : PostOutcome::kAmbiguous;
+  return status == sbox_status_ok ? PostOutcome::kWritten
+      : status == sbox_status_failed ? PostOutcome::kNotWritten : PostOutcome::kAmbiguous;
 }
 bool Router::Send(Session &session, const std::vector<uint8_t> &bytes, uint32_t id, v8host::RunEnvelopeType type) {
   auto &worker = *session.worker;
@@ -1171,26 +1171,26 @@ void Router::Pump(Connection &conn) {
         break;
       bool valid = true;
       if (!fact.credit.relay) fact.credit.Reset();
-      if (fact.kind == sbox_msg_lifecycle) {
+      if (fact.kind == sbox_msg_kind_lifecycle) {
         uint32_t phase = 0;
         if (fact.size == 4)
           phase = data[0] | (uint32_t(data[1]) << 8) | (uint32_t(data[2]) << 16) |
               (uint32_t(data[3]) << 24);
-        if (phase == SBOX_LIFECYCLE_STARTUP) {
+        if (phase == sbox_lifecycle_phase_startup) {
           if (!worker.startup) {
             worker.startup = true;
             worker.engine_image = HeldFile();
             session.state = SessionState::kStartupReady;
             conn.Enqueue(protocol::BuildStartupReadyFrame(ReplyHeader(conn, id)));
           }
-        } else if (phase == SBOX_LIFECYCLE_SECURITY && worker.startup) {
+        } else if (phase == sbox_lifecycle_phase_security && worker.startup) {
           if (!worker.security) {
             worker.security = true;
             session.state = SessionState::kOpen;
             worker.state = WorkerState::kRunning;
             conn.Enqueue(protocol::BuildSecurityReadyFrame(ReplyHeader(conn, id)));
           }
-        } else if (phase == SBOX_LIFECYCLE_EXIT) {
+        } else if (phase == sbox_lifecycle_phase_exit) {
           CloseSession(conn, id, RunState::kWorkerExited);
           break;
         } else {
@@ -1198,12 +1198,12 @@ void Router::Pump(Connection &conn) {
         }
       } else {
         v8host::RunEnvelope env;
-        valid = fact.kind == sbox_msg_binary && v8host::DecodeRunEnvelope(data.data(), fact.size, &env) &&
+        valid = fact.kind == sbox_msg_kind_binary && v8host::DecodeRunEnvelope(data.data(), fact.size, &env) &&
             worker.security && env.run_id != 0 &&
             (env.type == v8host::RunEnvelopeType::kRelay || env.type == v8host::RunEnvelopeType::kResult ||
              env.type == v8host::RunEnvelopeType::kRunError) &&
-            (env.type != v8host::RunEnvelopeType::kRelay || env.relay_kind == sbox_msg_string ||
-             env.relay_kind == sbox_msg_binary);
+            (env.type != v8host::RunEnvelopeType::kRelay || env.relay_kind == sbox_msg_kind_string ||
+             env.relay_kind == sbox_msg_kind_binary);
         if (valid && env.run_id != worker.engine_busy_run_id && env.run_id <= session.highest_run_id)
           continue;
         valid = valid && env.run_id == worker.engine_busy_run_id;
@@ -1216,7 +1216,7 @@ void Router::Pump(Connection &conn) {
             rit = session.runs.end();
           }
           if (env.type == v8host::RunEnvelopeType::kRelay) {
-            valid = env.relay_kind == sbox_msg_string || env.relay_kind == sbox_msg_binary;
+            valid = env.relay_kind == sbox_msg_kind_string || env.relay_kind == sbox_msg_kind_binary;
             if (valid && rit != session.runs.end()) {
               auto header = ReplyHeader(conn, id, env.run_id);
               header.type = protocol::MessageType::RELAY_FROM_WORKER;

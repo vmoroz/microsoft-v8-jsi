@@ -99,7 +99,7 @@ struct Run {
 enum class PostOutcome { kWritten, kNotWritten, kAmbiguous };
 struct Worker {
   struct Fact {
-    sbox_msg_kind kind = sbox_msg_binary;
+    sbox_msg_kind kind = sbox_msg_kind_binary;
     size_t size = 0;
     size_t offset = 0;
     OutputCredit credit;
@@ -131,7 +131,7 @@ struct Worker {
   v8host::RunEnvelopeType retry_type = v8host::RunEnvelopeType::kStart;
   uint32_t engine_busy_run_id = 0;
   bool startup = false, security = false;
-  static void SBOX_CALL OnMessage(void *, sbox_msg_kind, const void *, size_t);
+  static void SBOX_CDECL OnMessage(void *, sbox_msg_kind, const void *, size_t);
   static DWORD WINAPI Reap(void *);
   sbox_broker_worker handle = nullptr;
   std::atomic<WorkerState> state{WorkerState::kNone};

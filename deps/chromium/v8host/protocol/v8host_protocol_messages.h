@@ -138,7 +138,7 @@ struct StartRunPayload {
 // RESULT (broker -> client, design §9). A run's terminal disposition. The guest's
 // own output rides ordinary RELAY_FROM_WORKER during the run; RESULT carries no
 // guest bytes, so the result channel stays non-data and the terminal stays
-// single. kCancelled is the inbound frame that drives V8HOST_RUN_EVENT_CANCELLED.
+// single. kCancelled is the inbound frame that drives v8host_run_event_cancelled.
 enum class ResultDisposition : uint32_t {
   kCompleted = 0,  // the run finished normally
   kCancelled = 1,  // the run ended in response to CANCEL_RUN
