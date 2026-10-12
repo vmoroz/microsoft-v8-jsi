@@ -956,8 +956,8 @@ bool PopWorkerExit(router::Connection& conn, uint32_t session_id = 1) {
   return PopFrame(conn, &h) && h.type == protocol::MessageType::WORKER_EXIT &&
       h.session_id == session_id && h.run_id == 0 && h.request_id == 0 && conn.out_queue.empty();
 }
-bool LifecycleAbi5(std::string* detail) {
-  bool ok = SBOX_ABI_VERSION == 5u;
+bool LifecycleAbi6(std::string* detail) {
+  bool ok = SBOX_ABI_VERSION == 6u;
   for (const auto* dll : {L"v8host.dll", L"v8host_abi4_plugin.dll"}) {
     HMODULE module = ::LoadLibraryExW((ExecutableDirectory() + L"\\" + dll).c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
@@ -966,18 +966,18 @@ bool LifecycleAbi5(std::string* detail) {
     auto entry = reinterpret_cast<sbox_plugin_main_fn>(::GetProcAddress(module, SBOX_PLUGIN_ENTRY));
     const bool old = std::wstring(dll) == L"v8host_abi4_plugin.dll";
     const sbox_plugin_api* plugin = nullptr;
-    ok = entry && entry(old ? 4u : 5u, &plugin) == sbox_status_ok && plugin &&
-        plugin->abi_version == (old ? 4u : 5u) && plugin->configure && plugin->broker_run &&
+    ok = entry && entry(old ? 4u : 6u, &plugin) == sbox_status_ok && plugin &&
+        plugin->abi_version == (old ? 4u : 6u) && plugin->configure && plugin->broker_run &&
         plugin->warmup && plugin->run && plugin->shutdown && ok;
     plugin = nullptr;
-    ok = entry && entry(old ? 5u : 4u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
+    ok = entry && entry(old ? 6u : 4u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
     ::FreeLibrary(module);
   }
   DWORD code = 0;
   const std::wstring command = L"\"" + ExecutableDirectory() +
       L"\\sbox.exe\" --broker --plugin v8host_abi4_plugin.dll";
   ok = v8host::test::RunProcess(command, &code) && code == 3 && ok;
-  if (!ok) *detail = "matching ABI/4-5 rejection";
+  if (!ok) *detail = "matching ABI/4-6 rejection";
   return ok;
 }
 bool CoreLifecycleCase(const wchar_t* args, std::string* detail) {
@@ -4715,7 +4715,7 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
     *detail = "public held broker/worker reaping"; return false;
   }
   MSG msg; while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) ::DispatchMessageW(&msg);
-  *detail = "production DLL: seven client exports; two same-session runs; distinct copied string+binary "
+  *detail = "production DLL: client function + setter exports; two same-session runs; distinct copied string+binary "
       "JS transforms; readiness/FIFO; one COMPLETED/OK per run; callback close; one worker reaped";
   return capture.valid && capture.terminal == 2 && capture.disconnects == 0;
 }
@@ -5734,7 +5734,7 @@ int main(int argc, char** argv) {
       {"router", "worker-mailbox-pump-bound", MailboxPumpBound},
       {"cancel", "cancels-first", CancelsFirst},
       {"cancel", "completes-first", CompletesFirst},
-      {"run", "lifecycle-abi5", LifecycleAbi5},
+      {"run", "lifecycle-abi6", LifecycleAbi6},
       {"run", "exit-fact-origin", ExitFactOrigin},
       {"run", "exit-fact-final-drain", ExitFinalDrain},
       {"run", "smoke-lifecycle-two", SmokeLifecycleTwo},

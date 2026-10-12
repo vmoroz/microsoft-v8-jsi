@@ -4,9 +4,13 @@
 `sbox.exe` is generic: the app knowledge lives here, in a plugin resolved by
 `--plugin v8host.dll`. The container owns `main()` and drives the plugin-ABI
 lifecycle — `configure` (broker) → `warmup` pre-lockdown → `lower_token` → `run`
-post-lockdown → `shutdown`. The payload exports only the single
-`sbox_plugin_main` entry (see [`sbox.h`](../sandbox_dll/sbox.h)), which returns a
-vtable of those four functions. It links the JSI C++ API (`jsi_cpp`) but **never
+post-lockdown → `shutdown`. The plugin side is the single `sbox_plugin_main`
+entry (see [`sbox.h`](../sandbox_dll/sbox.h), `SBOX_ABI_VERSION` 6), which returns
+the `sbox_plugin_api` vtable of those functions. The DLL also exports the
+`v8host_*` client API for hosts that drive `sbox.exe` (see
+[`v8host_client.h`](../../../src/public/v8host_client.h), `V8HOST_ABI_VERSION`
+2): `v8host_initialize`, the session and run functions, and the
+`v8host_config_*` / `v8host_run_config_*` setters (29 exports in all). It links the JSI C++ API (`jsi_cpp`) but **never
 the sandbox core** — it reaches the message channel only through the
 `sbox_worker_api` function pointers the container hands it. This replaces the
 retired two-image topology where a `v8host.exe` target owned `main()` and loaded
