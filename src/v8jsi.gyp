@@ -88,7 +88,7 @@
       '<(v8jsi_root)/src/jsi_abi/jsi_abi_helpers.h',
       '<(v8jsi_root)/src/jsi_abi/jsi_abi_v8.cpp',
       '<(v8jsi_root)/src/jsi_abi/jsi_abi_v8_internal.h',
-      '<(v8jsi_root)/src/jsi_abi/v8_jsi_config.h',
+      '<(v8jsi_root)/src/jsi_abi/v8_jsi_abi.h',
       '<(v8jsi_root)/src/jsi_abi/v8_snapshot_container.h',
       '<(v8jsi_root)/src/jsi_abi/v8_node_api_attach.h',
     ],
@@ -231,6 +231,8 @@
       'defines': [
         'BUILDING_V8JSI_SHARED',
         'JSI_ABI_BUILDING',
+        'JSI_ABI_IMPL',
+        'V8_JSI_ABI_IMPL',
         'V8JSI_ENABLE_NODE_API',
       ],
 
@@ -379,7 +381,7 @@
         '<(v8jsi_root)/src/jsi_abi/JsiAbiRuntime.cpp',
         '<(v8jsi_root)/src/jsi_abi/jsi_abi.h',
         '<(v8jsi_root)/src/jsi_abi/jsi_abi_helpers.h',
-        '<(v8jsi_root)/src/jsi_abi/v8_jsi_config.h',
+        '<(v8jsi_root)/src/jsi_abi/v8_jsi_abi.h',
         # Consumer-side definition of makeV8Runtime. Ships as source in
         # the NuGet; compiled here to prove the round-trip works end-to-end.
         '<(v8jsi_root)/src/public/V8JsiRuntime.cpp',
@@ -443,7 +445,7 @@
       'type': 'executable',
 
       # Offline startup-snapshot builder. It LoadLibrary's the engine DLL
-      # (v8jsi.dll / v8jsisb.dll) and resolves v8_create_startup_snapshot at
+      # (v8jsi.dll / v8jsisb.dll) and resolves v8_jsi_abi_snapshot_create at
       # runtime, so it links NO V8 and has NO build dependency on the v8jsi
       # target: the SAME exe drives either engine, and using the actual shipped
       # DLL guarantees the blob matches that engine's V8 build flags. Built

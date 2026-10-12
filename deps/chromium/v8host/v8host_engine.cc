@@ -63,7 +63,7 @@
 #include <jsi/jsi.h>
 
 #include "jsi_abi/JsiAbiRuntime.h"
-#include "jsi_abi/v8_jsi_config.h"
+#include "jsi_abi/v8_jsi_abi.h"
 
 namespace {
 
@@ -276,7 +276,7 @@ inline void MarkFirstPost() {
 
 struct CTask {
   void* data;
-  v8_jsi_task_run_cb run;
+  v8_jsi_abi_task_run_cb run;
   jsi_data_delete_cb del;
   void* deleter_data;
 };
@@ -292,8 +292,8 @@ struct TaskQueue {
 TaskQueue* g_tasks = nullptr;
 
 // Called by the DLL (possibly on a background thread) to post a foreground task.
-void JSI_CDECL PostTaskCb(void* runner_data, void* task_data,
-                          v8_jsi_task_run_cb task_run_cb,
+void JSI_ABI_CDECL PostTaskCb(void* runner_data, void* task_data,
+                          v8_jsi_abi_task_run_cb task_run_cb,
                           jsi_data_delete_cb task_data_delete_cb,
                           void* deleter_data) {
   auto* q = static_cast<TaskQueue*>(runner_data);
@@ -306,7 +306,7 @@ void JSI_CDECL PostTaskCb(void* runner_data, void* task_data,
 // Called when the runtime is destroyed. runner_data points at g_tasks (process
 // lifetime) so we don't free it — but fire the delete cb of any task still
 // queued so nothing leaks.
-void JSI_CDECL TaskRunnerDeleteCb(void* runner_data, void* /*deleter_data*/) {
+void JSI_ABI_CDECL TaskRunnerDeleteCb(void* runner_data, void* /*deleter_data*/) {
   auto* q = static_cast<TaskQueue*>(runner_data);
   ::EnterCriticalSection(&q->cs);
   for (auto& t : q->tasks)
@@ -331,10 +331,10 @@ void RunQueuedTasks(TaskQueue* q) {
 }
 
 // Resolved v8jsi config setters (called inside the configure callback, which
-// runs synchronously during v8_create_runtime). Set before create.
-decltype(&v8_jsi_config_set_task_runner) g_set_task_runner = nullptr;
-decltype(&v8_jsi_config_set_explicit_microtask_policy) g_set_microtask = nullptr;
-decltype(&v8_jsi_config_set_startup_snapshot) g_set_snapshot = nullptr;
+// runs synchronously during v8_jsi_abi_runtime_create). Set before create.
+decltype(&v8_jsi_abi_config_set_task_runner) g_set_task_runner = nullptr;
+decltype(&v8_jsi_abi_config_set_explicit_microtask_policy) g_set_microtask = nullptr;
+decltype(&v8_jsi_abi_config_set_startup_snapshot) g_set_snapshot = nullptr;
 
 // Optional startup-snapshot blob (V8HOST_SNAPSHOT), read pre-lockdown. Held for
 // the process lifetime so the bytes outlive the runtime; passed to the config
@@ -357,7 +357,7 @@ bool g_expect_acg = true;
 uint32_t g_active_run_id = 0;
 bool g_run_complete_requested = false;
 
-jsi_error_code JSI_CDECL ConfigureRuntime(void* /*cb_data*/, jsi_config cfg) {
+jsi_status JSI_ABI_CDECL ConfigureRuntime(void* /*user_data*/, jsi_config cfg) {
   if (g_set_task_runner)
     g_set_task_runner(cfg, g_tasks, &PostTaskCb, &TaskRunnerDeleteCb, nullptr);
   // Explicit microtask policy: promise jobs run only when we drain them on the
@@ -370,7 +370,7 @@ jsi_error_code JSI_CDECL ConfigureRuntime(void* /*cb_data*/, jsi_config cfg) {
   if (g_have_snapshot && g_set_snapshot)
     g_set_snapshot(cfg, reinterpret_cast<const uint8_t*>(g_snapshot_blob.data()),
                    g_snapshot_blob.size(), nullptr, nullptr);
-  return jsi_no_error;
+  return jsi_status_ok;
 }
 
 //==========================================================================
@@ -932,12 +932,12 @@ sbox_status SBOX_CDECL V8HostEngineWarmup(sbox_worker w,
   HMODULE guest = g_engine;  // RESOLVE() expects the module in `guest`
   if (jitless) {
     // Process-global flag — note the dummy argv[0] (V8 skips it).
-    RESOLVE(guest, v8_jsi_set_v8_flags);
+    RESOLVE(guest, v8_jsi_abi_set_v8_flags);
     char arg0[] = "v8host";
     char flag[] = "--jitless";
     char* flag_argv[] = {arg0, flag};
     size_t flag_argc = 2;
-    p_v8_jsi_set_v8_flags(&flag_argc, flag_argv, /*remove_flags=*/true);
+    p_v8_jsi_abi_set_v8_flags(&flag_argc, flag_argv, /*remove_flags=*/true);
     printf("[v8host] --jitless %s\n",
            flag_argc == 1 ? "recognized" : "NOT recognized");
   }
@@ -947,11 +947,11 @@ sbox_status SBOX_CDECL V8HostEngineWarmup(sbox_worker w,
   // what the blob was built with. A stale or cross-engine blob is dropped here
   // and we continue WITHOUT a snapshot rather than feed V8 an incompatible blob.
   if (g_have_snapshot) {
-    auto p_compat = reinterpret_cast<decltype(&v8_startup_snapshot_compatible)>(
-        ::GetProcAddress(guest, "v8_startup_snapshot_compatible"));
+    auto p_compat = reinterpret_cast<decltype(&v8_jsi_abi_snapshot_check)>(
+        ::GetProcAddress(guest, "v8_jsi_abi_snapshot_check"));
     auto p_compat_str =
-        reinterpret_cast<decltype(&v8_startup_snapshot_compat_string)>(
-            ::GetProcAddress(guest, "v8_startup_snapshot_compat_string"));
+        reinterpret_cast<decltype(&v8_jsi_abi_snapshot_compat_to_string)>(
+            ::GetProcAddress(guest, "v8_jsi_abi_snapshot_compat_to_string"));
     if (p_compat) {
       const int code =
           p_compat(reinterpret_cast<const uint8_t*>(g_snapshot_blob.data()),
@@ -971,22 +971,22 @@ sbox_status SBOX_CDECL V8HostEngineWarmup(sbox_worker w,
   // Resolve the config setters the configure callback uses, then create the
   // runtime through the JSI C++ API (JsiAbiRuntime injects our JSI_ABI_VERSION).
   {
-    RESOLVE(guest, v8_jsi_config_set_task_runner);
-    RESOLVE(guest, v8_jsi_config_set_explicit_microtask_policy);
-    g_set_task_runner = p_v8_jsi_config_set_task_runner;
-    g_set_microtask = p_v8_jsi_config_set_explicit_microtask_policy;
+    RESOLVE(guest, v8_jsi_abi_config_set_task_runner);
+    RESOLVE(guest, v8_jsi_abi_config_set_explicit_microtask_policy);
+    g_set_task_runner = p_v8_jsi_abi_config_set_task_runner;
+    g_set_microtask = p_v8_jsi_abi_config_set_explicit_microtask_policy;
     if (g_have_snapshot) {
-      RESOLVE(guest, v8_jsi_config_set_startup_snapshot);
-      g_set_snapshot = p_v8_jsi_config_set_startup_snapshot;
+      RESOLVE(guest, v8_jsi_abi_config_set_startup_snapshot);
+      g_set_snapshot = p_v8_jsi_abi_config_set_startup_snapshot;
     }
   }
-  RESOLVE(guest, v8_create_runtime);
+  RESOLVE(guest, v8_jsi_abi_runtime_create);
 
   // makeJsiAbiRuntime + InstallHostObject use the throwing JSI C++ API; catch
   // everything so no exception crosses the extern "C" boundary (fail-closed).
   try {
     std::unique_ptr<Runtime> rt_owner = jsi::abi::makeJsiAbiRuntime(
-        p_v8_create_runtime, &ConfigureRuntime, nullptr);
+        p_v8_jsi_abi_runtime_create, &ConfigureRuntime, nullptr);
     if (!rt_owner) {
       printf("[v8host] makeJsiAbiRuntime failed\n");
       return sbox_status_failed;

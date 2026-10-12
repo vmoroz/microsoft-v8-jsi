@@ -698,14 +698,14 @@ function packNuGet(outputPath: string, platforms: string[], configurations: stri
   }
 
   // JSI ABI headers + sources. Consumers compile JsiAbiRuntime.cpp locally;
-  // v8_jsi_config.h and v8_node_api_attach.h are the public C-stable surfaces
+  // v8_jsi_abi.h and v8_node_api_attach.h are the public C-stable surfaces
   // for runtime configuration and the dual-API attach seam respectively.
   for (const file of [
     "jsi_abi.h",
     "jsi_abi_helpers.h",
     "JsiAbiRuntime.h",
     "JsiAbiRuntime.cpp",
-    "v8_jsi_config.h",
+    "v8_jsi_abi.h",
     "v8_node_api_attach.h",
   ]) {
     copyFile(file, path.join(srcDir, "jsi_abi"), jsiAbiDir);

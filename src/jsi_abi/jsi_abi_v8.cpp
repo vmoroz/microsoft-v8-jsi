@@ -18,8 +18,8 @@
 /// Error Handling Design
 /// =====================
 /// Two error types following the Hermes ABI pattern:
-/// - jsi_error_js: JavaScript exception (value stored in pendingJSError)
-/// - jsi_error_native: Native exception (message in nativeExceptionMessage)
+/// - jsi_status_js_error: JavaScript exception (value stored in pendingJSError)
+/// - jsi_status_native_error: Native exception (message in nativeExceptionMessage)
 ///
 /// The TryCatch class inherits from v8::TryCatch and automatically captures
 /// JavaScript exceptions in its destructor.
@@ -28,7 +28,7 @@
 
 #include "jsi_abi/jsi_abi.h"
 #include "jsi_abi/jsi_abi_helpers.h"
-#include "jsi_abi/v8_jsi_config.h"
+#include "jsi_abi/v8_jsi_abi.h"
 #include "jsi_abi/v8_snapshot_container.h"
 #include "jsi_abi/jsi_abi_v8_internal.h"
 #include "../v8_core.h"
@@ -94,34 +94,34 @@ struct jsi_config_s {
 
   // Note: process-global V8 engine flags (sparkplug, predictable,
   // optimize_for_size, always_compact, jitless, lite_mode) are NOT per-runtime
-  // config — they are set via the process-level v8_jsi_set_v8_flags before the
-  // first runtime. See v8_jsi_config.h.
+  // config — they are set via the process-level v8_jsi_abi_set_v8_flags before the
+  // first runtime. See v8_jsi_abi.h.
 
   // Script cache — null callbacks mean "no cache".
   // The config takes ownership of script_cache_data when the setter is called.
-  // On v8_create_runtime the runtime takes over (we clear these pointers so
+  // On v8_jsi_abi_runtime_create the runtime takes over (we clear these pointers so
   // ~jsi_config_s does not double-delete). If the config is destroyed before
   // any runtime claims the data, ~jsi_config_s runs the deleter once.
   void *script_cache_data{nullptr};
-  v8_jsi_script_cache_load_cb script_cache_load_cb{nullptr};
-  v8_jsi_script_cache_store_cb script_cache_store_cb{nullptr};
+  v8_jsi_abi_script_cache_load_cb script_cache_load_cb{nullptr};
+  v8_jsi_abi_script_cache_store_cb script_cache_store_cb{nullptr};
   jsi_data_delete_cb script_cache_data_delete_cb{nullptr};
   void *script_cache_deleter_data{nullptr};
 
   // Task runner — null callbacks mean "no task runner".
   // Same lifetime contract as the script-cache fields above: config takes
-  // ownership at setter time; on v8_create_runtime the runtime takes over
+  // ownership at setter time; on v8_jsi_abi_runtime_create the runtime takes over
   // (these pointers are cleared); the deleter runs exactly once via the
   // internal adapter's destructor (held inside IsolateData by shared_ptr).
   // If the config is destroyed before any runtime claims the data,
   // ~jsi_config_s runs the deleter once.
   void *task_runner_data{nullptr};
-  v8_jsi_task_runner_post_task_cb task_runner_post_task_cb{nullptr};
+  v8_jsi_abi_task_runner_post_task_cb task_runner_post_task_cb{nullptr};
   jsi_data_delete_cb task_runner_data_delete_cb{nullptr};
   void *task_runner_deleter_data{nullptr};
 
   // Startup-snapshot blob — null means none. Same lifetime contract as the
-  // fields above: config owns it at setter time; on v8_create_runtime the
+  // fields above: config owns it at setter time; on v8_jsi_abi_runtime_create the
   // runtime takes over (these are cleared); ~jsi_config_s fires the deleter only
   // if no runtime claimed it.
   const uint8_t *startup_snapshot_blob{nullptr};
@@ -169,7 +169,7 @@ struct HostFunctionContext;
 class CTaskRunner final : public v8rt::TaskRunner {
  public:
   CTaskRunner(void *task_runner_data,
-              v8_jsi_task_runner_post_task_cb post_task_cb,
+              v8_jsi_abi_task_runner_post_task_cb post_task_cb,
               jsi_data_delete_cb task_runner_data_delete_cb,
               void *deleter_data) noexcept
       : task_runner_data_(task_runner_data),
@@ -201,7 +201,7 @@ class CTaskRunner final : public v8rt::TaskRunner {
 
  private:
   void *task_runner_data_;
-  v8_jsi_task_runner_post_task_cb post_task_cb_;
+  v8_jsi_abi_task_runner_post_task_cb post_task_cb_;
   jsi_data_delete_cb task_runner_data_delete_cb_;
   void *deleter_data_;
 };
@@ -212,13 +212,13 @@ class CTaskRunner final : public v8rt::TaskRunner {
 
 /// Base wrapper for ABI handles that wrap V8 persistent handles.
 /// Inherits from jsi_pointer so the wrapper IS a jsi_pointer with an
-/// invalidate callback in its vtable.
+/// invalidate callback in its api.
 template <typename V8Type>
 struct HandleWrapper : public jsi_pointer {
-  static void JSI_CDECL invalidate(jsi_pointer *self) {
+  static void JSI_ABI_CDECL invalidate(jsi_pointer *self) {
     delete static_cast<HandleWrapper *>(self);
   }
-  static constexpr jsi_pointer_vtable pointerVt{invalidate};
+  static constexpr jsi_pointer_api pointerVt{invalidate};
 
   v8::Persistent<V8Type> persistent;
 
@@ -241,12 +241,12 @@ using BigIntHandle = HandleWrapper<v8::BigInt>;
 
 /// PreparedJavaScript implementation. Inherits from jsi_prepared_javascript
 /// (not jsi_pointer) — prepared scripts have their own lifecycle and
-/// vtable in the ABI.
+/// api in the ABI.
 struct PreparedScriptImpl : public jsi_prepared_javascript {
-  static void JSI_CDECL release(jsi_prepared_javascript *self) {
+  static void JSI_ABI_CDECL release(jsi_prepared_javascript *self) {
     delete static_cast<PreparedScriptImpl *>(self);
   }
-  static constexpr jsi_prepared_javascript_vtable preparedVt{release};
+  static constexpr jsi_prepared_javascript_api preparedVt{release};
 
   v8::Persistent<v8::UnboundScript> persistent;
 
@@ -264,10 +264,10 @@ struct PreparedScriptImpl : public jsi_prepared_javascript {
 
 /// Wrapper for property name IDs (can be string or symbol).
 struct PropNameIdHandle : public jsi_pointer {
-  static void JSI_CDECL invalidate(jsi_pointer *self) {
+  static void JSI_ABI_CDECL invalidate(jsi_pointer *self) {
     delete static_cast<PropNameIdHandle *>(self);
   }
-  static constexpr jsi_pointer_vtable pointerVt{invalidate};
+  static constexpr jsi_pointer_api pointerVt{invalidate};
 
   v8::Persistent<v8::Value> persistent; // String or Symbol
 
@@ -285,10 +285,10 @@ struct PropNameIdHandle : public jsi_pointer {
 
 /// Wrapper for weak object references.
 struct WeakObjectHandle : public jsi_pointer {
-  static void JSI_CDECL invalidate(jsi_pointer *self) {
+  static void JSI_ABI_CDECL invalidate(jsi_pointer *self) {
     delete static_cast<WeakObjectHandle *>(self);
   }
-  static constexpr jsi_pointer_vtable pointerVt{invalidate};
+  static constexpr jsi_pointer_api pointerVt{invalidate};
 
   v8::Persistent<v8::Object> persistent;
 
@@ -335,7 +335,7 @@ inline WeakObjectHandle *toWeakObjectHandle(jsi_weak_object weak) {
 /// Write data into a growable buffer.
 void writeToBuf(jsi_growable_buffer *buf, const char *data, size_t len) {
   if (buf->size < len)
-    buf->vtable->try_grow_to(buf, len);
+    buf->api->try_grow_to(buf, len);
   if (buf->size >= len) {
     std::memcpy(buf->data, data, len);
     buf->used = len;
@@ -419,7 +419,7 @@ struct NativeStateWrapper {
 
   ~NativeStateWrapper() {
     if (state) {
-      state->vtable->release(state);
+      state->api->release(state);
     }
     weak_ref.Reset();
   }
@@ -437,7 +437,7 @@ struct JsiRuntimeState : public jsi_runtime {
   // decremented by jsi_release, which destroys the runtime at zero.
   std::atomic<uint32_t> refcount{1};
 
-  // ABI version negotiated in v8_create_runtime (the consumer's compiled
+  // ABI version negotiated in v8_jsi_abi_runtime_create (the consumer's compiled
   // JSI_ABI_VERSION). Reserved for future behavioral pinning; get_abi_version
   // reports the implementation's max, not this value.
   uint32_t abi_version{JSI_ABI_VERSION};
@@ -453,8 +453,8 @@ struct JsiRuntimeState : public jsi_runtime {
   // Script cache — copied from the config in create(). Runtime owns
   // script_cache_data after handoff: the deleter runs in ~JsiRuntimeState.
   void *script_cache_data{nullptr};
-  v8_jsi_script_cache_load_cb script_cache_load_cb{nullptr};
-  v8_jsi_script_cache_store_cb script_cache_store_cb{nullptr};
+  v8_jsi_abi_script_cache_load_cb script_cache_load_cb{nullptr};
+  v8_jsi_abi_script_cache_store_cb script_cache_store_cb{nullptr};
   jsi_data_delete_cb script_cache_data_delete_cb{nullptr};
   void *script_cache_deleter_data{nullptr};
 
@@ -609,7 +609,7 @@ struct AbiHostObjectProxy {
 
   ~AbiHostObjectProxy() {
     if (hostObject) {
-      hostObject->vtable->release(hostObject);
+      hostObject->api->release(hostObject);
     }
     weakRef.Reset();
   }
@@ -642,14 +642,14 @@ struct AbiHostObjectProxy {
 
     jsi_propnameid propNameId{new PropNameIdHandle(isolate, v8PropName)};
 
-    jsi_value_or_error result = proxy->hostObject->vtable->get(
+    jsi_value_or_error result = proxy->hostObject->api->get(
         proxy->hostObject, proxy->runtime, propNameId);
 
-    propNameId.pointer->vtable->invalidate(propNameId.pointer);
+    propNameId.pointer->api->invalidate(propNameId.pointer);
 
     if (abi::is_error(result)) {
       auto *state = getState(proxy->runtime);
-      if (abi::get_error(result) == jsi_error_js) {
+      if (abi::get_error(result) == jsi_status_js_error) {
         jsi_value jsErr = state->pendingJSError;
         if (abi::is_pointer_value(jsErr)) {
           isolate->ThrowException(toV8Value(isolate, &jsErr));
@@ -684,15 +684,15 @@ struct AbiHostObjectProxy {
     jsi_propnameid propNameId{new PropNameIdHandle(isolate, v8PropName)};
     jsi_value jsiValue = createJsiValue(isolate, value);
 
-    jsi_error_code result = proxy->hostObject->vtable->set(
+    jsi_status result = proxy->hostObject->api->set(
         proxy->hostObject, proxy->runtime, propNameId, &jsiValue);
 
-    propNameId.pointer->vtable->invalidate(propNameId.pointer);
+    propNameId.pointer->api->invalidate(propNameId.pointer);
     abi::release_value(jsiValue);
 
     if (abi::is_error(result)) {
       auto *state = getState(proxy->runtime);
-      if (abi::get_error(result) == jsi_error_js &&
+      if (abi::get_error(result) == jsi_status_js_error &&
           abi::is_pointer_value(state->pendingJSError)) {
         isolate->ThrowException(toV8Value(isolate, &state->pendingJSError));
         state->pendingJSError = abi::create_undefined_value();
@@ -741,7 +741,7 @@ struct AbiHostObjectProxy {
     v8::Local<v8::Context> context = isolate->GetCurrentContext();
 
     jsi_propnameid_list_or_error listResult =
-        proxy->hostObject->vtable->get_own_keys(proxy->hostObject,
+        proxy->hostObject->api->get_own_keys(proxy->hostObject,
                                                  proxy->runtime);
 
     if (abi::is_error(listResult)) {
@@ -758,7 +758,7 @@ struct AbiHostObjectProxy {
       result->Set(context, static_cast<uint32_t>(i), propValue)
           .FromMaybe(false);
     }
-    list->vtable->release(list);
+    list->api->release(list);
 
     info.GetReturnValue().Set(result);
   }
@@ -878,11 +878,11 @@ JsiRuntimeState *JsiRuntimeState::create(const jsi_config_s *config) {
       isolateConfig.startup_snapshot_blob_size > 0;
   v8::Local<v8::Context> context = v8rt::createContext(isolate, fromSnapshot);
 
-  // Forward-declare the vtable (defined below)
-  extern const jsi_runtime_vtable g_vtable;
+  // Forward-declare the api (defined below)
+  extern const jsi_runtime_api g_vtable;
 
   auto *state = new JsiRuntimeState();
-  state->vt = &g_vtable;
+  state->api = &g_vtable;
   state->isolate = isolate;
   state->context.Reset(isolate, context);
   state->isolateData = v8rt::IsolateData::fromIsolate(isolate);
@@ -1046,7 +1046,7 @@ struct HostFunctionContext {
 
   ~HostFunctionContext() {
     if (hostFunction) {
-      hostFunction->vtable->release(hostFunction);
+      hostFunction->api->release(hostFunction);
     }
     weakRef.Reset();
   }
@@ -1192,7 +1192,7 @@ void JsiRuntimeState::RemoveUnhandledPromise(v8::Local<v8::Promise> promise) {
   }
 }
 
-void JSI_CDECL HostFunctionCallbackTrampoline(
+void JSI_ABI_CDECL HostFunctionCallbackTrampoline(
     const v8::FunctionCallbackInfo<v8::Value> &info) {
   v8::Isolate *isolate = info.GetIsolate();
   v8::HandleScope handle_scope(isolate);
@@ -1207,7 +1207,7 @@ void JSI_CDECL HostFunctionCallbackTrampoline(
 
   jsi_value thisVal = createJsiValue(isolate, info.This());
 
-  jsi_value_or_error result = ctx->hostFunction->vtable->call(
+  jsi_value_or_error result = ctx->hostFunction->api->call(
       ctx->hostFunction, ctx->runtime, &thisVal, args.data(), args.size());
 
   for (auto &arg : args)
@@ -1216,8 +1216,8 @@ void JSI_CDECL HostFunctionCallbackTrampoline(
 
   if (abi::is_error(result)) {
     auto *state = getState(ctx->runtime);
-    jsi_error_code err = abi::get_error(result);
-    if (err == jsi_error_js && abi::is_pointer_value(state->pendingJSError)) {
+    jsi_status err = abi::get_error(result);
+    if (err == jsi_status_js_error && abi::is_pointer_value(state->pendingJSError)) {
       isolate->ThrowException(toV8Value(isolate, &state->pendingJSError));
       abi::release_value(state->pendingJSError);
       state->pendingJSError = abi::create_undefined_value();
@@ -1263,14 +1263,14 @@ NativeStateWrapper *getNativeStateWrapper(JsiRuntimeState *state,
 // QueryInterface
 //------------------------------------------------------------------------------
 
-jsi_error_code JSI_CDECL jsi_query_interface(
+jsi_status JSI_ABI_CDECL jsi_query_interface(
     jsi_runtime *rt, const jsi_interface_id * /*iid*/,
     const void ** /*vtable_out*/, void ** /*instance_out*/) {
   // No optional interfaces are currently supported. query_interface is
   // retained as the COM-style extension seam for future engine-specific
   // interfaces; callers must handle the not-supported result.
   getState(rt)->setNativeError("Interface not supported");
-  return jsi_error_native;
+  return jsi_status_native_error;
 }
 
 //------------------------------------------------------------------------------
@@ -1278,9 +1278,9 @@ jsi_error_code JSI_CDECL jsi_query_interface(
 //------------------------------------------------------------------------------
 
 // Report the implementation's max supported ABI version (Node-API
-// napi_get_version analog). The create-time negotiation in v8_create_runtime is
+// napi_get_version analog). The create-time negotiation in v8_jsi_abi_runtime_create is
 // what actually gates; this is a feature-probe.
-uint32_t JSI_CDECL jsi_get_abi_version(jsi_runtime * /*rt*/) {
+uint32_t JSI_ABI_CDECL jsi_get_abi_version(jsi_runtime * /*rt*/) {
   return JSI_ABI_VERSION;
 }
 
@@ -1288,11 +1288,11 @@ uint32_t JSI_CDECL jsi_get_abi_version(jsi_runtime * /*rt*/) {
 // Lifecycle
 //------------------------------------------------------------------------------
 
-void JSI_CDECL jsi_add_ref(jsi_runtime *rt) {
+void JSI_ABI_CDECL jsi_add_ref(jsi_runtime *rt) {
   getState(rt)->refcount.fetch_add(1, std::memory_order_relaxed);
 }
 
-void JSI_CDECL jsi_release(jsi_runtime *rt) {
+void JSI_ABI_CDECL jsi_release(jsi_runtime *rt) {
   auto *state = getState(rt);
   // acq_rel ensures the destructor sees all writes from threads that held
   // a ref; relaxed isn't enough across thread boundaries.
@@ -1305,14 +1305,14 @@ void JSI_CDECL jsi_release(jsi_runtime *rt) {
 // Error Handling
 //------------------------------------------------------------------------------
 
-jsi_value JSI_CDECL jsi_get_and_clear_js_error_value(jsi_runtime *rt) {
+jsi_value JSI_ABI_CDECL jsi_get_and_clear_js_error_value(jsi_runtime *rt) {
   auto *state = getState(rt);
   jsi_value result = state->pendingJSError;
   state->pendingJSError = abi::create_undefined_value();
   return result;
 }
 
-void JSI_CDECL jsi_get_and_clear_native_exception_message(
+void JSI_ABI_CDECL jsi_get_and_clear_native_exception_message(
     jsi_runtime *rt, jsi_growable_buffer *buf) {
   auto *state = getState(rt);
   writeToBuf(buf, state->nativeExceptionMessage);
@@ -1320,7 +1320,7 @@ void JSI_CDECL jsi_get_and_clear_native_exception_message(
   state->nativeExceptionMessage.shrink_to_fit();
 }
 
-void JSI_CDECL jsi_set_js_error_value(jsi_runtime *rt,
+void JSI_ABI_CDECL jsi_set_js_error_value(jsi_runtime *rt,
                                        const jsi_value *error_value) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1333,7 +1333,7 @@ void JSI_CDECL jsi_set_js_error_value(jsi_runtime *rt,
   }
 }
 
-void JSI_CDECL jsi_set_native_exception_message(jsi_runtime *rt,
+void JSI_ABI_CDECL jsi_set_native_exception_message(jsi_runtime *rt,
                                                   const uint8_t *utf8,
                                                   size_t length) {
   getState(rt)->nativeExceptionMessage.assign(
@@ -1344,7 +1344,7 @@ void JSI_CDECL jsi_set_native_exception_message(jsi_runtime *rt,
 // Clone Operations
 //------------------------------------------------------------------------------
 
-jsi_propnameid JSI_CDECL jsi_clone_propnameid(jsi_runtime *rt,
+jsi_propnameid JSI_ABI_CDECL jsi_clone_propnameid(jsi_runtime *rt,
                                                jsi_propnameid name) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1352,28 +1352,28 @@ jsi_propnameid JSI_CDECL jsi_clone_propnameid(jsi_runtime *rt,
   return {new PropNameIdHandle(state->isolate, v8val)};
 }
 
-jsi_string JSI_CDECL jsi_clone_string(jsi_runtime *rt, jsi_string str) {
+jsi_string JSI_ABI_CDECL jsi_clone_string(jsi_runtime *rt, jsi_string str) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::String> v8str = toStringHandle(str)->get(state->isolate);
   return {new StringHandle(state->isolate, v8str)};
 }
 
-jsi_symbol JSI_CDECL jsi_clone_symbol(jsi_runtime *rt, jsi_symbol sym) {
+jsi_symbol JSI_ABI_CDECL jsi_clone_symbol(jsi_runtime *rt, jsi_symbol sym) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::Symbol> v8sym = toSymbolHandle(sym)->get(state->isolate);
   return {new SymbolHandle(state->isolate, v8sym)};
 }
 
-jsi_object JSI_CDECL jsi_clone_object(jsi_runtime *rt, jsi_object obj) {
+jsi_object JSI_ABI_CDECL jsi_clone_object(jsi_runtime *rt, jsi_object obj) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::Object> v8obj = toObjectHandle(obj)->get(state->isolate);
   return {new ObjectHandle(state->isolate, v8obj)};
 }
 
-jsi_bigint JSI_CDECL jsi_clone_bigint(jsi_runtime *rt, jsi_bigint bigint) {
+jsi_bigint JSI_ABI_CDECL jsi_clone_bigint(jsi_runtime *rt, jsi_bigint bigint) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::BigInt> v8bi = toBigIntHandle(bigint)->get(state->isolate);
@@ -1384,36 +1384,36 @@ jsi_bigint JSI_CDECL jsi_clone_bigint(jsi_runtime *rt, jsi_bigint bigint) {
 // Description & Capabilities
 //------------------------------------------------------------------------------
 
-void JSI_CDECL jsi_get_description(jsi_runtime * /*rt*/,
+void JSI_ABI_CDECL jsi_get_description(jsi_runtime * /*rt*/,
                                     jsi_growable_buffer *buf) {
   const char *v8_version = v8::V8::GetVersion();
   std::string desc = std::string("V8Runtime [") + v8_version + "]";
   writeToBuf(buf, desc);
 }
 
-bool JSI_CDECL jsi_is_inspectable(jsi_runtime * /*rt*/) { return false; }
+bool JSI_ABI_CDECL jsi_is_inspectable(jsi_runtime * /*rt*/) { return false; }
 
 //------------------------------------------------------------------------------
 // Handle Scopes
 //------------------------------------------------------------------------------
 
-jsi_error_code JSI_CDECL jsi_push_scope(jsi_runtime * /*rt*/,
+jsi_status JSI_ABI_CDECL jsi_push_scope(jsi_runtime * /*rt*/,
                                             void **scope) {
   if (scope)
     *scope = reinterpret_cast<void *>(1);
-  return jsi_no_error;
+  return jsi_status_ok;
 }
 
-jsi_error_code JSI_CDECL jsi_pop_scope(jsi_runtime * /*rt*/,
+jsi_status JSI_ABI_CDECL jsi_pop_scope(jsi_runtime * /*rt*/,
                                            void * /*scope*/) {
-  return jsi_no_error;
+  return jsi_status_ok;
 }
 
 //------------------------------------------------------------------------------
 // Script Evaluation
 //------------------------------------------------------------------------------
 
-jsi_value_or_error JSI_CDECL jsi_evaluate_javascript_source(
+jsi_value_or_error JSI_ABI_CDECL jsi_evaluate_javascript_source(
     jsi_runtime *rt, jsi_buffer *buf, const char *source_url,
     size_t source_url_len) {
   auto *state = getState(rt);
@@ -1427,40 +1427,40 @@ jsi_value_or_error JSI_CDECL jsi_evaluate_javascript_source(
                                 v8::NewStringType::kNormal,
                                 static_cast<int>(buf->size))
            .ToLocal(&sourceStr)) {
-    if (buf->vtable && buf->vtable->release)
-      buf->vtable->release(buf);
+    if (buf->api && buf->api->release)
+      buf->api->release(buf);
     state->setNativeError("Failed to create source string");
-    return abi::create_value_or_error(jsi_error_native);
+    return abi::create_value_or_error(jsi_status_native_error);
   }
 
   v8::Local<v8::String> urlV8Str;
   if (!v8::String::NewFromUtf8(isolate, source_url, v8::NewStringType::kNormal,
                                 static_cast<int>(source_url_len))
            .ToLocal(&urlV8Str)) {
-    if (buf->vtable && buf->vtable->release)
-      buf->vtable->release(buf);
+    if (buf->api && buf->api->release)
+      buf->api->release(buf);
     state->setNativeError("Failed to create source URL string");
-    return abi::create_value_or_error(jsi_error_native);
+    return abi::create_value_or_error(jsi_status_native_error);
   }
 
-  if (buf->vtable && buf->vtable->release)
-    buf->vtable->release(buf);
+  if (buf->api && buf->api->release)
+    buf->api->release(buf);
 
   v8::ScriptOrigin origin(urlV8Str);
 
   v8::Local<v8::Script> compiled;
   if (!v8::Script::Compile(state->getContextLocal(), sourceStr, &origin)
            .ToLocal(&compiled))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(jsi_status_js_error);
 
   v8::Local<v8::Value> resultValue;
   if (!compiled->Run(state->getContextLocal()).ToLocal(&resultValue))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(jsi_status_js_error);
 
   return abi::create_value_or_error(createJsiValue(isolate, resultValue));
 }
 
-jsi_prepared_javascript_or_error JSI_CDECL jsi_prepare_javascript(
+jsi_prepared_javascript_or_error JSI_ABI_CDECL jsi_prepare_javascript(
     jsi_runtime *rt, jsi_buffer *buf, const char *source_url,
     size_t source_url_len) {
   auto *state = getState(rt);
@@ -1481,24 +1481,24 @@ jsi_prepared_javascript_or_error JSI_CDECL jsi_prepare_javascript(
                                 v8::NewStringType::kNormal,
                                 static_cast<int>(buf->size))
            .ToLocal(&sourceStr)) {
-    if (buf->vtable && buf->vtable->release)
-      buf->vtable->release(buf);
+    if (buf->api && buf->api->release)
+      buf->api->release(buf);
     state->setNativeError("Failed to create source string");
-    return abi::create_prepared_javascript_or_error(jsi_error_native);
+    return abi::create_prepared_javascript_or_error(jsi_status_native_error);
   }
 
   v8::Local<v8::String> urlV8Str;
   if (!v8::String::NewFromUtf8(isolate, source_url, v8::NewStringType::kNormal,
                                 static_cast<int>(source_url_len))
            .ToLocal(&urlV8Str)) {
-    if (buf->vtable && buf->vtable->release)
-      buf->vtable->release(buf);
+    if (buf->api && buf->api->release)
+      buf->api->release(buf);
     state->setNativeError("Failed to create source URL string");
-    return abi::create_prepared_javascript_or_error(jsi_error_native);
+    return abi::create_prepared_javascript_or_error(jsi_status_native_error);
   }
 
-  if (buf->vtable && buf->vtable->release)
-    buf->vtable->release(buf);
+  if (buf->api && buf->api->release)
+    buf->api->release(buf);
 
   v8::ScriptOrigin origin(urlV8Str);
 
@@ -1555,7 +1555,7 @@ jsi_prepared_javascript_or_error JSI_CDECL jsi_prepare_javascript(
   }
 
   if (!compile_ok)
-    return abi::create_prepared_javascript_or_error(jsi_error_js);
+    return abi::create_prepared_javascript_or_error(jsi_status_js_error);
 
   v8::Local<v8::UnboundScript> unbound = compiled->GetUnboundScript();
 
@@ -1589,7 +1589,7 @@ jsi_prepared_javascript_or_error JSI_CDECL jsi_prepare_javascript(
       new PreparedScriptImpl(isolate, unbound));
 }
 
-jsi_value_or_error JSI_CDECL
+jsi_value_or_error JSI_ABI_CDECL
 jsi_evaluate_prepared_javascript(jsi_runtime *rt,
                                   jsi_prepared_javascript *prepared) {
   auto *state = getState(rt);
@@ -1603,7 +1603,7 @@ jsi_evaluate_prepared_javascript(jsi_runtime *rt,
 
   v8::Local<v8::Value> resultValue;
   if (!script->Run(state->getContextLocal()).ToLocal(&resultValue))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(jsi_status_js_error);
 
   return abi::create_value_or_error(createJsiValue(isolate, resultValue));
 }
@@ -1612,7 +1612,7 @@ jsi_evaluate_prepared_javascript(jsi_runtime *rt,
 // Microtasks
 //------------------------------------------------------------------------------
 
-jsi_bool_or_error JSI_CDECL jsi_drain_microtasks(jsi_runtime *rt,
+jsi_bool_or_error JSI_ABI_CDECL jsi_drain_microtasks(jsi_runtime *rt,
                                                    int32_t /*max_hint*/) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1623,7 +1623,7 @@ jsi_bool_or_error JSI_CDECL jsi_drain_microtasks(jsi_runtime *rt,
   return abi::create_bool_or_error(false);
 }
 
-jsi_error_code JSI_CDECL jsi_queue_microtask(jsi_runtime *rt,
+jsi_status JSI_ABI_CDECL jsi_queue_microtask(jsi_runtime *rt,
                                                   jsi_function callback) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1631,18 +1631,18 @@ jsi_error_code JSI_CDECL jsi_queue_microtask(jsi_runtime *rt,
   v8::Local<v8::Object> obj = toObjectHandle({callback.pointer})->get(state->isolate);
   if (!obj->IsFunction()) {
     state->setNativeError("callback must be a function");
-    return jsi_error_native;
+    return jsi_status_native_error;
   }
 
   state->isolate->EnqueueMicrotask(v8::Local<v8::Function>::Cast(obj));
-  return jsi_no_error;
+  return jsi_status_ok;
 }
 
 //------------------------------------------------------------------------------
 // Global Object
 //------------------------------------------------------------------------------
 
-jsi_object JSI_CDECL jsi_get_global_object(jsi_runtime *rt) {
+jsi_object JSI_ABI_CDECL jsi_get_global_object(jsi_runtime *rt) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::Object> global = state->getContextLocal()->Global();
@@ -1653,7 +1653,7 @@ jsi_object JSI_CDECL jsi_get_global_object(jsi_runtime *rt) {
 // String Operations
 //------------------------------------------------------------------------------
 
-jsi_string_or_error JSI_CDECL jsi_create_string_from_utf8(jsi_runtime *rt,
+jsi_string_or_error JSI_ABI_CDECL jsi_create_string_from_utf8(jsi_runtime *rt,
                                                            const uint8_t *utf8,
                                                            size_t len) {
   auto *state = getState(rt);
@@ -1665,13 +1665,13 @@ jsi_string_or_error JSI_CDECL jsi_create_string_from_utf8(jsi_runtime *rt,
                                 static_cast<int>(len))
            .ToLocal(&v8str)) {
     state->setNativeError("Failed to create string");
-    return abi::create_string_or_error(jsi_error_native);
+    return abi::create_string_or_error(jsi_status_native_error);
   }
   return abi::create_string_or_error(
       static_cast<jsi_pointer *>(new StringHandle(state->isolate, v8str)));
 }
 
-jsi_string_or_error JSI_CDECL jsi_create_string_from_utf16(
+jsi_string_or_error JSI_ABI_CDECL jsi_create_string_from_utf16(
     jsi_runtime *rt, const uint16_t *utf16, size_t len) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1681,13 +1681,13 @@ jsi_string_or_error JSI_CDECL jsi_create_string_from_utf16(
                                    static_cast<int>(len))
            .ToLocal(&v8str)) {
     state->setNativeError("Failed to create string");
-    return abi::create_string_or_error(jsi_error_native);
+    return abi::create_string_or_error(jsi_status_native_error);
   }
   return abi::create_string_or_error(
       static_cast<jsi_pointer *>(new StringHandle(state->isolate, v8str)));
 }
 
-void JSI_CDECL jsi_get_utf8_from_string(jsi_runtime *rt, jsi_string str,
+void JSI_ABI_CDECL jsi_get_utf8_from_string(jsi_runtime *rt, jsi_string str,
                                          jsi_growable_buffer *buf) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1696,7 +1696,7 @@ void JSI_CDECL jsi_get_utf8_from_string(jsi_runtime *rt, jsi_string str,
 
   size_t utf8_len = v8str->Utf8LengthV2(isolate);
   if (buf->size < utf8_len)
-    buf->vtable->try_grow_to(buf, utf8_len);
+    buf->api->try_grow_to(buf, utf8_len);
   if (buf->size >= utf8_len) {
     v8str->WriteUtf8V2(isolate, reinterpret_cast<char *>(buf->data),
                         static_cast<int>(utf8_len));
@@ -1704,7 +1704,7 @@ void JSI_CDECL jsi_get_utf8_from_string(jsi_runtime *rt, jsi_string str,
   }
 }
 
-void JSI_CDECL jsi_get_utf16_from_string(jsi_runtime *rt, jsi_string str,
+void JSI_ABI_CDECL jsi_get_utf16_from_string(jsi_runtime *rt, jsi_string str,
                                           jsi_growable_buffer *buf) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1714,7 +1714,7 @@ void JSI_CDECL jsi_get_utf16_from_string(jsi_runtime *rt, jsi_string str,
   int len = v8str->Length();
   size_t bytes = static_cast<size_t>(len) * sizeof(uint16_t);
   if (buf->size < bytes)
-    buf->vtable->try_grow_to(buf, bytes);
+    buf->api->try_grow_to(buf, bytes);
   if (buf->size >= bytes) {
     v8str->WriteV2(isolate, 0, len,
                     reinterpret_cast<uint16_t *>(buf->data));
@@ -1726,7 +1726,7 @@ void JSI_CDECL jsi_get_utf16_from_string(jsi_runtime *rt, jsi_string str,
 // Symbol Operations
 //------------------------------------------------------------------------------
 
-void JSI_CDECL jsi_get_utf8_from_symbol(jsi_runtime *rt, jsi_symbol sym,
+void JSI_ABI_CDECL jsi_get_utf8_from_symbol(jsi_runtime *rt, jsi_symbol sym,
                                          jsi_growable_buffer *buf) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1751,7 +1751,7 @@ void JSI_CDECL jsi_get_utf8_from_symbol(jsi_runtime *rt, jsi_symbol sym,
 // PropNameID Operations
 //------------------------------------------------------------------------------
 
-jsi_propnameid_or_error JSI_CDECL jsi_create_propnameid_from_utf8(
+jsi_propnameid_or_error JSI_ABI_CDECL jsi_create_propnameid_from_utf8(
     jsi_runtime *rt, const uint8_t *utf8, size_t len) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1762,13 +1762,13 @@ jsi_propnameid_or_error JSI_CDECL jsi_create_propnameid_from_utf8(
                                 static_cast<int>(len))
            .ToLocal(&v8str)) {
     state->setNativeError("Failed to create property name");
-    return abi::create_propnameid_or_error(jsi_error_native);
+    return abi::create_propnameid_or_error(jsi_status_native_error);
   }
   return abi::create_propnameid_or_error(
       static_cast<jsi_pointer *>(new PropNameIdHandle(state->isolate, v8str)));
 }
 
-jsi_propnameid_or_error JSI_CDECL
+jsi_propnameid_or_error JSI_ABI_CDECL
 jsi_create_propnameid_from_string(jsi_runtime *rt, jsi_string str) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1777,7 +1777,7 @@ jsi_create_propnameid_from_string(jsi_runtime *rt, jsi_string str) {
       static_cast<jsi_pointer *>(new PropNameIdHandle(state->isolate, v8str)));
 }
 
-jsi_propnameid_or_error JSI_CDECL
+jsi_propnameid_or_error JSI_ABI_CDECL
 jsi_create_propnameid_from_symbol(jsi_runtime *rt, jsi_symbol sym) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1786,7 +1786,7 @@ jsi_create_propnameid_from_symbol(jsi_runtime *rt, jsi_symbol sym) {
       static_cast<jsi_pointer *>(new PropNameIdHandle(state->isolate, v8sym)));
 }
 
-bool JSI_CDECL jsi_prop_name_id_equals(jsi_runtime *rt, jsi_propnameid a,
+bool JSI_ABI_CDECL jsi_prop_name_id_equals(jsi_runtime *rt, jsi_propnameid a,
                                         jsi_propnameid b) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1795,7 +1795,7 @@ bool JSI_CDECL jsi_prop_name_id_equals(jsi_runtime *rt, jsi_propnameid a,
   return va->StrictEquals(vb);
 }
 
-void JSI_CDECL jsi_get_utf8_from_propnameid(jsi_runtime *rt,
+void JSI_ABI_CDECL jsi_get_utf8_from_propnameid(jsi_runtime *rt,
                                              jsi_propnameid name,
                                              jsi_growable_buffer *buf) {
   auto *state = getState(rt);
@@ -1821,7 +1821,7 @@ void JSI_CDECL jsi_get_utf8_from_propnameid(jsi_runtime *rt,
 
   size_t utf8_len = v8str->Utf8LengthV2(isolate);
   if (buf->size < utf8_len)
-    buf->vtable->try_grow_to(buf, utf8_len);
+    buf->api->try_grow_to(buf, utf8_len);
   if (buf->size >= utf8_len) {
     v8str->WriteUtf8V2(isolate, reinterpret_cast<char *>(buf->data),
                         static_cast<int>(utf8_len));
@@ -1833,7 +1833,7 @@ void JSI_CDECL jsi_get_utf8_from_propnameid(jsi_runtime *rt,
 // Object Operations
 //------------------------------------------------------------------------------
 
-jsi_object_or_error JSI_CDECL jsi_create_object(jsi_runtime *rt) {
+jsi_object_or_error JSI_ABI_CDECL jsi_create_object(jsi_runtime *rt) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::Object> obj = v8::Object::New(state->isolate);
@@ -1841,7 +1841,7 @@ jsi_object_or_error JSI_CDECL jsi_create_object(jsi_runtime *rt) {
       static_cast<jsi_pointer *>(new ObjectHandle(state->isolate, obj)));
 }
 
-jsi_object_or_error JSI_CDECL
+jsi_object_or_error JSI_ABI_CDECL
 jsi_create_object_with_prototype(jsi_runtime *rt,
                                   const jsi_value *prototype) {
   auto *state = getState(rt);
@@ -1860,7 +1860,7 @@ jsi_create_object_with_prototype(jsi_runtime *rt,
       static_cast<jsi_pointer *>(new ObjectHandle(isolate, obj)));
 }
 
-jsi_value_or_error JSI_CDECL jsi_get_prototype_of(jsi_runtime *rt,
+jsi_value_or_error JSI_ABI_CDECL jsi_get_prototype_of(jsi_runtime *rt,
                                                     jsi_object obj) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1869,7 +1869,7 @@ jsi_value_or_error JSI_CDECL jsi_get_prototype_of(jsi_runtime *rt,
   return abi::create_value_or_error(createJsiValue(state->isolate, proto));
 }
 
-jsi_error_code JSI_CDECL jsi_set_prototype_of(jsi_runtime *rt,
+jsi_status JSI_ABI_CDECL jsi_set_prototype_of(jsi_runtime *rt,
                                                    jsi_object obj,
                                                    const jsi_value *prototype) {
   auto *state = getState(rt);
@@ -1885,15 +1885,15 @@ jsi_error_code JSI_CDECL jsi_set_prototype_of(jsi_runtime *rt,
   v8::Maybe<bool> success =
       v8obj->SetPrototypeV2(state->getContextLocal(), proto);
   if (success.IsNothing())
-    return jsi_error_js;
+    return jsi_status_js_error;
   if (!success.FromJust()) {
     state->setNativeError("Failed to set prototype");
-    return jsi_error_native;
+    return jsi_status_native_error;
   }
-  return jsi_no_error;
+  return jsi_status_ok;
 }
 
-jsi_bool_or_error JSI_CDECL jsi_has_object_property_from_propnameid(
+jsi_bool_or_error JSI_ABI_CDECL jsi_has_object_property_from_propnameid(
     jsi_runtime *rt, jsi_object obj, jsi_propnameid name) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1904,11 +1904,11 @@ jsi_bool_or_error JSI_CDECL jsi_has_object_property_from_propnameid(
 
   v8::Maybe<bool> has = v8obj->Has(state->getContextLocal(), v8name);
   if (has.IsNothing())
-    return abi::create_bool_or_error(jsi_error_js);
+    return abi::create_bool_or_error(jsi_status_js_error);
   return abi::create_bool_or_error(has.FromJust());
 }
 
-jsi_value_or_error JSI_CDECL jsi_get_object_property_from_propnameid(
+jsi_value_or_error JSI_ABI_CDECL jsi_get_object_property_from_propnameid(
     jsi_runtime *rt, jsi_object obj, jsi_propnameid name) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1919,12 +1919,12 @@ jsi_value_or_error JSI_CDECL jsi_get_object_property_from_propnameid(
 
   v8::Local<v8::Value> val;
   if (!v8obj->Get(state->getContextLocal(), v8name).ToLocal(&val))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(jsi_status_js_error);
 
   return abi::create_value_or_error(createJsiValue(state->isolate, val));
 }
 
-jsi_error_code JSI_CDECL jsi_set_object_property_from_propnameid(
+jsi_status JSI_ABI_CDECL jsi_set_object_property_from_propnameid(
     jsi_runtime *rt, jsi_object obj, jsi_propnameid name,
     const jsi_value *value) {
   auto *state = getState(rt);
@@ -1938,11 +1938,11 @@ jsi_error_code JSI_CDECL jsi_set_object_property_from_propnameid(
   v8::Maybe<bool> success =
       v8obj->Set(state->getContextLocal(), v8name, v8val);
   if (success.IsNothing())
-    return jsi_error_js;
-  return jsi_no_error;
+    return jsi_status_js_error;
+  return jsi_status_ok;
 }
 
-jsi_error_code JSI_CDECL jsi_delete_property_from_propnameid(
+jsi_status JSI_ABI_CDECL jsi_delete_property_from_propnameid(
     jsi_runtime *rt, jsi_object obj, jsi_propnameid name) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1953,11 +1953,11 @@ jsi_error_code JSI_CDECL jsi_delete_property_from_propnameid(
 
   v8::Maybe<bool> deleted = v8obj->Delete(state->getContextLocal(), v8name);
   if (deleted.IsNothing())
-    return jsi_error_js;
-  return jsi_no_error;
+    return jsi_status_js_error;
+  return jsi_status_ok;
 }
 
-jsi_bool_or_error JSI_CDECL jsi_has_object_property_from_value(
+jsi_bool_or_error JSI_ABI_CDECL jsi_has_object_property_from_value(
     jsi_runtime *rt, jsi_object obj, const jsi_value *key) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1968,11 +1968,11 @@ jsi_bool_or_error JSI_CDECL jsi_has_object_property_from_value(
 
   v8::Maybe<bool> has = v8obj->Has(state->getContextLocal(), v8key);
   if (has.IsNothing())
-    return abi::create_bool_or_error(jsi_error_js);
+    return abi::create_bool_or_error(jsi_status_js_error);
   return abi::create_bool_or_error(has.FromJust());
 }
 
-jsi_value_or_error JSI_CDECL jsi_get_object_property_from_value(
+jsi_value_or_error JSI_ABI_CDECL jsi_get_object_property_from_value(
     jsi_runtime *rt, jsi_object obj, const jsi_value *key) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -1983,12 +1983,12 @@ jsi_value_or_error JSI_CDECL jsi_get_object_property_from_value(
 
   v8::Local<v8::Value> val;
   if (!v8obj->Get(state->getContextLocal(), v8key).ToLocal(&val))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(jsi_status_js_error);
 
   return abi::create_value_or_error(createJsiValue(state->isolate, val));
 }
 
-jsi_error_code JSI_CDECL jsi_set_object_property_from_value(
+jsi_status JSI_ABI_CDECL jsi_set_object_property_from_value(
     jsi_runtime *rt, jsi_object obj, const jsi_value *key,
     const jsi_value *value) {
   auto *state = getState(rt);
@@ -2002,11 +2002,11 @@ jsi_error_code JSI_CDECL jsi_set_object_property_from_value(
   v8::Maybe<bool> success =
       v8obj->Set(state->getContextLocal(), v8key, v8val);
   if (success.IsNothing())
-    return jsi_error_js;
-  return jsi_no_error;
+    return jsi_status_js_error;
+  return jsi_status_ok;
 }
 
-jsi_error_code JSI_CDECL jsi_delete_property_from_value(
+jsi_status JSI_ABI_CDECL jsi_delete_property_from_value(
     jsi_runtime *rt, jsi_object obj, const jsi_value *key) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2017,11 +2017,11 @@ jsi_error_code JSI_CDECL jsi_delete_property_from_value(
 
   v8::Maybe<bool> deleted = v8obj->Delete(state->getContextLocal(), v8key);
   if (deleted.IsNothing())
-    return jsi_error_js;
-  return jsi_no_error;
+    return jsi_status_js_error;
+  return jsi_status_ok;
 }
 
-jsi_array_or_error JSI_CDECL jsi_get_object_property_names(jsi_runtime *rt,
+jsi_array_or_error JSI_ABI_CDECL jsi_get_object_property_names(jsi_runtime *rt,
                                                             jsi_object obj) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2038,22 +2038,22 @@ jsi_array_or_error JSI_CDECL jsi_get_object_property_names(jsi_runtime *rt,
                v8::IndexFilter::kIncludeIndices,
                v8::KeyConversionMode::kConvertToString)
            .ToLocal(&names))
-    return abi::create_array_or_error(jsi_error_js);
+    return abi::create_array_or_error(jsi_status_js_error);
 
   return abi::create_array_or_error(
       static_cast<jsi_pointer *>(new ObjectHandle(state->isolate, names)));
 }
 
-jsi_error_code JSI_CDECL jsi_set_object_external_memory_pressure(
+jsi_status JSI_ABI_CDECL jsi_set_object_external_memory_pressure(
     jsi_runtime *rt, jsi_object /*obj*/, size_t amount) {
   auto *state = getState(rt);
   V8Scope scope(state);
   state->isolate->AdjustAmountOfExternalAllocatedMemory(
       static_cast<int64_t>(amount));
-  return jsi_no_error;
+  return jsi_status_ok;
 }
 
-jsi_object_or_error JSI_CDECL jsi_create_error(jsi_runtime *rt,
+jsi_object_or_error JSI_ABI_CDECL jsi_create_error(jsi_runtime *rt,
                                                 const uint8_t *utf8_msg,
                                                 size_t len) {
   auto *state = getState(rt);
@@ -2068,7 +2068,7 @@ jsi_object_or_error JSI_CDECL jsi_create_error(jsi_runtime *rt,
                                   static_cast<int>(len))
              .ToLocal(&msgStr)) {
       state->setNativeError("Failed to create message string");
-      return abi::create_object_or_error(jsi_error_native);
+      return abi::create_object_or_error(jsi_status_native_error);
     }
   } else {
     msgStr = v8::String::Empty(isolate);
@@ -2083,7 +2083,7 @@ jsi_object_or_error JSI_CDECL jsi_create_error(jsi_runtime *rt,
 // Array Operations
 //------------------------------------------------------------------------------
 
-jsi_array_or_error JSI_CDECL jsi_create_array(jsi_runtime *rt, size_t length) {
+jsi_array_or_error JSI_ABI_CDECL jsi_create_array(jsi_runtime *rt, size_t length) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::Array> arr =
@@ -2092,7 +2092,7 @@ jsi_array_or_error JSI_CDECL jsi_create_array(jsi_runtime *rt, size_t length) {
       static_cast<jsi_pointer *>(new ObjectHandle(state->isolate, arr)));
 }
 
-size_t JSI_CDECL jsi_get_array_length(jsi_runtime *rt, jsi_array arr) {
+size_t JSI_ABI_CDECL jsi_get_array_length(jsi_runtime *rt, jsi_array arr) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::Object> v8obj = toObjectHandle({arr.pointer})->get(state->isolate);
@@ -2101,7 +2101,7 @@ size_t JSI_CDECL jsi_get_array_length(jsi_runtime *rt, jsi_array arr) {
   return v8::Local<v8::Array>::Cast(v8obj)->Length();
 }
 
-jsi_value_or_error JSI_CDECL jsi_get_array_element(jsi_runtime *rt,
+jsi_value_or_error JSI_ABI_CDECL jsi_get_array_element(jsi_runtime *rt,
                                                     jsi_object arr,
                                                     size_t index) {
   auto *state = getState(rt);
@@ -2112,12 +2112,12 @@ jsi_value_or_error JSI_CDECL jsi_get_array_element(jsi_runtime *rt,
   v8::Local<v8::Value> val;
   if (!v8obj->Get(state->getContextLocal(), static_cast<uint32_t>(index))
            .ToLocal(&val))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(jsi_status_js_error);
 
   return abi::create_value_or_error(createJsiValue(state->isolate, val));
 }
 
-jsi_error_code JSI_CDECL jsi_set_array_element(jsi_runtime *rt,
+jsi_status JSI_ABI_CDECL jsi_set_array_element(jsi_runtime *rt,
                                                     jsi_object arr,
                                                     size_t index,
                                                     const jsi_value *value) {
@@ -2131,15 +2131,15 @@ jsi_error_code JSI_CDECL jsi_set_array_element(jsi_runtime *rt,
   v8::Maybe<bool> success =
       v8obj->Set(state->getContextLocal(), static_cast<uint32_t>(index), v8val);
   if (success.IsNothing())
-    return jsi_error_js;
-  return jsi_no_error;
+    return jsi_status_js_error;
+  return jsi_status_ok;
 }
 
 //------------------------------------------------------------------------------
 // ArrayBuffer Operations
 //------------------------------------------------------------------------------
 
-jsi_arraybuffer_or_error JSI_CDECL jsi_create_arraybuffer(jsi_runtime *rt,
+jsi_arraybuffer_or_error JSI_ABI_CDECL jsi_create_arraybuffer(jsi_runtime *rt,
                                                            size_t byte_length) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2149,7 +2149,7 @@ jsi_arraybuffer_or_error JSI_CDECL jsi_create_arraybuffer(jsi_runtime *rt,
       static_cast<jsi_pointer *>(new ObjectHandle(state->isolate, ab)));
 }
 
-jsi_arraybuffer_or_error JSI_CDECL jsi_create_arraybuffer_from_external_data(
+jsi_arraybuffer_or_error JSI_ABI_CDECL jsi_create_arraybuffer_from_external_data(
     jsi_runtime *rt, jsi_mutable_buffer *buf) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2165,8 +2165,8 @@ jsi_arraybuffer_or_error JSI_CDECL jsi_create_arraybuffer_from_external_data(
   v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(isolate, buf->size);
   if (buf->size != 0)
     std::memcpy(ab->Data(), buf->data, buf->size);
-  if (buf->vtable && buf->vtable->release)
-    buf->vtable->release(buf);
+  if (buf->api && buf->api->release)
+    buf->api->release(buf);
   return abi::create_arraybuffer_or_error(
       static_cast<jsi_pointer *>(new ObjectHandle(isolate, ab)));
 #else
@@ -2180,8 +2180,8 @@ jsi_arraybuffer_or_error JSI_CDECL jsi_create_arraybuffer_from_external_data(
           buf->data, buf->size,
           [](void * /*data*/, size_t /*length*/, void *deleter_data) {
             auto *r = static_cast<BufRef *>(deleter_data);
-            if (r->buf->vtable && r->buf->vtable->release)
-              r->buf->vtable->release(r->buf);
+            if (r->buf->api && r->buf->api->release)
+              r->buf->api->release(r->buf);
             delete r;
           },
           ref);
@@ -2193,7 +2193,7 @@ jsi_arraybuffer_or_error JSI_CDECL jsi_create_arraybuffer_from_external_data(
 #endif  // V8_ENABLE_SANDBOX
 }
 
-jsi_uint8_ptr_or_error JSI_CDECL jsi_get_arraybuffer_data(jsi_runtime *rt,
+jsi_uint8_ptr_or_error JSI_ABI_CDECL jsi_get_arraybuffer_data(jsi_runtime *rt,
                                                            jsi_arraybuffer ab) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2201,7 +2201,7 @@ jsi_uint8_ptr_or_error JSI_CDECL jsi_get_arraybuffer_data(jsi_runtime *rt,
   v8::Local<v8::Object> v8obj = toObjectHandle({ab.pointer})->get(state->isolate);
   if (!v8obj->IsArrayBuffer()) {
     state->setNativeError("Object is not an ArrayBuffer");
-    return abi::create_uint8_ptr_or_error(jsi_error_native);
+    return abi::create_uint8_ptr_or_error(jsi_status_native_error);
   }
 
   v8::Local<v8::ArrayBuffer> v8ab = v8::Local<v8::ArrayBuffer>::Cast(v8obj);
@@ -2209,7 +2209,7 @@ jsi_uint8_ptr_or_error JSI_CDECL jsi_get_arraybuffer_data(jsi_runtime *rt,
       static_cast<uint8_t *>(v8ab->GetBackingStore()->Data()));
 }
 
-jsi_size_or_error JSI_CDECL jsi_get_arraybuffer_size(jsi_runtime *rt,
+jsi_size_or_error JSI_ABI_CDECL jsi_get_arraybuffer_size(jsi_runtime *rt,
                                                       jsi_arraybuffer ab) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2217,7 +2217,7 @@ jsi_size_or_error JSI_CDECL jsi_get_arraybuffer_size(jsi_runtime *rt,
   v8::Local<v8::Object> v8obj = toObjectHandle({ab.pointer})->get(state->isolate);
   if (!v8obj->IsArrayBuffer()) {
     state->setNativeError("Object is not an ArrayBuffer");
-    return abi::create_size_or_error(jsi_error_native);
+    return abi::create_size_or_error(jsi_status_native_error);
   }
 
   v8::Local<v8::ArrayBuffer> v8ab = v8::Local<v8::ArrayBuffer>::Cast(v8obj);
@@ -2228,7 +2228,7 @@ jsi_size_or_error JSI_CDECL jsi_get_arraybuffer_size(jsi_runtime *rt,
 // Function Operations
 //------------------------------------------------------------------------------
 
-jsi_value_or_error JSI_CDECL jsi_call(jsi_runtime *rt, jsi_function fn,
+jsi_value_or_error JSI_ABI_CDECL jsi_call(jsi_runtime *rt, jsi_function fn,
                                        const jsi_value *js_this,
                                        const jsi_value *args,
                                        size_t arg_count) {
@@ -2240,7 +2240,7 @@ jsi_value_or_error JSI_CDECL jsi_call(jsi_runtime *rt, jsi_function fn,
   v8::Local<v8::Object> v8obj = toObjectHandle({fn.pointer})->get(state->isolate);
   if (!v8obj->IsFunction()) {
     state->setNativeError("Object is not a function");
-    return abi::create_value_or_error(jsi_error_native);
+    return abi::create_value_or_error(jsi_status_native_error);
   }
   v8::Local<v8::Function> v8func = v8::Local<v8::Function>::Cast(v8obj);
 
@@ -2258,12 +2258,12 @@ jsi_value_or_error JSI_CDECL jsi_call(jsi_runtime *rt, jsi_function fn,
            ->Call(state->getContextLocal(), v8this,
                   static_cast<int>(arg_count), v8args.data())
            .ToLocal(&callResult))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(jsi_status_js_error);
 
   return abi::create_value_or_error(createJsiValue(isolate, callResult));
 }
 
-jsi_value_or_error JSI_CDECL jsi_call_as_constructor(jsi_runtime *rt,
+jsi_value_or_error JSI_ABI_CDECL jsi_call_as_constructor(jsi_runtime *rt,
                                                       jsi_function fn,
                                                       const jsi_value *args,
                                                       size_t arg_count) {
@@ -2275,7 +2275,7 @@ jsi_value_or_error JSI_CDECL jsi_call_as_constructor(jsi_runtime *rt,
   v8::Local<v8::Object> v8obj = toObjectHandle({fn.pointer})->get(state->isolate);
   if (!v8obj->IsFunction()) {
     state->setNativeError("Object is not a function");
-    return abi::create_value_or_error(jsi_error_native);
+    return abi::create_value_or_error(jsi_status_native_error);
   }
   v8::Local<v8::Function> v8func = v8::Local<v8::Function>::Cast(v8obj);
 
@@ -2289,13 +2289,13 @@ jsi_value_or_error JSI_CDECL jsi_call_as_constructor(jsi_runtime *rt,
            ->NewInstance(state->getContextLocal(),
                          static_cast<int>(arg_count), v8args.data())
            .ToLocal(&constructed))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(jsi_status_js_error);
 
   return abi::create_value_or_error(
       abi::create_object_value(new ObjectHandle(isolate, constructed)));
 }
 
-jsi_function_or_error JSI_CDECL jsi_create_function_from_host_function(
+jsi_function_or_error JSI_ABI_CDECL jsi_create_function_from_host_function(
     jsi_runtime *rt, jsi_propnameid name, uint32_t param_count,
     jsi_host_function *hf) {
   auto *state = getState(rt);
@@ -2312,7 +2312,7 @@ jsi_function_or_error JSI_CDECL jsi_create_function_from_host_function(
            .ToLocal(&func)) {
     ctx->hostFunction = nullptr; // caller still owns hf
     delete ctx;
-    return abi::create_function_or_error(jsi_error_js);
+    return abi::create_function_or_error(jsi_status_js_error);
   }
 
   // Set up weak ref so ctx + hf are released when V8 GCs the function
@@ -2332,7 +2332,7 @@ jsi_function_or_error JSI_CDECL jsi_create_function_from_host_function(
       static_cast<jsi_pointer *>(new ObjectHandle(isolate, func)));
 }
 
-jsi_host_function *JSI_CDECL jsi_get_host_function(jsi_runtime *rt,
+jsi_host_function *JSI_ABI_CDECL jsi_get_host_function(jsi_runtime *rt,
                                                     jsi_function fn) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2353,7 +2353,7 @@ jsi_host_function *JSI_CDECL jsi_get_host_function(jsi_runtime *rt,
 // Host Object Operations
 //------------------------------------------------------------------------------
 
-jsi_object_or_error JSI_CDECL
+jsi_object_or_error JSI_ABI_CDECL
 jsi_create_object_from_host_object(jsi_runtime *rt, jsi_host_object *ho) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2365,7 +2365,7 @@ jsi_create_object_from_host_object(jsi_runtime *rt, jsi_host_object *ho) {
 
   v8::Local<v8::Object> newObject;
   if (!constructor->NewInstance(context).ToLocal(&newObject))
-    return abi::create_object_or_error(jsi_error_js);
+    return abi::create_object_or_error(jsi_status_js_error);
 
   auto *proxy = new AbiHostObjectProxy(rt, ho, isolate, newObject);
   newObject->SetInternalField(0, v8::External::New(isolate, proxy));
@@ -2378,7 +2378,7 @@ jsi_create_object_from_host_object(jsi_runtime *rt, jsi_host_object *ho) {
       static_cast<jsi_pointer *>(new ObjectHandle(isolate, newObject)));
 }
 
-jsi_host_object *JSI_CDECL jsi_get_host_object(jsi_runtime *rt,
+jsi_host_object *JSI_ABI_CDECL jsi_get_host_object(jsi_runtime *rt,
                                                 jsi_object obj) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2401,7 +2401,7 @@ jsi_host_object *JSI_CDECL jsi_get_host_object(jsi_runtime *rt,
 // Native State
 //------------------------------------------------------------------------------
 
-bool JSI_CDECL jsi_has_native_state(jsi_runtime *rt, jsi_object obj) {
+bool JSI_ABI_CDECL jsi_has_native_state(jsi_runtime *rt, jsi_object obj) {
   auto *state = getState(rt);
   V8Scope scope(state);
   v8::Local<v8::Context> context = state->getContextLocal();
@@ -2412,7 +2412,7 @@ bool JSI_CDECL jsi_has_native_state(jsi_runtime *rt, jsi_object obj) {
   return hasPrivate.FromMaybe(false);
 }
 
-jsi_native_state *JSI_CDECL jsi_get_native_state(jsi_runtime *rt,
+jsi_native_state *JSI_ABI_CDECL jsi_get_native_state(jsi_runtime *rt,
                                                    jsi_object obj) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2423,7 +2423,7 @@ jsi_native_state *JSI_CDECL jsi_get_native_state(jsi_runtime *rt,
   return wrapper ? wrapper->state : nullptr;
 }
 
-jsi_error_code JSI_CDECL jsi_set_native_state(jsi_runtime *rt,
+jsi_status JSI_ABI_CDECL jsi_set_native_state(jsi_runtime *rt,
                                                    jsi_object obj,
                                                    jsi_native_state *ns) {
   auto *state = getState(rt);
@@ -2436,33 +2436,33 @@ jsi_error_code JSI_CDECL jsi_set_native_state(jsi_runtime *rt,
   NativeStateWrapper *existing = getNativeStateWrapper(state, context, v8obj);
   if (existing) {
     if (existing->state)
-      existing->state->vtable->release(existing->state);
+      existing->state->api->release(existing->state);
     existing->state = ns;
   } else {
     auto *wrapper = new NativeStateWrapper(isolate, v8obj, ns);
     v8::Local<v8::External> external = v8::External::New(isolate, wrapper);
     v8obj->SetPrivate(context, key, external).Check();
   }
-  return jsi_no_error;
+  return jsi_status_ok;
 }
 
 //------------------------------------------------------------------------------
 // Type Checks
 //------------------------------------------------------------------------------
 
-bool JSI_CDECL jsi_object_is_array(jsi_runtime *rt, jsi_object obj) {
+bool JSI_ABI_CDECL jsi_object_is_array(jsi_runtime *rt, jsi_object obj) {
   auto *state = getState(rt);
   V8Scope scope(state);
   return toObjectHandle(obj)->get(state->isolate)->IsArray();
 }
 
-bool JSI_CDECL jsi_object_is_arraybuffer(jsi_runtime *rt, jsi_object obj) {
+bool JSI_ABI_CDECL jsi_object_is_arraybuffer(jsi_runtime *rt, jsi_object obj) {
   auto *state = getState(rt);
   V8Scope scope(state);
   return toObjectHandle(obj)->get(state->isolate)->IsArrayBuffer();
 }
 
-bool JSI_CDECL jsi_object_is_function(jsi_runtime *rt, jsi_object obj) {
+bool JSI_ABI_CDECL jsi_object_is_function(jsi_runtime *rt, jsi_object obj) {
   auto *state = getState(rt);
   V8Scope scope(state);
   return toObjectHandle(obj)->get(state->isolate)->IsFunction();
@@ -2472,7 +2472,7 @@ bool JSI_CDECL jsi_object_is_function(jsi_runtime *rt, jsi_object obj) {
 // Weak References
 //------------------------------------------------------------------------------
 
-jsi_weak_object_or_error JSI_CDECL jsi_create_weak_object(jsi_runtime *rt,
+jsi_weak_object_or_error JSI_ABI_CDECL jsi_create_weak_object(jsi_runtime *rt,
                                                            jsi_object obj) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2481,7 +2481,7 @@ jsi_weak_object_or_error JSI_CDECL jsi_create_weak_object(jsi_runtime *rt,
       static_cast<jsi_pointer *>(new WeakObjectHandle(state->isolate, v8obj)));
 }
 
-jsi_value JSI_CDECL jsi_lock_weak_object(jsi_runtime *rt,
+jsi_value JSI_ABI_CDECL jsi_lock_weak_object(jsi_runtime *rt,
                                           jsi_weak_object wo) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2495,7 +2495,7 @@ jsi_value JSI_CDECL jsi_lock_weak_object(jsi_runtime *rt,
 // Comparison
 //------------------------------------------------------------------------------
 
-jsi_bool_or_error JSI_CDECL jsi_instance_of(jsi_runtime *rt, jsi_object obj,
+jsi_bool_or_error JSI_ABI_CDECL jsi_instance_of(jsi_runtime *rt, jsi_object obj,
                                              jsi_function ctor) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2507,32 +2507,32 @@ jsi_bool_or_error JSI_CDECL jsi_instance_of(jsi_runtime *rt, jsi_object obj,
   v8::Maybe<bool> result =
       v8obj->InstanceOf(state->getContextLocal(), v8ctor);
   if (result.IsNothing())
-    return abi::create_bool_or_error(jsi_error_js);
+    return abi::create_bool_or_error(jsi_status_js_error);
   return abi::create_bool_or_error(result.FromJust());
 }
 
-bool JSI_CDECL jsi_strict_equals_symbol(jsi_runtime *rt, jsi_symbol a,
+bool JSI_ABI_CDECL jsi_strict_equals_symbol(jsi_runtime *rt, jsi_symbol a,
                                          jsi_symbol b) {
   auto *state = getState(rt);
   V8Scope scope(state);
   return toSymbolHandle(a)->get(state->isolate)->StrictEquals(toSymbolHandle(b)->get(state->isolate));
 }
 
-bool JSI_CDECL jsi_strict_equals_bigint(jsi_runtime *rt, jsi_bigint a,
+bool JSI_ABI_CDECL jsi_strict_equals_bigint(jsi_runtime *rt, jsi_bigint a,
                                          jsi_bigint b) {
   auto *state = getState(rt);
   V8Scope scope(state);
   return toBigIntHandle(a)->get(state->isolate)->StrictEquals(toBigIntHandle(b)->get(state->isolate));
 }
 
-bool JSI_CDECL jsi_strict_equals_string(jsi_runtime *rt, jsi_string a,
+bool JSI_ABI_CDECL jsi_strict_equals_string(jsi_runtime *rt, jsi_string a,
                                          jsi_string b) {
   auto *state = getState(rt);
   V8Scope scope(state);
   return toStringHandle(a)->get(state->isolate)->StrictEquals(toStringHandle(b)->get(state->isolate));
 }
 
-bool JSI_CDECL jsi_strict_equals_object(jsi_runtime *rt, jsi_object a,
+bool JSI_ABI_CDECL jsi_strict_equals_object(jsi_runtime *rt, jsi_object a,
                                          jsi_object b) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2543,7 +2543,7 @@ bool JSI_CDECL jsi_strict_equals_object(jsi_runtime *rt, jsi_object a,
 // BigInt Operations
 //------------------------------------------------------------------------------
 
-jsi_bigint_or_error JSI_CDECL jsi_create_bigint_from_int64(jsi_runtime *rt,
+jsi_bigint_or_error JSI_ABI_CDECL jsi_create_bigint_from_int64(jsi_runtime *rt,
                                                             int64_t value) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2552,7 +2552,7 @@ jsi_bigint_or_error JSI_CDECL jsi_create_bigint_from_int64(jsi_runtime *rt,
       static_cast<jsi_pointer *>(new BigIntHandle(state->isolate, bi)));
 }
 
-jsi_bigint_or_error JSI_CDECL jsi_create_bigint_from_uint64(jsi_runtime *rt,
+jsi_bigint_or_error JSI_ABI_CDECL jsi_create_bigint_from_uint64(jsi_runtime *rt,
                                                              uint64_t value) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2562,7 +2562,7 @@ jsi_bigint_or_error JSI_CDECL jsi_create_bigint_from_uint64(jsi_runtime *rt,
       static_cast<jsi_pointer *>(new BigIntHandle(state->isolate, bi)));
 }
 
-bool JSI_CDECL jsi_bigint_is_int64(jsi_runtime *rt, jsi_bigint bigint) {
+bool JSI_ABI_CDECL jsi_bigint_is_int64(jsi_runtime *rt, jsi_bigint bigint) {
   auto *state = getState(rt);
   V8Scope scope(state);
   bool lossless = true;
@@ -2570,7 +2570,7 @@ bool JSI_CDECL jsi_bigint_is_int64(jsi_runtime *rt, jsi_bigint bigint) {
   return lossless;
 }
 
-bool JSI_CDECL jsi_bigint_is_uint64(jsi_runtime *rt, jsi_bigint bigint) {
+bool JSI_ABI_CDECL jsi_bigint_is_uint64(jsi_runtime *rt, jsi_bigint bigint) {
   auto *state = getState(rt);
   V8Scope scope(state);
   bool lossless = true;
@@ -2578,7 +2578,7 @@ bool JSI_CDECL jsi_bigint_is_uint64(jsi_runtime *rt, jsi_bigint bigint) {
   return lossless;
 }
 
-uint64_t JSI_CDECL jsi_bigint_truncate_to_uint64(jsi_runtime *rt,
+uint64_t JSI_ABI_CDECL jsi_bigint_truncate_to_uint64(jsi_runtime *rt,
                                                    jsi_bigint bigint) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2586,7 +2586,7 @@ uint64_t JSI_CDECL jsi_bigint_truncate_to_uint64(jsi_runtime *rt,
   return toBigIntHandle(bigint)->get(state->isolate)->Uint64Value(&lossless);
 }
 
-int64_t JSI_CDECL jsi_bigint_to_int64(jsi_runtime *rt, jsi_bigint bigint,
+int64_t JSI_ABI_CDECL jsi_bigint_to_int64(jsi_runtime *rt, jsi_bigint bigint,
                                        bool *lossless) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2597,7 +2597,7 @@ int64_t JSI_CDECL jsi_bigint_to_int64(jsi_runtime *rt, jsi_bigint bigint,
   return result;
 }
 
-uint64_t JSI_CDECL jsi_bigint_to_uint64(jsi_runtime *rt, jsi_bigint bigint,
+uint64_t JSI_ABI_CDECL jsi_bigint_to_uint64(jsi_runtime *rt, jsi_bigint bigint,
                                          bool *lossless) {
   auto *state = getState(rt);
   V8Scope scope(state);
@@ -2608,7 +2608,7 @@ uint64_t JSI_CDECL jsi_bigint_to_uint64(jsi_runtime *rt, jsi_bigint bigint,
   return result;
 }
 
-jsi_string_or_error JSI_CDECL jsi_bigint_to_string(jsi_runtime *rt,
+jsi_string_or_error JSI_ABI_CDECL jsi_bigint_to_string(jsi_runtime *rt,
                                                     jsi_bigint bigint,
                                                     uint32_t radix) {
   auto *state = getState(rt);
@@ -2621,7 +2621,7 @@ jsi_string_or_error JSI_CDECL jsi_bigint_to_string(jsi_runtime *rt,
 
   v8::Local<v8::Object> bigintProto;
   if (!bi->ToObject(context).ToLocal(&bigintProto))
-    return abi::create_string_or_error(jsi_error_js);
+    return abi::create_string_or_error(jsi_status_js_error);
 
   v8::Local<v8::String> toStringName =
       v8::String::NewFromUtf8Literal(isolate, "toString");
@@ -2629,7 +2629,7 @@ jsi_string_or_error JSI_CDECL jsi_bigint_to_string(jsi_runtime *rt,
   if (!bigintProto->Get(context, toStringName).ToLocal(&toStringFn) ||
       !toStringFn->IsFunction()) {
     state->setNativeError("BigInt.prototype.toString not found");
-    return abi::create_string_or_error(jsi_error_native);
+    return abi::create_string_or_error(jsi_status_native_error);
   }
 
   v8::Local<v8::Value> radixArg =
@@ -2638,11 +2638,11 @@ jsi_string_or_error JSI_CDECL jsi_bigint_to_string(jsi_runtime *rt,
   if (!v8::Local<v8::Function>::Cast(toStringFn)
            ->Call(context, bi, 1, &radixArg)
            .ToLocal(&resultValue))
-    return abi::create_string_or_error(jsi_error_js);
+    return abi::create_string_or_error(jsi_status_js_error);
 
   if (!resultValue->IsString()) {
     state->setNativeError("BigInt.toString did not return a string");
-    return abi::create_string_or_error(jsi_error_native);
+    return abi::create_string_or_error(jsi_status_native_error);
   }
 
   return abi::create_string_or_error(static_cast<jsi_pointer *>(
@@ -2653,7 +2653,7 @@ jsi_string_or_error JSI_CDECL jsi_bigint_to_string(jsi_runtime *rt,
 // Runtime VTable Definition
 //==============================================================================
 
-const jsi_runtime_vtable g_vtable = {
+const jsi_runtime_api g_vtable = {
     /* query_interface */ jsi_query_interface,
     /* get_abi_version */ jsi_get_abi_version,
     /* add_ref */ jsi_add_ref,
@@ -2663,7 +2663,7 @@ const jsi_runtime_vtable g_vtable = {
     /* get_and_clear_native_exception_message */
     jsi_get_and_clear_native_exception_message,
     /* set_js_error_value */ jsi_set_js_error_value,
-    /* set_native_exception_message */ jsi_set_native_exception_message,
+    /* set_native_exception_message_utf8 */ jsi_set_native_exception_message,
 
     /* clone_propnameid */ jsi_clone_propnameid,
     /* clone_string */ jsi_clone_string,
@@ -2686,18 +2686,18 @@ const jsi_runtime_vtable g_vtable = {
 
     /* get_global_object */ jsi_get_global_object,
 
-    /* create_string_from_utf8 */ jsi_create_string_from_utf8,
-    /* create_string_from_utf16 */ jsi_create_string_from_utf16,
-    /* get_utf8_from_string */ jsi_get_utf8_from_string,
-    /* get_utf16_from_string */ jsi_get_utf16_from_string,
+    /* create_string_utf8 */ jsi_create_string_from_utf8,
+    /* create_string_utf16 */ jsi_create_string_from_utf16,
+    /* get_string_utf8 */ jsi_get_utf8_from_string,
+    /* get_string_utf16 */ jsi_get_utf16_from_string,
 
-    /* get_utf8_from_symbol */ jsi_get_utf8_from_symbol,
+    /* get_symbol_utf8 */ jsi_get_utf8_from_symbol,
 
-    /* create_propnameid_from_utf8 */ jsi_create_propnameid_from_utf8,
+    /* create_propnameid_utf8 */ jsi_create_propnameid_from_utf8,
     /* create_propnameid_from_string */ jsi_create_propnameid_from_string,
     /* create_propnameid_from_symbol */ jsi_create_propnameid_from_symbol,
-    /* prop_name_id_equals */ jsi_prop_name_id_equals,
-    /* get_utf8_from_propnameid */ jsi_get_utf8_from_propnameid,
+    /* propnameid_equals */ jsi_prop_name_id_equals,
+    /* get_propnameid_utf8 */ jsi_get_utf8_from_propnameid,
 
     /* create_object */ jsi_create_object,
     /* create_object_with_prototype */ jsi_create_object_with_prototype,
@@ -2720,7 +2720,7 @@ const jsi_runtime_vtable g_vtable = {
     /* get_object_property_names */ jsi_get_object_property_names,
     /* set_object_external_memory_pressure */
     jsi_set_object_external_memory_pressure,
-    /* create_error */ jsi_create_error,
+    /* create_error_utf8 */ jsi_create_error,
 
     /* create_array */ jsi_create_array,
     /* get_array_length */ jsi_get_array_length,
@@ -2844,9 +2844,9 @@ extern "C" {
 
 // Flat runtime-creation export (replaces the dropped jsi_vtable factory).
 // requested_abi_version is the consumer's compiled JSI_ABI_VERSION; configure
-// (may be NULL) populates a factory-owned jsi_config via the v8_jsi_config_set_*
+// (may be NULL) populates a factory-owned jsi_config via the v8_jsi_abi_config_set_*
 // setters. Returns NULL on version mismatch or configure failure.
-JSI_API jsi_runtime *JSI_CDECL v8_create_runtime(
+JSI_ABI_API jsi_runtime *JSI_ABI_CDECL v8_jsi_abi_runtime_create(
     uint32_t requested_abi_version,
     jsi_configure_runtime_cb configure,
     void *configure_data) {
@@ -2862,7 +2862,7 @@ JSI_API jsi_runtime *JSI_CDECL v8_create_runtime(
     // pointers it takes over, so ~jsi_config_s does not double-fire; on a
     // configure abort, ~jsi_config_s fires any registered deleters exactly once.
     jsi_config_s config;
-    if (configure(configure_data, &config) != jsi_no_error)
+    if (configure(configure_data, &config) != jsi_status_ok)
       return nullptr;
     rt = JsiRuntimeState::create(&config);
   } else {
@@ -2881,8 +2881,8 @@ JSI_API jsi_runtime *JSI_CDECL v8_create_runtime(
 
 // Process-global V8 engine flags. Raw CLI-style pass-through to V8 — these are
 // process-global and consumed only on the first platform init, so they are NOT
-// per-runtime config. Must be called before the first v8_create_runtime.
-JSI_API void JSI_CDECL v8_jsi_set_v8_flags(
+// per-runtime config. Must be called before the first v8_jsi_abi_runtime_create.
+JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_set_v8_flags(
     size_t *argc, char **argv, bool remove_flags) {
   if (!argc || !argv)
     return;
@@ -2891,10 +2891,10 @@ JSI_API void JSI_CDECL v8_jsi_set_v8_flags(
   *argc = n < 0 ? 0u : static_cast<size_t>(n);
 }
 
-// Startup-snapshot creation. See v8_jsi_config.h for the contract. Builds a
+// Startup-snapshot creation. See v8_jsi_abi.h for the contract. Builds a
 // blob with v8::SnapshotCreator (its own isolate), running the builder script
 // in a fresh context and serializing it as the default context. Exception-free.
-JSI_API jsi_error_code JSI_CDECL v8_create_startup_snapshot(
+JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_snapshot_create(
     const char *script_utf8,
     size_t script_size,
     const char *source_url,
@@ -2903,7 +2903,7 @@ JSI_API jsi_error_code JSI_CDECL v8_create_startup_snapshot(
     size_t *out_blob_size) {
   (void)source_url;
   if (!script_utf8 || !out_blob || !out_blob_size)
-    return jsi_error_native;
+    return jsi_status_native_error;
   *out_blob = nullptr;
   *out_blob_size = 0;
 
@@ -2977,7 +2977,7 @@ JSI_API jsi_error_code JSI_CDECL v8_create_startup_snapshot(
           v8::SnapshotCreator::FunctionCodeHandling::kClear);
   } // creator destroyed: isolate exited + disposed
 
-  jsi_error_code rc = jsi_no_error;
+  jsi_status rc = jsi_status_ok;
   if (ok && blob.data && blob.raw_size > 0) {
     // Prefix the raw StartupData with the self-describing container header so a
     // stale/cross-engine blob is rejected at load time rather than crashing V8.
@@ -2992,10 +2992,10 @@ JSI_API jsi_error_code JSI_CDECL v8_create_startup_snapshot(
       *out_blob = bytes;
       *out_blob_size = total;
     } else {
-      rc = jsi_error_native;
+      rc = jsi_status_native_error;
     }
   } else {
-    rc = jsi_error_native;
+    rc = jsi_status_native_error;
   }
 
   // CreateBlob hands ownership of blob.data to us (allocated with new[]).
@@ -3004,12 +3004,12 @@ JSI_API jsi_error_code JSI_CDECL v8_create_startup_snapshot(
   return rc;
 }
 
-JSI_API void JSI_CDECL v8_free_startup_snapshot(uint8_t *blob) {
+JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_snapshot_destroy(uint8_t *blob) {
   std::free(blob);
 }
 
-JSI_API int JSI_CDECL
-v8_startup_snapshot_compatible(const uint8_t *blob, size_t blob_size) {
+JSI_ABI_API int JSI_ABI_CDECL
+v8_jsi_abi_snapshot_check(const uint8_t *blob, size_t blob_size) {
   // Initialize V8 (idempotent) so CachedDataVersionTag is read in its final,
   // flag-implication-enforced state — matching the create path. Any process-
   // global engine flags (e.g. --jitless) must already be set by the caller.
@@ -3017,11 +3017,11 @@ v8_startup_snapshot_compatible(const uint8_t *blob, size_t blob_size) {
   return v8rt_snapshot::validate(blob, blob_size);
 }
 
-JSI_API const char *JSI_CDECL v8_startup_snapshot_compat_string(int code) {
+JSI_ABI_API const char *JSI_ABI_CDECL v8_jsi_abi_snapshot_compat_to_string(int code) {
   return v8rt_snapshot::compatString(code);
 }
 
-JSI_API void JSI_CDECL v8_jsi_config_set_startup_snapshot(
+JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_config_set_startup_snapshot(
     jsi_config config,
     const uint8_t *blob,
     size_t blob_size,
@@ -3045,7 +3045,7 @@ JSI_API void JSI_CDECL v8_jsi_config_set_startup_snapshot(
 // openInspector(jsi::Runtime &) and openInspectors_toberemoved() exports.
 // Starts a previously-quiet Agent (e.g. when enable_inspector was set on the
 // config but inspector_break_on_start was false). Safe to call multiple times.
-JSI_API void JSI_CDECL v8_open_inspector(jsi_runtime *runtime) {
+JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_runtime_open_inspector(jsi_runtime *runtime) {
 #if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)
   if (!runtime) return;
   auto *state = static_cast<JsiRuntimeState *>(runtime);
@@ -3062,9 +3062,9 @@ JSI_API void JSI_CDECL v8_open_inspector(jsi_runtime *runtime) {
 // release builds can drop it. Not declared in any public header; the test
 // forward-declares it inline.
 #ifdef JSI_TESTING_ONLY
-JSI_API void JSI_CDECL v8_jsi_test_post_foreground_task(
+JSI_ABI_API void JSI_ABI_CDECL v8_jsi_test_post_foreground_task(
     jsi_runtime *runtime,
-    void (JSI_CDECL *task_run_cb)(void *),
+    void (JSI_ABI_CDECL *task_run_cb)(void *),
     void *task_data) {
   if (!runtime || !task_run_cb)
     return;
@@ -3073,7 +3073,7 @@ JSI_API void JSI_CDECL v8_jsi_test_post_foreground_task(
   if (!runner)
     return;
   struct InlineTask final : public v8rt::TaskRunner::Task {
-    void (JSI_CDECL *cb)(void *);
+    void (JSI_ABI_CDECL *cb)(void *);
     void *data;
     void run() override { cb(data); }
   };
@@ -3088,86 +3088,86 @@ JSI_API void JSI_CDECL v8_jsi_test_post_foreground_task(
 // V8 jsi_config — public C API
 //==============================================================================
 
-JSI_API void JSI_CDECL
-v8_jsi_config_set_initial_heap_size(jsi_config config, size_t bytes) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_initial_heap_size(jsi_config config, size_t bytes) {
   if (config) config->initial_heap_size_in_bytes = bytes;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_set_maximum_heap_size(jsi_config config, size_t bytes) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_maximum_heap_size(jsi_config config, size_t bytes) {
   if (config) config->maximum_heap_size_in_bytes = bytes;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_set_thread_pool_size(jsi_config config, uint8_t size) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_thread_pool_size(jsi_config config, uint8_t size) {
   if (config) config->thread_pool_size = size;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_set_debugger_runtime_name(jsi_config config, const char *name) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_debugger_runtime_name_utf8(jsi_config config, const char *name) {
   if (config) config->debugger_runtime_name = (name ? name : "");
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_enable_inspector(jsi_config config, bool value) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_inspector_enabled(jsi_config config, bool value) {
   if (config) config->enable_inspector = value;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_set_inspector_port(jsi_config config, uint16_t port) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_inspector_port(jsi_config config, uint16_t port) {
   if (config) config->inspector_port = port;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_set_inspector_break_on_start(jsi_config config, bool value) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_inspector_break_on_start(jsi_config config, bool value) {
   if (config) config->inspector_break_on_start = value;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_set_explicit_microtask_policy(jsi_config config, bool value) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_explicit_microtask_policy(jsi_config config, bool value) {
   if (config) config->explicit_microtask_policy = value;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_set_ignore_unhandled_promises(jsi_config config, bool value) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_ignore_unhandled_promises(jsi_config config, bool value) {
   if (config) config->ignore_unhandled_promises = value;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_enable_gc_api(jsi_config config, bool value) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_gc_api_enabled(jsi_config config, bool value) {
   if (config) config->enable_gc_api = value;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_enable_multi_thread(jsi_config config, bool value) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_multi_thread_enabled(jsi_config config, bool value) {
   if (config) config->enable_multi_thread = value;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_enable_jit_tracing(jsi_config config, bool value) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_jit_tracing_enabled(jsi_config config, bool value) {
   if (config) config->enable_jit_tracing = value;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_enable_message_tracing(jsi_config config, bool value) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_message_tracing_enabled(jsi_config config, bool value) {
   if (config) config->enable_message_tracing = value;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_enable_gc_tracing(jsi_config config, bool value) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_gc_tracing_enabled(jsi_config config, bool value) {
   if (config) config->enable_gc_tracing = value;
 }
 
-JSI_API void JSI_CDECL
-v8_jsi_config_enable_system_instrumentation(jsi_config config, bool value) {
+JSI_ABI_API void JSI_ABI_CDECL
+v8_jsi_abi_config_set_system_instrumentation_enabled(jsi_config config, bool value) {
   if (config) config->enable_system_instrumentation = value;
 }
 
-JSI_API void JSI_CDECL v8_jsi_config_set_script_cache(
+JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_config_set_script_cache(
     jsi_config config,
     void *script_cache_data,
-    v8_jsi_script_cache_load_cb load_cb,
-    v8_jsi_script_cache_store_cb store_cb,
+    v8_jsi_abi_script_cache_load_cb load_cb,
+    v8_jsi_abi_script_cache_store_cb store_cb,
     jsi_data_delete_cb script_cache_data_delete_cb,
     void *deleter_data) {
   if (!config) {
@@ -3188,10 +3188,10 @@ JSI_API void JSI_CDECL v8_jsi_config_set_script_cache(
   config->script_cache_deleter_data = deleter_data;
 }
 
-JSI_API void JSI_CDECL v8_jsi_config_set_task_runner(
+JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_config_set_task_runner(
     jsi_config config,
     void *task_runner_data,
-    v8_jsi_task_runner_post_task_cb post_task_cb,
+    v8_jsi_abi_task_runner_post_task_cb post_task_cb,
     jsi_data_delete_cb task_runner_data_delete_cb,
     void *deleter_data) {
   if (!config) {

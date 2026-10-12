@@ -35,10 +35,10 @@
 namespace jsi::abi {
 
 /// The engine's flat runtime-creation export, as a function-pointer type.
-/// Each engine provides one (e.g. v8_create_runtime). Takes the consumer's
+/// Each engine provides one (e.g. v8_jsi_abi_runtime_create). Takes the consumer's
 /// compiled JSI_ABI_VERSION + a configure callback/context; returns a runtime
 /// with refcount 1, or nullptr on version mismatch / configure failure.
-using jsi_create_runtime_fn = jsi_runtime *(JSI_CDECL *)(
+using jsi_create_runtime_fn = jsi_runtime *(JSI_ABI_CDECL *)(
     uint32_t requested_abi_version,
     jsi_configure_runtime_cb configure,
     void *configure_data);
@@ -46,9 +46,9 @@ using jsi_create_runtime_fn = jsi_runtime *(JSI_CDECL *)(
 /// Create a new JSI runtime via the engine's flat create function. This wrapper
 /// is compiled into the consumer, so it injects the consumer's JSI_ABI_VERSION
 /// for free (Node-API Model B).
-/// \param create_runtime The engine's create export (e.g. v8_create_runtime).
+/// \param create_runtime The engine's create export (e.g. v8_jsi_abi_runtime_create).
 /// \param configure Optional callback that populates the factory-owned config
-///   via engine-specific setters (e.g. v8_jsi_config_set_*); nullptr = defaults.
+///   via engine-specific setters (e.g. v8_jsi_abi_config_set_*); nullptr = defaults.
 /// \param configure_data Opaque context passed through to configure.
 /// \return A facebook::jsi::Runtime that owns one ref on the new runtime.
 std::unique_ptr<facebook::jsi::Runtime> makeJsiAbiRuntime(
@@ -70,7 +70,7 @@ std::unique_ptr<facebook::jsi::Runtime> wrapJsiRuntime(jsi_runtime *abiRuntime);
 /// borrowed (no add_ref); it stays alive as long as the wrapping Runtime does.
 ///
 /// Intended for test hooks and advanced consumers that need to call
-/// ABI-specific extensions (e.g., v8_open_inspector). Returns nullptr if
+/// ABI-specific extensions (e.g., v8_jsi_abi_runtime_open_inspector). Returns nullptr if
 /// the supplied Runtime was not created by this factory.
 jsi_runtime *getAbiRuntime(facebook::jsi::Runtime &runtime) noexcept;
 

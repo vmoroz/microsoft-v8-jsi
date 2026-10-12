@@ -53,7 +53,7 @@ const HEADERS: readonly Header[] = [
   { root: "src", include: "jsi_abi/jsi_abi_stela.h" },
   {
     root: "src",
-    include: "jsi_abi/v8_jsi_config.h",
+    include: "jsi_abi/v8_jsi_abi.h",
     pending: "doesn't parse as C; the JSI ABI migration (to v8_jsi_abi.h) fixes it",
   },
   { root: "src/node-api", include: "js_runtime_api.h" },

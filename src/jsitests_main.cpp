@@ -14,19 +14,19 @@
 #include "public/V8JsiRuntime.h"
 #include "jsi_abi/JsiAbiRuntime.h"
 #include "jsi_abi/jsi_abi_helpers.h"
-#include "jsi_abi/v8_jsi_config.h"
+#include "jsi_abi/v8_jsi_abi.h"
 #include "js_runtime_api.h"
 
 // test-only hook (declared in jsi_abi_v8.cpp). Posts a task to the
 // runtime's foreground task runner — used by JsiAbiTaskRunner.LifecycleAndPostTask
 // to exercise the post-task trampoline without an inspector session.
-extern "C" JSI_API void JSI_CDECL v8_jsi_test_post_foreground_task(
+extern "C" JSI_ABI_API void JSI_ABI_CDECL v8_jsi_test_post_foreground_task(
     jsi_runtime *runtime,
-    void (JSI_CDECL *task_run_cb)(void *),
+    void (JSI_ABI_CDECL *task_run_cb)(void *),
     void *task_data);
 
-// v8_create_startup_snapshot / v8_free_startup_snapshot are declared in
-// jsi_abi/v8_jsi_config.h (included above).
+// v8_jsi_abi_snapshot_create / v8_jsi_abi_snapshot_destroy are declared in
+// jsi_abi/v8_jsi_abi.h (included above).
 
 namespace facebook::jsi {
 
@@ -45,7 +45,7 @@ std::vector<facebook::jsi::RuntimeFactory> runtimeGenerators() {
       },
       // Index 1: V8JsiRuntime via ABI-stable C interface
       []() -> std::shared_ptr<facebook::jsi::Runtime> {
-        return ::jsi::abi::makeJsiAbiRuntime(&v8_create_runtime);
+        return ::jsi::abi::makeJsiAbiRuntime(&v8_jsi_abi_runtime_create);
       },
   };
 }
@@ -121,9 +121,9 @@ TEST(SnapshotRoundtrip, DISABLED_SnapshotCreate) {
 
   uint8_t *blob = nullptr;
   size_t blobSize = 0;
-  jsi_error_code rc = v8_create_startup_snapshot(
+  jsi_status rc = v8_jsi_abi_snapshot_create(
       builder.data(), builder.size(), "snapshot-builder.js", /*jitless*/ false, &blob, &blobSize);
-  ASSERT_EQ(rc, jsi_no_error) << "v8_create_startup_snapshot failed";
+  ASSERT_EQ(rc, jsi_status_ok) << "v8_jsi_abi_snapshot_create failed";
   ASSERT_NE(blob, nullptr);
   ASSERT_GT(blobSize, 0u);
   fprintf(stderr, "[snap-test] created blob = %zu bytes -> %s\n", blobSize, kSnapshotTestBlobPath);
@@ -132,7 +132,7 @@ TEST(SnapshotRoundtrip, DISABLED_SnapshotCreate) {
   ASSERT_NE(f, nullptr) << "cannot open blob file for write";
   ASSERT_EQ(fwrite(blob, 1, blobSize, f), blobSize);
   fclose(f);
-  v8_free_startup_snapshot(blob);
+  v8_jsi_abi_snapshot_destroy(blob);
 }
 
 TEST(SnapshotRoundtrip, DISABLED_SnapshotConsume) {
@@ -185,7 +185,7 @@ TEST(Basic, MultiThreadIsolate) {
   }
 }
 
-// smoke test: end-to-end exercise of the v8_jsi_config plumbing.
+// smoke test: end-to-end exercise of the v8_jsi_abi config plumbing.
 // Populates a factory-owned config via the public C setters inside the
 // configure callback, and confirms a basic eval works. Does not (and cannot)
 // verify that V8 actually applied the requested flags — V8 platform-flag state
@@ -194,28 +194,28 @@ TEST(JsiAbiConfig, RuntimeFromConfigEvaluates) {
   // The factory owns the jsi_config; we populate it inside the configure
   // callback (pull model). Touch a representative subset of every field group
   // to confirm linkage.
-  jsi_configure_runtime_cb configure = [](void * /*cb_data*/,
-                                          jsi_config cfg) -> jsi_error_code {
-    v8_jsi_config_set_initial_heap_size(cfg, 0);
-    v8_jsi_config_set_maximum_heap_size(cfg, 0);
-    v8_jsi_config_set_thread_pool_size(cfg, 0);
-    v8_jsi_config_set_debugger_runtime_name(cfg, "config-smoke");
-    v8_jsi_config_enable_inspector(cfg, false);
-    v8_jsi_config_set_inspector_port(cfg, 9223);
-    v8_jsi_config_set_inspector_break_on_start(cfg, false);
-    v8_jsi_config_set_explicit_microtask_policy(cfg, true);
-    v8_jsi_config_set_ignore_unhandled_promises(cfg, false);
-    v8_jsi_config_enable_gc_api(cfg, true);
-    v8_jsi_config_enable_multi_thread(cfg, false);
-    v8_jsi_config_enable_jit_tracing(cfg, false);
-    v8_jsi_config_enable_message_tracing(cfg, false);
-    v8_jsi_config_enable_gc_tracing(cfg, false);
-    v8_jsi_config_enable_system_instrumentation(cfg, false);
-    return jsi_no_error;
+  jsi_configure_runtime_cb configure = [](void * /*user_data*/,
+                                          jsi_config cfg) -> jsi_status {
+    v8_jsi_abi_config_set_initial_heap_size(cfg, 0);
+    v8_jsi_abi_config_set_maximum_heap_size(cfg, 0);
+    v8_jsi_abi_config_set_thread_pool_size(cfg, 0);
+    v8_jsi_abi_config_set_debugger_runtime_name_utf8(cfg, "config-smoke");
+    v8_jsi_abi_config_set_inspector_enabled(cfg, false);
+    v8_jsi_abi_config_set_inspector_port(cfg, 9223);
+    v8_jsi_abi_config_set_inspector_break_on_start(cfg, false);
+    v8_jsi_abi_config_set_explicit_microtask_policy(cfg, true);
+    v8_jsi_abi_config_set_ignore_unhandled_promises(cfg, false);
+    v8_jsi_abi_config_set_gc_api_enabled(cfg, true);
+    v8_jsi_abi_config_set_multi_thread_enabled(cfg, false);
+    v8_jsi_abi_config_set_jit_tracing_enabled(cfg, false);
+    v8_jsi_abi_config_set_message_tracing_enabled(cfg, false);
+    v8_jsi_abi_config_set_gc_tracing_enabled(cfg, false);
+    v8_jsi_abi_config_set_system_instrumentation_enabled(cfg, false);
+    return jsi_status_ok;
   };
 
   std::shared_ptr<facebook::jsi::Runtime> runtime =
-      ::jsi::abi::makeJsiAbiRuntime(&v8_create_runtime, configure);
+      ::jsi::abi::makeJsiAbiRuntime(&v8_jsi_abi_runtime_create, configure);
 
   facebook::jsi::Value result = runtime->evaluateJavaScript(
       std::make_shared<facebook::jsi::StringBuffer>("1 + 2"), "config-smoke.js");
@@ -404,12 +404,12 @@ TEST(JsiAbiTaskRunner, LifecycleAndPostTask) {
 }
 
 // inspector lifecycle smoke test. Builds a runtime with
-// enable_inspector=true, calls v8_open_inspector, evaluates JS, and tears
+// enable_inspector=true, calls v8_jsi_abi_runtime_open_inspector, evaluates JS, and tears
 // down — all without standing up a real debugger client. The point is to
 // verify the inspector::Agent is created/started/torn down without crashing,
 // not to exercise the protocol. Mark skipped on inspector-disabled builds so
 // the test corpus stays portable during transitional rebuilds.
-extern "C" JSI_API void JSI_CDECL v8_open_inspector(jsi_runtime *runtime);
+extern "C" JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_runtime_open_inspector(jsi_runtime *runtime);
 
 TEST(JsiAbiInspector, LifecycleAndOpen) {
 #if !defined(_WIN32) || !defined(V8JSI_ENABLE_INSPECTOR)
@@ -438,8 +438,8 @@ TEST(JsiAbiInspector, LifecycleAndOpen) {
   EXPECT_TRUE(result.isNumber());
   EXPECT_EQ(result.getNumber(), 42.0);
 
-  // Calling v8_open_inspector again on an already-started agent must be safe.
-  v8_open_inspector(::jsi::abi::getAbiRuntime(*runtime));
+  // Calling v8_jsi_abi_runtime_open_inspector again on an already-started agent must be safe.
+  v8_jsi_abi_runtime_open_inspector(::jsi::abi::getAbiRuntime(*runtime));
 
   // Tear down — Agent::removeContext + Agent::stop run inside the runtime
   // destructor; the test passes if nothing crashes.
@@ -500,7 +500,7 @@ TEST(NodeApiSmoke, CreateRuntimeAndRunScript) {
 // existed was so a consumer could create a runtime via Node-API (jsr_*) and
 // also reach into the same V8 isolate through the JSI APIs. Now the
 // inheritance is gone, but the contract is preserved through:
-//   1. v8_create_runtime + v8_attach_node_api as the underlying primitives.
+//   1. v8_jsi_abi_runtime_create + v8_attach_node_api as the underlying primitives.
 //   2. jsr_create_runtime as the same convenience entry point, internally
 //      calling those two.
 //   3. jsr_runtime_get_jsi_runtime as the accessor that lets a napi-created
@@ -562,11 +562,11 @@ TEST(DualApi, NodeApiAndJsiShareIsolate) {
 
 // query_interface negative-path test. The ABI currently supports no
 // optional interfaces, so query_interface always reports not-supported.
-// Confirms it returns jsi_error_native and surfaces "Interface not supported"
+// Confirms it returns jsi_status_native_error and surfaces "Interface not supported"
 // via the native-exception-message slot. Exercises the only path through which
 // a non-JS error message flows back to the consumer.
 TEST(JsiAbiQueryInterface, UnknownIidReturnsError) {
-  jsi_runtime *rt = v8_create_runtime(JSI_ABI_VERSION, nullptr, nullptr);
+  jsi_runtime *rt = v8_jsi_abi_runtime_create(JSI_ABI_VERSION, nullptr, nullptr);
   ASSERT_NE(rt, nullptr);
 
   // Bogus IID — reserved-bit-pattern that will never collide with any
@@ -576,24 +576,24 @@ TEST(JsiAbiQueryInterface, UnknownIidReturnsError) {
 
   const void *vtableOut = nullptr;
   void *instanceOut = nullptr;
-  jsi_error_code result =
-      rt->vt->query_interface(rt, &kBogusIid, &vtableOut, &instanceOut);
+  jsi_status result =
+      rt->api->query_interface(rt, &kBogusIid, &vtableOut, &instanceOut);
 
   ASSERT_TRUE(::jsi::abi::is_error(result));
-  EXPECT_EQ(::jsi::abi::get_error(result), jsi_error_native);
+  EXPECT_EQ(::jsi::abi::get_error(result), jsi_status_native_error);
 
   // Read back the native exception message — must mention "Interface not
   // supported".
   struct LocalBuf : public jsi_growable_buffer {
     std::string buf{std::string(64, '\0')};
     LocalBuf() {
-      static const jsi_growable_buffer_vtable bufVt{&tryGrowTo};
-      vtable = const_cast<jsi_growable_buffer_vtable *>(&bufVt);
+      static const jsi_growable_buffer_api bufVt{&tryGrowTo};
+      api = const_cast<jsi_growable_buffer_api *>(&bufVt);
       data = reinterpret_cast<uint8_t *>(buf.data());
       size = buf.size();
       used = 0;
     }
-    static void JSI_CDECL tryGrowTo(jsi_growable_buffer *b, size_t sz) {
+    static void JSI_ABI_CDECL tryGrowTo(jsi_growable_buffer *b, size_t sz) {
       auto *self = static_cast<LocalBuf *>(b);
       if (sz > self->buf.size()) {
         self->buf.resize(sz);
@@ -603,12 +603,12 @@ TEST(JsiAbiQueryInterface, UnknownIidReturnsError) {
     }
   } gb;
 
-  rt->vt->get_and_clear_native_exception_message(rt, &gb);
+  rt->api->get_and_clear_native_exception_message(rt, &gb);
   std::string msg(reinterpret_cast<const char *>(gb.data), gb.used);
   EXPECT_NE(msg.find("Interface not supported"), std::string::npos)
       << "expected 'Interface not supported' in message; got: " << msg;
 
-  rt->vt->release(rt);
+  rt->api->release(rt);
 }
 
 int main(int argc, char **argv) {

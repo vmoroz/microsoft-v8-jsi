@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 // ----------------------------------------------------------------------------
 // Some code is copied from Node.js project to compile V8 NAPI code
@@ -42,7 +42,7 @@
 #include "MurmurHash.h"
 #include "V8Instrumentation.h"
 #include "jsi_abi/jsi_abi_v8_internal.h"
-#include "jsi_abi/v8_jsi_config.h"
+#include "jsi_abi/v8_jsi_abi.h"
 #include "jsi_abi/v8_node_api_attach.h"
 #include "v8_core.h"
 
@@ -676,7 +676,7 @@ void V8RuntimeEnv::Unref(NodeApiEnv* env) {
 //============================================================================
 // RuntimeWrapper ΓÇö backs the public jsr_runtime opaque type.
 //
-// Owns a jsi_runtime (created via v8_create_runtime) and the V8RuntimeEnv
+// Owns a jsi_runtime (created via v8_jsi_abi_runtime_create) and the V8RuntimeEnv
 // attached on top via v8_attach_node_api. The V8RuntimeEnv lifetime is
 // managed via JsiRuntimeState's attached-owner hook, so ~RuntimeWrapper
 // just calls jsi_release on the abi runtime and the cascade tears down
@@ -691,8 +691,8 @@ class RuntimeWrapper {
     // Release the abi runtime; this triggers ~JsiRuntimeState which fires
     // the attached-owner hook and tears down V8RuntimeEnv (which Unrefs
     // rootEnv_ ΓåÆ ~NodeApiEnv).
-    if (abiRuntime_ && abiRuntime_->vt && abiRuntime_->vt->release) {
-      abiRuntime_->vt->release(abiRuntime_);
+    if (abiRuntime_ && abiRuntime_->api && abiRuntime_->api->release) {
+      abiRuntime_->api->release(abiRuntime_);
     }
   }
 
@@ -725,9 +725,9 @@ class RuntimeWrapper {
 //
 // these own the consumer-supplied task runner / script cache C
 // callback bundles. ConfigWrapper holds them; on jsr_create_runtime they
-// are translated into v8_jsi_config setters that hand a C-callback pair to
+// are translated into v8_jsi_abi_config setters that hand a C-callback pair to
 // the JSI ABI. The wrapper lifetime is governed by the ABI's deleter
-// contract ΓÇö the deleter the wrapper passes to v8_jsi_config_set_*
+// contract ΓÇö the deleter the wrapper passes to v8_jsi_abi_config_set_*
 // outlives the config and is invoked exactly once on runtime destruction.
 //============================================================================
 class V8TaskRunner {
@@ -805,7 +805,7 @@ class V8ScriptCache {
 //
 // stores the consumer-facing values directly (no V8RuntimeArgs round
 // trip). On jsr_create_runtime the values are pushed into a jsi_config via
-// v8_jsi_config_set_* setters, then v8_create_runtime + v8_attach_node_api
+// v8_jsi_abi_config_set_* setters, then v8_jsi_abi_runtime_create + v8_attach_node_api
 // build the final jsr_runtime.
 //============================================================================
 class ConfigWrapper {
@@ -851,15 +851,15 @@ class ConfigWrapper {
   }
 
   // Populate a factory-owned jsi_config from this wrapper's fields. Called from
-  // the v8_create_runtime configure callback — the factory owns cfg's lifetime.
+  // the v8_jsi_abi_runtime_create configure callback — the factory owns cfg's lifetime.
   void buildJsiConfigInto(jsi_config cfg) const {
-    v8_jsi_config_enable_inspector(cfg, enableInspector_);
-    v8_jsi_config_set_inspector_port(cfg, inspectorPort_);
-    v8_jsi_config_set_inspector_break_on_start(cfg, inspectorBreakOnStart_);
-    v8_jsi_config_set_debugger_runtime_name(cfg,
+    v8_jsi_abi_config_set_inspector_enabled(cfg, enableInspector_);
+    v8_jsi_abi_config_set_inspector_port(cfg, inspectorPort_);
+    v8_jsi_abi_config_set_inspector_break_on_start(cfg, inspectorBreakOnStart_);
+    v8_jsi_abi_config_set_debugger_runtime_name_utf8(cfg,
                                               inspectorRuntimeName_.c_str());
-    v8_jsi_config_enable_gc_api(cfg, enableGCApi_);
-    v8_jsi_config_enable_multi_thread(cfg, enableMultithreading_);
+    v8_jsi_abi_config_set_gc_api_enabled(cfg, enableGCApi_);
+    v8_jsi_abi_config_set_multi_thread_enabled(cfg, enableMultithreading_);
 
     if (taskRunner_) {
       // Forward the consumer-supplied C task runner straight through. We
@@ -867,12 +867,12 @@ class ConfigWrapper {
       // ABI's deleter releases the holder, and ~V8TaskRunner runs the
       // consumer's data-deleter callback exactly once.
       auto* runnerHolder = new std::shared_ptr<V8TaskRunner>(taskRunner_);
-      v8_jsi_config_set_task_runner(
+      v8_jsi_abi_config_set_task_runner(
           cfg,
           /*task_runner_data:*/ runnerHolder,
           /*post_task_cb:*/
           [](void* runner_data, void* task_data,
-             v8_jsi_task_run_cb task_run_cb,
+             v8_jsi_abi_task_run_cb task_run_cb,
              jsi_data_delete_cb task_data_delete_cb, void* deleter_data) {
             auto* runner =
                 static_cast<std::shared_ptr<V8TaskRunner>*>(runner_data);
@@ -896,7 +896,7 @@ class ConfigWrapper {
 
     if (scriptCache_) {
       auto* cacheHolder = new std::shared_ptr<V8ScriptCache>(scriptCache_);
-      v8_jsi_config_set_script_cache(
+      v8_jsi_abi_config_set_script_cache(
           cfg,
           /*script_cache_data:*/ cacheHolder,
           /*load_cb:*/
@@ -949,7 +949,7 @@ class ConfigWrapper {
 // v8_attach_node_api ΓÇö JSI ABI dual-API attachment seam.
 //============================================================================
 
-JSI_API napi_status JSI_CDECL v8_attach_node_api(jsi_runtime* runtime,
+JSI_ABI_API napi_status JSI_ABI_CDECL v8_attach_node_api(jsi_runtime* runtime,
                                                   int32_t /*api_version*/,
                                                   napi_env* env_out) {
   if (!runtime || !env_out) return napi_invalid_arg;
@@ -1043,14 +1043,14 @@ JSR_API jsr_prepared_script_run(napi_env env,
   return CHECKED_ENV(env)->runPreparedScript(prepared_script, result);
 }
 
-// Configure trampoline for v8_create_runtime: the factory hands us a config and
-// we populate it from the ConfigWrapper carried in cb_data. The runtime takes
+// Configure trampoline for v8_jsi_abi_runtime_create: the factory hands us a config and
+// we populate it from the ConfigWrapper carried in user_data. The runtime takes
 // ownership of the cache/runner data via the ABI's deleter contract; the config
 // shell itself is owned and freed by the factory.
-static jsi_error_code JSI_CDECL configureFromWrapper(void* cb_data,
+static jsi_status JSI_ABI_CDECL configureFromWrapper(void* user_data,
                                                      jsi_config cfg) {
-  static_cast<const v8impl::ConfigWrapper*>(cb_data)->buildJsiConfigInto(cfg);
-  return jsi_no_error;
+  static_cast<const v8impl::ConfigWrapper*>(user_data)->buildJsiConfigInto(cfg);
+  return jsi_status_ok;
 }
 
 JSR_API jsr_create_runtime(jsr_config config, jsr_runtime* runtime) {
@@ -1060,18 +1060,18 @@ JSR_API jsr_create_runtime(jsr_config config, jsr_runtime* runtime) {
   auto* configWrapper = reinterpret_cast<v8impl::ConfigWrapper*>(config);
 
   // Create the foundation ABI runtime, populating its config via the pull
-  // callback. v8_create_runtime owns the jsi_config lifetime; the runtime takes
+  // callback. v8_jsi_abi_runtime_create owns the jsi_config lifetime; the runtime takes
   // ownership of the cache/runner data via the ABI's deleter contract.
   jsi_runtime* abiRuntime =
-      v8_create_runtime(JSI_ABI_VERSION, configureFromWrapper, configWrapper);
+      v8_jsi_abi_runtime_create(JSI_ABI_VERSION, configureFromWrapper, configWrapper);
   if (!abiRuntime) return napi_generic_failure;
 
   napi_env rootEnv{};
   napi_status s = v8_attach_node_api(abiRuntime, NAPI_VERSION_EXPERIMENTAL,
                                       &rootEnv);
   if (s != napi_ok) {
-    if (abiRuntime->vt && abiRuntime->vt->release) {
-      abiRuntime->vt->release(abiRuntime);
+    if (abiRuntime->api && abiRuntime->api->release) {
+      abiRuntime->api->release(abiRuntime);
     }
     return s;
   }

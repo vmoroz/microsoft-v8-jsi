@@ -203,7 +203,7 @@ source_set("engine_persona") {
 
   # //sandbox_dll for sbox.h (the plugin ABI) + sbox_harden.h (header-only
   # ExeDir); //../../src for the JSI C++ API headers (jsi/jsi.h,
-  # jsi_abi/JsiAbiRuntime.h) + the v8jsi config header (jsi_abi/v8_jsi_config.h).
+  # jsi_abi/JsiAbiRuntime.h) + the v8jsi config header (jsi_abi/v8_jsi_abi.h).
   # The engine DLL itself is LoadLibrary'd at runtime (resolved by name, no
   # link-time bind).
   include_dirs = [
