@@ -37,13 +37,13 @@ namespace {
 // Mirrors the engine's extern "C" exports (see src/jsi_abi/v8_jsi_abi.h).
 // The return is jsi_status; 0 == jsi_status_ok == success.
 using CreateSnapshotFn = int(__cdecl*)(
-    const char* script_utf8,
-    size_t script_size,
+    const char* script,
+    size_t script_length,
     const char* source_url,
     bool jitless,
-    uint8_t** out_blob,
-    size_t* out_blob_size);
-using FreeSnapshotFn = void(__cdecl*)(uint8_t* blob);
+    uint8_t** out_data,
+    size_t* out_size);
+using FreeSnapshotFn = void(__cdecl*)(uint8_t* data);
 
 std::wstring Widen(const std::string& s) {
   if (s.empty()) return std::wstring();

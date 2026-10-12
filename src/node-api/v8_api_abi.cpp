@@ -469,7 +469,7 @@ class NodeApiEnv : public napi_env__ {
     const uint8_t* cache_buffer = nullptr;
     size_t cache_buffer_size = 0;
     jsi_data_delete_cb cache_buffer_delete_cb = nullptr;
-    void* cache_buffer_deleter_data = nullptr;
+    void* cache_buffer_delete_data = nullptr;
 
     if (cache.load_cb) {
       cache.load_cb(cache.data,
@@ -481,7 +481,7 @@ class NodeApiEnv : public napi_env__ {
                      &cache_buffer,
                      &cache_buffer_size,
                      &cache_buffer_delete_cb,
-                     &cache_buffer_deleter_data);
+                     &cache_buffer_delete_data);
       if (cache_buffer && cache_buffer_size > 0) {
         cached_data = new v8::ScriptCompiler::CachedData(
             cache_buffer, static_cast<int>(cache_buffer_size));
@@ -498,8 +498,8 @@ class NodeApiEnv : public napi_env__ {
             .ToLocal(&compiled);
 
     if (cache_buffer_delete_cb) {
-      cache_buffer_delete_cb(const_cast<uint8_t*>(cache_buffer),
-                              cache_buffer_deleter_data);
+      cache_buffer_delete_cb(cache_buffer_delete_data,
+                             const_cast<uint8_t*>(cache_buffer));
     }
 
     CHECK_MAYBE_EMPTY(env, v8::MaybeLocal<v8::Script>(
@@ -516,9 +516,9 @@ class NodeApiEnv : public napi_env__ {
       if (codeCache) {
         // Stateless lambda ΓåÆ function pointer via unary +; assign through a
         // typed function-pointer variable so the conversion is well-formed.
-        jsi_data_delete_cb delete_cb = +[](void* /*data*/,
-                                             void* deleter_data) {
-          delete static_cast<v8::ScriptCompiler::CachedData*>(deleter_data);
+        jsi_data_delete_cb delete_cb = +[](void* delete_data,
+                                             void* /*data*/) {
+          delete static_cast<v8::ScriptCompiler::CachedData*>(delete_data);
         };
         cache.store_cb(cache.data,
                         sourceUrl,
@@ -801,6 +801,62 @@ class V8ScriptCache {
 };
 
 //============================================================================
+// Deleter adapters. jsr_data_delete_cb is called as cb(data, deleter_data);
+// jsi_data_delete_cb is called as cb(delete_data, data). A deleter crossing
+// between the two surfaces is wrapped in a one-shot heap adapter that frees
+// itself after forwarding the call.
+//============================================================================
+struct JsiDeleterForJsr {
+  jsi_data_delete_cb cb;
+  void* delete_data;
+
+  // Returns a jsr deleter pair that forwards to (cb, delete_data).
+  static void wrap(jsi_data_delete_cb cb,
+                   void* delete_data,
+                   jsr_data_delete_cb* out_cb,
+                   void** out_deleter_data) {
+    if (!cb) {
+      *out_cb = nullptr;
+      *out_deleter_data = nullptr;
+      return;
+    }
+    *out_cb = &call;
+    *out_deleter_data = new JsiDeleterForJsr{cb, delete_data};
+  }
+
+  static void NAPI_CDECL call(void* data, void* deleter_data) {
+    auto* self = static_cast<JsiDeleterForJsr*>(deleter_data);
+    self->cb(self->delete_data, data);
+    delete self;
+  }
+};
+
+struct JsrDeleterForJsi {
+  jsr_data_delete_cb cb;
+  void* deleter_data;
+
+  // Returns a jsi deleter pair that forwards to (cb, deleter_data).
+  static void wrap(jsr_data_delete_cb cb,
+                   void* deleter_data,
+                   jsi_data_delete_cb* out_cb,
+                   void** out_delete_data) {
+    if (!cb) {
+      *out_cb = nullptr;
+      *out_delete_data = nullptr;
+      return;
+    }
+    *out_cb = &call;
+    *out_delete_data = new JsrDeleterForJsi{cb, deleter_data};
+  }
+
+  static void JSI_ABI_CDECL call(void* delete_data, void* data) {
+    auto* self = static_cast<JsrDeleterForJsi*>(delete_data);
+    self->cb(data, self->deleter_data);
+    delete self;
+  }
+};
+
+//============================================================================
 // ConfigWrapper ΓÇö backs the public jsr_config opaque type.
 //
 // stores the consumer-facing values directly (no V8RuntimeArgs round
@@ -856,8 +912,8 @@ class ConfigWrapper {
     v8_jsi_abi_config_set_inspector_enabled(cfg, enableInspector_);
     v8_jsi_abi_config_set_inspector_port(cfg, inspectorPort_);
     v8_jsi_abi_config_set_inspector_break_on_start(cfg, inspectorBreakOnStart_);
-    v8_jsi_abi_config_set_debugger_runtime_name_utf8(cfg,
-                                              inspectorRuntimeName_.c_str());
+    v8_jsi_abi_config_set_debugger_runtime_name_utf8(
+        cfg, inspectorRuntimeName_.data(), inspectorRuntimeName_.size());
     v8_jsi_abi_config_set_gc_api_enabled(cfg, enableGCApi_);
     v8_jsi_abi_config_set_multi_thread_enabled(cfg, enableMultithreading_);
 
@@ -869,66 +925,79 @@ class ConfigWrapper {
       auto* runnerHolder = new std::shared_ptr<V8TaskRunner>(taskRunner_);
       v8_jsi_abi_config_set_task_runner(
           cfg,
-          /*task_runner_data:*/ runnerHolder,
           /*post_task_cb:*/
           [](void* runner_data, void* task_data,
              v8_jsi_abi_task_run_cb task_run_cb,
-             jsi_data_delete_cb task_data_delete_cb, void* deleter_data) {
+             jsi_data_delete_cb task_data_delete_cb,
+             void* task_data_delete_data) {
             auto* runner =
                 static_cast<std::shared_ptr<V8TaskRunner>*>(runner_data);
-            // jsr_*_cb and v8_jsi_*_cb have the same call signature
-            // (void(*)(void*) and void(*)(void*, void*)) ΓÇö both __cdecl on
-            // Windows, both unspecified on POSIX. reinterpret_cast is well
-            // defined here.
+            // jsr_task_run_cb and v8_jsi_abi_task_run_cb share the call
+            // signature void(*)(void*), so reinterpret_cast is well defined.
+            // The deleters do not (their arguments are swapped), so the task
+            // deleter goes through an adapter.
+            jsr_data_delete_cb jsr_delete_cb = nullptr;
+            void* jsr_deleter_data = nullptr;
+            JsiDeleterForJsr::wrap(task_data_delete_cb, task_data_delete_data,
+                                   &jsr_delete_cb, &jsr_deleter_data);
             (*runner)->postTaskCallback()(
                 (*runner)->taskRunnerData(),
                 task_data,
                 reinterpret_cast<jsr_task_run_cb>(task_run_cb),
-                reinterpret_cast<jsr_data_delete_cb>(task_data_delete_cb),
-                deleter_data);
+                jsr_delete_cb,
+                jsr_deleter_data);
           },
-          /*task_runner_data_delete_cb:*/
-          [](void* runner_data, void* /*deleter_data*/) {
+          /*user_data:*/ runnerHolder,
+          /*user_data_delete_cb:*/
+          [](void* /*delete_data*/, void* runner_data) {
             delete static_cast<std::shared_ptr<V8TaskRunner>*>(runner_data);
           },
-          /*deleter_data:*/ nullptr);
+          /*user_data_delete_data:*/ nullptr);
     }
 
     if (scriptCache_) {
       auto* cacheHolder = new std::shared_ptr<V8ScriptCache>(scriptCache_);
       v8_jsi_abi_config_set_script_cache(
           cfg,
-          /*script_cache_data:*/ cacheHolder,
           /*load_cb:*/
-          [](void* data, const char* source_url, uint64_t source_hash,
+          [](void* user_data, const char* source_url, uint64_t source_hash,
              const char* runtime_name, uint64_t runtime_version,
-             const char* cache_tag, const uint8_t** buffer,
-             size_t* buffer_size, jsi_data_delete_cb* buffer_delete_cb,
-             void** deleter_data) {
-            auto* holder = static_cast<std::shared_ptr<V8ScriptCache>*>(data);
+             const char* cache_tag, const uint8_t** out_data,
+             size_t* out_size, jsi_data_delete_cb* out_data_delete_cb,
+             void** out_data_delete_data) {
+            auto* holder =
+                static_cast<std::shared_ptr<V8ScriptCache>*>(user_data);
+            jsr_data_delete_cb jsr_delete_cb = nullptr;
+            void* jsr_deleter_data = nullptr;
             (*holder)->loadCb()(
                 (*holder)->scriptCacheData(), source_url, source_hash,
-                runtime_name, runtime_version, cache_tag, buffer, buffer_size,
-                reinterpret_cast<jsr_data_delete_cb*>(buffer_delete_cb),
-                deleter_data);
+                runtime_name, runtime_version, cache_tag, out_data, out_size,
+                &jsr_delete_cb, &jsr_deleter_data);
+            JsrDeleterForJsi::wrap(jsr_delete_cb, jsr_deleter_data,
+                                   out_data_delete_cb, out_data_delete_data);
           },
           /*store_cb:*/
-          [](void* data, const char* source_url, uint64_t source_hash,
+          [](void* user_data, const char* source_url, uint64_t source_hash,
              const char* runtime_name, uint64_t runtime_version,
-             const char* cache_tag, const uint8_t* buffer, size_t buffer_size,
-             jsi_data_delete_cb buffer_delete_cb, void* deleter_data) {
-            auto* holder = static_cast<std::shared_ptr<V8ScriptCache>*>(data);
+             const char* cache_tag, const uint8_t* data, size_t size,
+             jsi_data_delete_cb data_delete_cb, void* data_delete_data) {
+            auto* holder =
+                static_cast<std::shared_ptr<V8ScriptCache>*>(user_data);
+            jsr_data_delete_cb jsr_delete_cb = nullptr;
+            void* jsr_deleter_data = nullptr;
+            JsiDeleterForJsr::wrap(data_delete_cb, data_delete_data,
+                                   &jsr_delete_cb, &jsr_deleter_data);
             (*holder)->storeCb()(
                 (*holder)->scriptCacheData(), source_url, source_hash,
-                runtime_name, runtime_version, cache_tag, buffer, buffer_size,
-                reinterpret_cast<jsr_data_delete_cb>(buffer_delete_cb),
-                deleter_data);
+                runtime_name, runtime_version, cache_tag, data, size,
+                jsr_delete_cb, jsr_deleter_data);
           },
-          /*data_delete_cb:*/
-          [](void* data, void* /*deleter_data*/) {
-            delete static_cast<std::shared_ptr<V8ScriptCache>*>(data);
+          /*user_data:*/ cacheHolder,
+          /*user_data_delete_cb:*/
+          [](void* /*delete_data*/, void* user_data) {
+            delete static_cast<std::shared_ptr<V8ScriptCache>*>(user_data);
           },
-          /*deleter_data:*/ nullptr);
+          /*user_data_delete_data:*/ nullptr);
     }
   }
 
@@ -1062,9 +1131,11 @@ JSR_API jsr_create_runtime(jsr_config config, jsr_runtime* runtime) {
   // Create the foundation ABI runtime, populating its config via the pull
   // callback. v8_jsi_abi_runtime_create owns the jsi_config lifetime; the runtime takes
   // ownership of the cache/runner data via the ABI's deleter contract.
-  jsi_runtime* abiRuntime =
-      v8_jsi_abi_runtime_create(JSI_ABI_VERSION, configureFromWrapper, configWrapper);
-  if (!abiRuntime) return napi_generic_failure;
+  jsi_runtime* abiRuntime = nullptr;
+  if (v8_jsi_abi_runtime_create(JSI_ABI_VERSION, configureFromWrapper,
+                                configWrapper, &abiRuntime) != jsi_status_ok) {
+    return napi_generic_failure;
+  }
 
   napi_env rootEnv{};
   napi_status s = v8_attach_node_api(abiRuntime, NAPI_VERSION_EXPERIMENTAL,

@@ -106,7 +106,7 @@ struct jsi_config_s {
   v8_jsi_abi_script_cache_load_cb script_cache_load_cb{nullptr};
   v8_jsi_abi_script_cache_store_cb script_cache_store_cb{nullptr};
   jsi_data_delete_cb script_cache_data_delete_cb{nullptr};
-  void *script_cache_deleter_data{nullptr};
+  void *script_cache_delete_data{nullptr};
 
   // Task runner — null callbacks mean "no task runner".
   // Same lifetime contract as the script-cache fields above: config takes
@@ -118,7 +118,7 @@ struct jsi_config_s {
   void *task_runner_data{nullptr};
   v8_jsi_abi_task_runner_post_task_cb task_runner_post_task_cb{nullptr};
   jsi_data_delete_cb task_runner_data_delete_cb{nullptr};
-  void *task_runner_deleter_data{nullptr};
+  void *task_runner_delete_data{nullptr};
 
   // Startup-snapshot blob — null means none. Same lifetime contract as the
   // fields above: config owns it at setter time; on v8_jsi_abi_runtime_create the
@@ -127,19 +127,22 @@ struct jsi_config_s {
   const uint8_t *startup_snapshot_blob{nullptr};
   size_t startup_snapshot_blob_size{0};
   jsi_data_delete_cb startup_snapshot_delete_cb{nullptr};
-  void *startup_snapshot_deleter_data{nullptr};
+  void *startup_snapshot_delete_data{nullptr};
+
+  // First setter failure; sticky. v8_jsi_abi_runtime_create fails with it.
+  jsi_status status{jsi_status_ok};
 
   ~jsi_config_s() {
     if (script_cache_data_delete_cb) {
-      script_cache_data_delete_cb(script_cache_data, script_cache_deleter_data);
+      script_cache_data_delete_cb(script_cache_delete_data, script_cache_data);
     }
     if (task_runner_data_delete_cb) {
-      task_runner_data_delete_cb(task_runner_data, task_runner_deleter_data);
+      task_runner_data_delete_cb(task_runner_delete_data, task_runner_data);
     }
     if (startup_snapshot_delete_cb) {
       startup_snapshot_delete_cb(
-          const_cast<uint8_t *>(startup_snapshot_blob),
-          startup_snapshot_deleter_data);
+          startup_snapshot_delete_data,
+          const_cast<uint8_t *>(startup_snapshot_blob));
     }
   }
 };
@@ -181,23 +184,23 @@ struct HostFunctionContext;
 // platform plumbing speak; this adapter forwards postTask() calls into the
 // consumer-supplied C callback pair.
 //
-// The adapter owns task_runner_data and runs task_runner_data_delete_cb
-// exactly once in its destructor — that's the single point where the
-// consumer's runner is released.
+// The adapter owns the consumer's user_data and runs its deleter exactly once
+// in its destructor — the single point where the consumer's runner is
+// released.
 class CTaskRunner final : public v8rt::TaskRunner {
  public:
-  CTaskRunner(void *task_runner_data,
-              v8_jsi_abi_task_runner_post_task_cb post_task_cb,
-              jsi_data_delete_cb task_runner_data_delete_cb,
-              void *deleter_data) noexcept
-      : task_runner_data_(task_runner_data),
-        post_task_cb_(post_task_cb),
-        task_runner_data_delete_cb_(task_runner_data_delete_cb),
-        deleter_data_(deleter_data) {}
+  CTaskRunner(v8_jsi_abi_task_runner_post_task_cb post_task_cb,
+              void *user_data,
+              jsi_data_delete_cb user_data_delete_cb,
+              void *user_data_delete_data) noexcept
+      : post_task_cb_(post_task_cb),
+        user_data_(user_data),
+        user_data_delete_cb_(user_data_delete_cb),
+        user_data_delete_data_(user_data_delete_data) {}
 
   ~CTaskRunner() override {
-    if (task_runner_data_delete_cb_) {
-      task_runner_data_delete_cb_(task_runner_data_, deleter_data_);
+    if (user_data_delete_cb_) {
+      user_data_delete_cb_(user_data_delete_data_, user_data_);
     }
   }
 
@@ -206,22 +209,22 @@ class CTaskRunner final : public v8rt::TaskRunner {
 
   void postTask(std::unique_ptr<Task> task) override {
     post_task_cb_(
-        task_runner_data_,
+        user_data_,
         static_cast<void *>(task.release()),
         [](void *task_data) {
           static_cast<Task *>(task_data)->run();
         },
-        [](void *task_data, void * /*deleter_data*/) {
+        [](void * /*delete_data*/, void *task_data) {
           delete static_cast<Task *>(task_data);
         },
-        /*deleter_data:*/ nullptr);
+        /*task_data_delete_data:*/ nullptr);
   }
 
  private:
-  void *task_runner_data_;
   v8_jsi_abi_task_runner_post_task_cb post_task_cb_;
-  jsi_data_delete_cb task_runner_data_delete_cb_;
-  void *deleter_data_;
+  void *user_data_;
+  jsi_data_delete_cb user_data_delete_cb_;
+  void *user_data_delete_data_;
 };
 
 //==============================================================================
@@ -474,14 +477,14 @@ struct JsiRuntimeState : public jsi_runtime {
   v8_jsi_abi_script_cache_load_cb script_cache_load_cb{nullptr};
   v8_jsi_abi_script_cache_store_cb script_cache_store_cb{nullptr};
   jsi_data_delete_cb script_cache_data_delete_cb{nullptr};
-  void *script_cache_deleter_data{nullptr};
+  void *script_cache_delete_data{nullptr};
 
   // Startup-snapshot blob — copied from the config in create(). The runtime
   // owns the bytes after handoff: V8 references them for the isolate's whole
   // lifetime, so the deleter runs in ~JsiRuntimeState AFTER isolate disposal.
   const uint8_t *startup_snapshot_blob{nullptr};
   jsi_data_delete_cb startup_snapshot_delete_cb{nullptr};
-  void *startup_snapshot_deleter_data{nullptr};
+  void *startup_snapshot_delete_data{nullptr};
 
   // Error state (v2 pattern)
   jsi_value pendingJSError{}; // JS exception value (inline tagged union)
@@ -873,14 +876,14 @@ JsiRuntimeState *JsiRuntimeState::create(const jsi_config_s *config) {
     if (config->task_runner_post_task_cb) {
       auto *mutableConfig = const_cast<jsi_config_s *>(config);
       isolateConfig.task_runner = std::make_shared<CTaskRunner>(
-          mutableConfig->task_runner_data,
           mutableConfig->task_runner_post_task_cb,
+          mutableConfig->task_runner_data,
           mutableConfig->task_runner_data_delete_cb,
-          mutableConfig->task_runner_deleter_data);
+          mutableConfig->task_runner_delete_data);
       mutableConfig->task_runner_data = nullptr;
       mutableConfig->task_runner_post_task_cb = nullptr;
       mutableConfig->task_runner_data_delete_cb = nullptr;
-      mutableConfig->task_runner_deleter_data = nullptr;
+      mutableConfig->task_runner_delete_data = nullptr;
     }
   }
 
@@ -932,12 +935,12 @@ JsiRuntimeState *JsiRuntimeState::create(const jsi_config_s *config) {
     state->script_cache_store_cb = mutableConfig->script_cache_store_cb;
     state->script_cache_data_delete_cb =
         mutableConfig->script_cache_data_delete_cb;
-    state->script_cache_deleter_data = mutableConfig->script_cache_deleter_data;
+    state->script_cache_delete_data = mutableConfig->script_cache_delete_data;
     mutableConfig->script_cache_data = nullptr;
     mutableConfig->script_cache_load_cb = nullptr;
     mutableConfig->script_cache_store_cb = nullptr;
     mutableConfig->script_cache_data_delete_cb = nullptr;
-    mutableConfig->script_cache_deleter_data = nullptr;
+    mutableConfig->script_cache_delete_data = nullptr;
 
     // take ownership of the startup-snapshot blob from the config. The runtime
     // now keeps the bytes alive for the isolate's lifetime and fires the
@@ -945,12 +948,12 @@ JsiRuntimeState *JsiRuntimeState::create(const jsi_config_s *config) {
     // config fields prevents ~jsi_config_s from double-freeing.
     state->startup_snapshot_blob = mutableConfig->startup_snapshot_blob;
     state->startup_snapshot_delete_cb = mutableConfig->startup_snapshot_delete_cb;
-    state->startup_snapshot_deleter_data =
-        mutableConfig->startup_snapshot_deleter_data;
+    state->startup_snapshot_delete_data =
+        mutableConfig->startup_snapshot_delete_data;
     mutableConfig->startup_snapshot_blob = nullptr;
     mutableConfig->startup_snapshot_blob_size = 0;
     mutableConfig->startup_snapshot_delete_cb = nullptr;
-    mutableConfig->startup_snapshot_deleter_data = nullptr;
+    mutableConfig->startup_snapshot_delete_data = nullptr;
   }
 
   state->pendingJSError = abi::create_undefined_value();
@@ -1139,15 +1142,15 @@ JsiRuntimeState::~JsiRuntimeState() {
   // (no more cache calls can be in flight). Runs in the consumer's CRT
   // because the consumer also supplied the deleter callback.
   if (script_cache_data_delete_cb) {
-    script_cache_data_delete_cb(script_cache_data, script_cache_deleter_data);
+    script_cache_data_delete_cb(script_cache_delete_data, script_cache_data);
   }
 
   // release the startup-snapshot blob only after isolate disposal — V8 keeps a
   // pointer to these bytes for the whole isolate lifetime.
   if (startup_snapshot_delete_cb) {
     startup_snapshot_delete_cb(
-        const_cast<uint8_t *>(startup_snapshot_blob),
-        startup_snapshot_deleter_data);
+        startup_snapshot_delete_data,
+        const_cast<uint8_t *>(startup_snapshot_blob));
   }
 }
 
@@ -1566,7 +1569,7 @@ jsi_status JSI_ABI_CDECL jsi_prepare_javascript(
   const uint8_t *cache_buffer = nullptr;
   size_t cache_buffer_size = 0;
   jsi_data_delete_cb cache_buffer_delete_cb = nullptr;
-  void *cache_buffer_deleter_data = nullptr;
+  void *cache_buffer_delete_data = nullptr;
 
   if (state->script_cache_load_cb) {
     state->script_cache_load_cb(
@@ -1579,7 +1582,7 @@ jsi_status JSI_ABI_CDECL jsi_prepare_javascript(
         &cache_buffer,
         &cache_buffer_size,
         &cache_buffer_delete_cb,
-        &cache_buffer_deleter_data);
+        &cache_buffer_delete_data);
     if (cache_buffer && cache_buffer_size > 0) {
       // BufferNotOwned: V8 does not free `cache_buffer`; we own it and
       // release via cache_buffer_delete_cb after Compile returns.
@@ -1600,8 +1603,8 @@ jsi_status JSI_ABI_CDECL jsi_prepare_javascript(
   // Release the consumer's cache buffer (if any) now that V8 is done with it.
   // Compile is synchronous, so the bytes are no longer needed past this point.
   if (cache_buffer_delete_cb) {
-    cache_buffer_delete_cb(const_cast<uint8_t *>(cache_buffer),
-                            cache_buffer_deleter_data);
+    cache_buffer_delete_cb(cache_buffer_delete_data,
+                           const_cast<uint8_t *>(cache_buffer));
   }
 
   if (!compile_ok)
@@ -1618,8 +1621,8 @@ jsi_status JSI_ABI_CDECL jsi_prepare_javascript(
       // The consumer reads codeCache->data and then calls our delete_cb,
       // which deletes the V8 CachedData object (and its owned buffer) in the
       // DLL's CRT — the same CRT that allocated it.
-      auto delete_cb = [](void * /*data*/, void *deleter_data) {
-        delete static_cast<v8::ScriptCompiler::CachedData *>(deleter_data);
+      auto delete_cb = [](void *delete_data, void * /*data*/) {
+        delete static_cast<v8::ScriptCompiler::CachedData *>(delete_data);
       };
       state->script_cache_store_cb(
           state->script_cache_data,
@@ -3032,17 +3035,21 @@ void clearAttachedOwner(jsi_runtime *runtime) noexcept {
 
 extern "C" {
 
-// Flat runtime-creation export (replaces the dropped jsi_vtable factory).
-// requested_abi_version is the consumer's compiled JSI_ABI_VERSION; configure
-// (may be NULL) populates a factory-owned jsi_config via the v8_jsi_abi_config_set_*
-// setters. Returns NULL on version mismatch or configure failure.
-JSI_ABI_API jsi_runtime *JSI_ABI_CDECL v8_jsi_abi_runtime_create(
-    uint32_t requested_abi_version,
+// Flat runtime-creation export. abi_version is the consumer's compiled
+// JSI_ABI_VERSION; configure (may be NULL) populates a factory-owned
+// jsi_config via the v8_jsi_abi_config_set_* setters.
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_runtime_create(
+    uint32_t abi_version,
     jsi_configure_runtime_cb configure,
-    void *configure_data) {
+    void *user_data,
+    jsi_runtime **out_runtime) {
+  if (!out_runtime)
+    return jsi_status_invalid_arg;
+  *out_runtime = nullptr;
+
   // Model B version negotiation: refuse a version newer than we implement.
-  if (requested_abi_version > JSI_ABI_VERSION)
-    return nullptr;
+  if (abi_version > JSI_ABI_VERSION)
+    return jsi_status_version_mismatch;
 
   jsi_runtime *rt = nullptr;
   if (configure) {
@@ -3050,10 +3057,13 @@ JSI_ABI_API jsi_runtime *JSI_ABI_CDECL v8_jsi_abi_runtime_create(
     // the setters, consume it, then let it destruct. The handle never escapes
     // the callback. JsiRuntimeState::create clears the cache/task-runner
     // pointers it takes over, so ~jsi_config_s does not double-fire; on a
-    // configure abort, ~jsi_config_s fires any registered deleters exactly once.
+    // failure, ~jsi_config_s fires any registered deleters exactly once.
     jsi_config_s config;
-    if (configure(configure_data, &config) != jsi_status_ok)
-      return nullptr;
+    jsi_status status = configure(user_data, &config);
+    if (status == jsi_status_ok)
+      status = config.status;
+    if (status != jsi_status_ok)
+      return status;
     rt = JsiRuntimeState::create(&config);
   } else {
     // No configure callback → engine defaults. Passing nullptr selects the
@@ -3061,41 +3071,51 @@ JSI_ABI_API jsi_runtime *JSI_ABI_CDECL v8_jsi_abi_runtime_create(
     rt = JsiRuntimeState::create(nullptr);
   }
 
-  if (rt) {
-    // Pin the runtime to the negotiated version (reserved for future
-    // behavioral branching; get_abi_version reports the impl max).
-    static_cast<JsiRuntimeState *>(rt)->abi_version = requested_abi_version;
-  }
-  return rt;
+  if (!rt)
+    return jsi_status_native_error;
+
+  // Pin the runtime to the negotiated version (reserved for future
+  // behavioral branching; get_abi_version reports the impl max).
+  static_cast<JsiRuntimeState *>(rt)->abi_version = abi_version;
+  *out_runtime = rt;
+  return jsi_status_ok;
 }
 
 // Process-global V8 engine flags. Raw CLI-style pass-through to V8 — these are
 // process-global and consumed only on the first platform init, so they are NOT
 // per-runtime config. Must be called before the first v8_jsi_abi_runtime_create.
-JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_set_v8_flags(
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_set_v8_flags(
     size_t *argc, char **argv, bool remove_flags) {
-  if (!argc || !argv)
-    return;
+  if (!argc || (!argv && *argc != 0))
+    return jsi_status_invalid_arg;
+  if (*argc == 0)
+    return jsi_status_ok;
   int n = static_cast<int>(*argc);
   v8::V8::SetFlagsFromCommandLine(&n, argv, remove_flags);
   *argc = n < 0 ? 0u : static_cast<size_t>(n);
+  return jsi_status_ok;
 }
 
 // Startup-snapshot creation. See v8_jsi_abi.h for the contract. Builds a
 // blob with v8::SnapshotCreator (its own isolate), running the builder script
 // in a fresh context and serializing it as the default context. Exception-free.
-JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_snapshot_create(
-    const char *script_utf8,
-    size_t script_size,
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_snapshot_create(
+    const char *script,
+    size_t script_length,
     const char *source_url,
     bool jitless,
-    uint8_t **out_blob,
-    size_t *out_blob_size) {
+    uint8_t **out_data,
+    size_t *out_size) {
   (void)source_url;
-  if (!script_utf8 || !out_blob || !out_blob_size)
-    return jsi_status_native_error;
-  *out_blob = nullptr;
-  *out_blob_size = 0;
+  if (out_data)
+    *out_data = nullptr;
+  if (out_size)
+    *out_size = 0;
+  if (!script || !out_data || !out_size)
+    return jsi_status_invalid_arg;
+  script_length = resolveUtf8Length(script, script_length);
+  if (script_length > static_cast<size_t>(v8::String::kMaxLength))
+    return jsi_status_invalid_arg;
 
   // Ensure the V8 platform is initialized (idempotent). Set process-global
   // flags inside the one-time init so they match the eventual consumer engine.
@@ -3137,8 +3157,8 @@ JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_snapshot_create(
 
         v8::Local<v8::String> source;
         if (!v8::String::NewFromUtf8(
-                 isolate, script_utf8, v8::NewStringType::kNormal,
-                 static_cast<int>(script_size))
+                 isolate, script, v8::NewStringType::kNormal,
+                 static_cast<int>(script_length))
                  .ToLocal(&source)) {
           ok = false;
         }
@@ -3179,8 +3199,8 @@ JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_snapshot_create(
     if (bytes) {
       v8rt_snapshot::writeHeader(bytes, static_cast<uint64_t>(raw));
       std::memcpy(bytes + v8rt_snapshot::kHeaderSize, blob.data, raw);
-      *out_blob = bytes;
-      *out_blob_size = total;
+      *out_data = bytes;
+      *out_size = total;
     } else {
       rc = jsi_status_native_error;
     }
@@ -3194,59 +3214,40 @@ JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_snapshot_create(
   return rc;
 }
 
-JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_snapshot_destroy(uint8_t *blob) {
-  std::free(blob);
+V8_JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_snapshot_destroy(uint8_t *data) {
+  std::free(data);
 }
 
-JSI_ABI_API int JSI_ABI_CDECL
-v8_jsi_abi_snapshot_check(const uint8_t *blob, size_t blob_size) {
+V8_JSI_ABI_API v8_jsi_abi_snapshot_compat JSI_ABI_CDECL
+v8_jsi_abi_snapshot_check(const uint8_t *data, size_t size) {
   // Initialize V8 (idempotent) so CachedDataVersionTag is read in its final,
   // flag-implication-enforced state — matching the create path. Any process-
   // global engine flags (e.g. --jitless) must already be set by the caller.
   v8rt::V8PlatformHolder::initializePlatform(0, []() {});
-  return v8rt_snapshot::validate(blob, blob_size);
+  return static_cast<v8_jsi_abi_snapshot_compat>(
+      v8rt_snapshot::validate(data, size));
 }
 
-JSI_ABI_API const char *JSI_ABI_CDECL v8_jsi_abi_snapshot_compat_to_string(int code) {
-  return v8rt_snapshot::compatString(code);
+V8_JSI_ABI_API const char *JSI_ABI_CDECL
+v8_jsi_abi_snapshot_compat_to_string(v8_jsi_abi_snapshot_compat value) {
+  return v8rt_snapshot::compatString(static_cast<int>(value));
 }
 
-JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_config_set_startup_snapshot(
-    jsi_config config,
-    const uint8_t *blob,
-    size_t blob_size,
-    jsi_data_delete_cb blob_delete_cb,
-    void *deleter_data) {
-  if (!config)
-    return;
-  // Free any previously-set blob the config still owns.
-  if (config->startup_snapshot_delete_cb) {
-    config->startup_snapshot_delete_cb(
-        const_cast<uint8_t *>(config->startup_snapshot_blob),
-        config->startup_snapshot_deleter_data);
-  }
-  config->startup_snapshot_blob = blob;
-  config->startup_snapshot_blob_size = blob_size;
-  config->startup_snapshot_delete_cb = blob_delete_cb;
-  config->startup_snapshot_deleter_data = deleter_data;
-}
-
-// inspector entry point. Pure-C replacement for the legacy
-// openInspector(jsi::Runtime &) and openInspectors_toberemoved() exports.
-// Starts a previously-quiet Agent (e.g. when enable_inspector was set on the
-// config but inspector_break_on_start was false). Safe to call multiple times.
-JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_runtime_open_inspector(jsi_runtime *runtime) {
+// inspector entry point. Starts a previously-quiet Agent (e.g. when
+// the inspector was enabled on the config but break-on-start was false).
+// Safe to call multiple times.
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
+v8_jsi_abi_runtime_open_inspector(jsi_runtime *runtime) {
+  if (!runtime)
+    return jsi_status_invalid_arg;
 #if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)
-  if (!runtime) return;
   auto *state = static_cast<JsiRuntimeState *>(runtime);
   if (state->inspector_agent) {
     state->inspector_agent->start();
   }
-#else
-  (void)runtime;
 #endif
+  return jsi_status_ok;
 }
-
 // test-only hook: post a synthetic task to the runtime's foreground task
 // runner. Gated behind JSI_TESTING_ONLY (gyp variable v8jsi_test_hooks) so
 // release builds can drop it. Not declared in any public header; the test
@@ -3278,127 +3279,225 @@ JSI_ABI_API void JSI_ABI_CDECL v8_jsi_test_post_foreground_task(
 // V8 jsi_config — public C API
 //==============================================================================
 
-JSI_ABI_API void JSI_ABI_CDECL
+} // extern "C"
+
+namespace {
+
+// The first setter failure poisons the config; later setters return it.
+jsi_status configFail(jsi_config config, jsi_status status) {
+  if (config->status == jsi_status_ok)
+    config->status = status;
+  return config->status;
+}
+
+// Applies a plain value unless the config is NULL or already poisoned.
+template <typename Fn>
+jsi_status configSet(jsi_config config, Fn &&apply) {
+  if (!config)
+    return jsi_status_invalid_arg;
+  if (config->status != jsi_status_ok)
+    return config->status;
+  apply(*config);
+  return jsi_status_ok;
+}
+
+// An ownership-taking setter that fails still owns the incoming data, so it
+// releases it before reporting the failure.
+jsi_status releaseAndFail(jsi_config config,
+                          jsi_status status,
+                          jsi_data_delete_cb delete_cb,
+                          void *delete_data,
+                          void *data) {
+  if (delete_cb)
+    delete_cb(delete_data, data);
+  return config ? configFail(config, status) : status;
+}
+
+// Status an ownership-taking setter starts from: invalid_arg for a NULL
+// config, the poison status, or ok.
+jsi_status configEntryStatus(jsi_config config) {
+  return config ? config->status : jsi_status_invalid_arg;
+}
+
+} // namespace
+
+extern "C" {
+
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_initial_heap_size(jsi_config config, size_t bytes) {
-  if (config) config->initial_heap_size_in_bytes = bytes;
+  return configSet(config, [&](jsi_config_s &c) {
+    c.initial_heap_size_in_bytes = bytes;
+  });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_maximum_heap_size(jsi_config config, size_t bytes) {
-  if (config) config->maximum_heap_size_in_bytes = bytes;
+  return configSet(config, [&](jsi_config_s &c) {
+    c.maximum_heap_size_in_bytes = bytes;
+  });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_thread_pool_size(jsi_config config, uint8_t size) {
-  if (config) config->thread_pool_size = size;
+  return configSet(config, [&](jsi_config_s &c) { c.thread_pool_size = size; });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
-v8_jsi_abi_config_set_debugger_runtime_name_utf8(jsi_config config, const char *name) {
-  if (config) config->debugger_runtime_name = (name ? name : "");
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
+v8_jsi_abi_config_set_debugger_runtime_name_utf8(jsi_config config,
+                                                 const char *value,
+                                                 size_t length) {
+  if (!config)
+    return jsi_status_invalid_arg;
+  if (config->status != jsi_status_ok)
+    return config->status;
+  if (!value && length != 0 && length != JSI_ABI_AUTO_LENGTH)
+    return configFail(config, jsi_status_invalid_arg);
+  length = resolveUtf8Length(value, length);
+  config->debugger_runtime_name.assign(value ? value : "", length);
+  return jsi_status_ok;
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_inspector_enabled(jsi_config config, bool value) {
-  if (config) config->enable_inspector = value;
+  return configSet(config, [&](jsi_config_s &c) { c.enable_inspector = value; });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_inspector_port(jsi_config config, uint16_t port) {
-  if (config) config->inspector_port = port;
+  return configSet(config, [&](jsi_config_s &c) { c.inspector_port = port; });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_inspector_break_on_start(jsi_config config, bool value) {
-  if (config) config->inspector_break_on_start = value;
+  return configSet(config, [&](jsi_config_s &c) {
+    c.inspector_break_on_start = value;
+  });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_explicit_microtask_policy(jsi_config config, bool value) {
-  if (config) config->explicit_microtask_policy = value;
+  return configSet(config, [&](jsi_config_s &c) {
+    c.explicit_microtask_policy = value;
+  });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_ignore_unhandled_promises(jsi_config config, bool value) {
-  if (config) config->ignore_unhandled_promises = value;
+  return configSet(config, [&](jsi_config_s &c) {
+    c.ignore_unhandled_promises = value;
+  });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_gc_api_enabled(jsi_config config, bool value) {
-  if (config) config->enable_gc_api = value;
+  return configSet(config, [&](jsi_config_s &c) { c.enable_gc_api = value; });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_multi_thread_enabled(jsi_config config, bool value) {
-  if (config) config->enable_multi_thread = value;
+  return configSet(config, [&](jsi_config_s &c) {
+    c.enable_multi_thread = value;
+  });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_jit_tracing_enabled(jsi_config config, bool value) {
-  if (config) config->enable_jit_tracing = value;
+  return configSet(config, [&](jsi_config_s &c) {
+    c.enable_jit_tracing = value;
+  });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_message_tracing_enabled(jsi_config config, bool value) {
-  if (config) config->enable_message_tracing = value;
+  return configSet(config, [&](jsi_config_s &c) {
+    c.enable_message_tracing = value;
+  });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
 v8_jsi_abi_config_set_gc_tracing_enabled(jsi_config config, bool value) {
-  if (config) config->enable_gc_tracing = value;
+  return configSet(config, [&](jsi_config_s &c) {
+    c.enable_gc_tracing = value;
+  });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL
-v8_jsi_abi_config_set_system_instrumentation_enabled(jsi_config config, bool value) {
-  if (config) config->enable_system_instrumentation = value;
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL
+v8_jsi_abi_config_set_system_instrumentation_enabled(jsi_config config,
+                                                     bool value) {
+  return configSet(config, [&](jsi_config_s &c) {
+    c.enable_system_instrumentation = value;
+  });
 }
 
-JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_config_set_script_cache(
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_config_set_startup_snapshot(
     jsi_config config,
-    void *script_cache_data,
+    const uint8_t *data,
+    size_t size,
+    jsi_data_delete_cb data_delete_cb,
+    void *data_delete_data) {
+  jsi_status status = configEntryStatus(config);
+  if (status == jsi_status_ok && !data && size != 0)
+    status = jsi_status_invalid_arg;
+  if (status != jsi_status_ok)
+    return releaseAndFail(config, status, data_delete_cb, data_delete_data,
+                          const_cast<uint8_t *>(data));
+  // Free any previously-set blob the config still owns.
+  if (config->startup_snapshot_delete_cb) {
+    config->startup_snapshot_delete_cb(
+        config->startup_snapshot_delete_data,
+        const_cast<uint8_t *>(config->startup_snapshot_blob));
+  }
+  config->startup_snapshot_blob = data;
+  config->startup_snapshot_blob_size = size;
+  config->startup_snapshot_delete_cb = data_delete_cb;
+  config->startup_snapshot_delete_data = data_delete_data;
+  return jsi_status_ok;
+}
+
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_config_set_script_cache(
+    jsi_config config,
     v8_jsi_abi_script_cache_load_cb load_cb,
     v8_jsi_abi_script_cache_store_cb store_cb,
-    jsi_data_delete_cb script_cache_data_delete_cb,
-    void *deleter_data) {
-  if (!config) {
-    // Nothing owns script_cache_data; release it immediately.
-    if (script_cache_data_delete_cb)
-      script_cache_data_delete_cb(script_cache_data, deleter_data);
-    return;
-  }
+    void *user_data,
+    jsi_data_delete_cb user_data_delete_cb,
+    void *user_data_delete_data) {
+  jsi_status status = configEntryStatus(config);
+  if (status != jsi_status_ok)
+    return releaseAndFail(config, status, user_data_delete_cb,
+                          user_data_delete_data, user_data);
   // Release any previously-set cache before overwriting.
   if (config->script_cache_data_delete_cb) {
     config->script_cache_data_delete_cb(
-        config->script_cache_data, config->script_cache_deleter_data);
+        config->script_cache_delete_data, config->script_cache_data);
   }
-  config->script_cache_data = script_cache_data;
+  config->script_cache_data = user_data;
   config->script_cache_load_cb = load_cb;
   config->script_cache_store_cb = store_cb;
-  config->script_cache_data_delete_cb = script_cache_data_delete_cb;
-  config->script_cache_deleter_data = deleter_data;
+  config->script_cache_data_delete_cb = user_data_delete_cb;
+  config->script_cache_delete_data = user_data_delete_data;
+  return jsi_status_ok;
 }
 
-JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_config_set_task_runner(
+V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_config_set_task_runner(
     jsi_config config,
-    void *task_runner_data,
     v8_jsi_abi_task_runner_post_task_cb post_task_cb,
-    jsi_data_delete_cb task_runner_data_delete_cb,
-    void *deleter_data) {
-  if (!config) {
-    // Nothing owns task_runner_data; release it immediately.
-    if (task_runner_data_delete_cb)
-      task_runner_data_delete_cb(task_runner_data, deleter_data);
-    return;
-  }
+    void *user_data,
+    jsi_data_delete_cb user_data_delete_cb,
+    void *user_data_delete_data) {
+  jsi_status status = configEntryStatus(config);
+  if (status != jsi_status_ok)
+    return releaseAndFail(config, status, user_data_delete_cb,
+                          user_data_delete_data, user_data);
   // Release any previously-set task runner before overwriting.
   if (config->task_runner_data_delete_cb) {
     config->task_runner_data_delete_cb(
-        config->task_runner_data, config->task_runner_deleter_data);
+        config->task_runner_delete_data, config->task_runner_data);
   }
-  config->task_runner_data = task_runner_data;
+  config->task_runner_data = user_data;
   config->task_runner_post_task_cb = post_task_cb;
-  config->task_runner_data_delete_cb = task_runner_data_delete_cb;
-  config->task_runner_deleter_data = deleter_data;
+  config->task_runner_data_delete_cb = user_data_delete_cb;
+  config->task_runner_delete_data = user_data_delete_data;
+  return jsi_status_ok;
 }
 
 } // extern "C"

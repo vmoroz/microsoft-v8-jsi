@@ -278,7 +278,7 @@ struct CTask {
   void* data;
   v8_jsi_abi_task_run_cb run;
   jsi_data_delete_cb del;
-  void* deleter_data;
+  void* delete_data;
 };
 
 struct TaskQueue {
@@ -295,10 +295,10 @@ TaskQueue* g_tasks = nullptr;
 void JSI_ABI_CDECL PostTaskCb(void* runner_data, void* task_data,
                           v8_jsi_abi_task_run_cb task_run_cb,
                           jsi_data_delete_cb task_data_delete_cb,
-                          void* deleter_data) {
+                          void* task_data_delete_data) {
   auto* q = static_cast<TaskQueue*>(runner_data);
   ::EnterCriticalSection(&q->cs);
-  q->tasks.push_back({task_data, task_run_cb, task_data_delete_cb, deleter_data});
+  q->tasks.push_back({task_data, task_run_cb, task_data_delete_cb, task_data_delete_data});
   ::LeaveCriticalSection(&q->cs);
   ::SetEvent(q->wake);
 }
@@ -306,12 +306,12 @@ void JSI_ABI_CDECL PostTaskCb(void* runner_data, void* task_data,
 // Called when the runtime is destroyed. runner_data points at g_tasks (process
 // lifetime) so we don't free it — but fire the delete cb of any task still
 // queued so nothing leaks.
-void JSI_ABI_CDECL TaskRunnerDeleteCb(void* runner_data, void* /*deleter_data*/) {
+void JSI_ABI_CDECL TaskRunnerDeleteCb(void* /*delete_data*/, void* runner_data) {
   auto* q = static_cast<TaskQueue*>(runner_data);
   ::EnterCriticalSection(&q->cs);
   for (auto& t : q->tasks)
     if (t.del)
-      t.del(t.data, t.deleter_data);
+      t.del(t.delete_data, t.data);
   q->tasks.clear();
   ::LeaveCriticalSection(&q->cs);
 }
@@ -326,15 +326,15 @@ void RunQueuedTasks(TaskQueue* q) {
     if (t.run)
       t.run(t.data);
     if (t.del)
-      t.del(t.data, t.deleter_data);
+      t.del(t.delete_data, t.data);
   }
 }
 
 // Resolved v8jsi config setters (called inside the configure callback, which
 // runs synchronously during v8_jsi_abi_runtime_create). Set before create.
-decltype(&v8_jsi_abi_config_set_task_runner) g_set_task_runner = nullptr;
-decltype(&v8_jsi_abi_config_set_explicit_microtask_policy) g_set_microtask = nullptr;
-decltype(&v8_jsi_abi_config_set_startup_snapshot) g_set_snapshot = nullptr;
+v8_jsi_abi_config_set_task_runner_fn g_set_task_runner = nullptr;
+v8_jsi_abi_config_set_explicit_microtask_policy_fn g_set_microtask = nullptr;
+v8_jsi_abi_config_set_startup_snapshot_fn g_set_snapshot = nullptr;
 
 // Optional startup-snapshot blob (V8HOST_SNAPSHOT), read pre-lockdown. Held for
 // the process lifetime so the bytes outlive the runtime; passed to the config
@@ -358,8 +358,10 @@ uint32_t g_active_run_id = 0;
 bool g_run_complete_requested = false;
 
 jsi_status JSI_ABI_CDECL ConfigureRuntime(void* /*user_data*/, jsi_config cfg) {
+  // A failing setter poisons the config, so runtime creation reports it; the
+  // individual statuses need no separate check here.
   if (g_set_task_runner)
-    g_set_task_runner(cfg, g_tasks, &PostTaskCb, &TaskRunnerDeleteCb, nullptr);
+    g_set_task_runner(cfg, &PostTaskCb, g_tasks, &TaskRunnerDeleteCb, nullptr);
   // Explicit microtask policy: promise jobs run only when we drain them on the
   // JS thread (after each loop turn), giving the host deterministic control.
   if (g_set_microtask)
@@ -937,7 +939,11 @@ sbox_status SBOX_CDECL V8HostEngineWarmup(sbox_worker w,
     char flag[] = "--jitless";
     char* flag_argv[] = {arg0, flag};
     size_t flag_argc = 2;
-    p_v8_jsi_abi_set_v8_flags(&flag_argc, flag_argv, /*remove_flags=*/true);
+    if (p_v8_jsi_abi_set_v8_flags(&flag_argc, flag_argv,
+                                  /*remove_flags=*/true) != jsi_status_ok) {
+      printf("[v8host] v8_jsi_abi_set_v8_flags failed\n");
+      return sbox_status_failed;
+    }
     printf("[v8host] --jitless %s\n",
            flag_argc == 1 ? "recognized" : "NOT recognized");
   }
@@ -947,16 +953,15 @@ sbox_status SBOX_CDECL V8HostEngineWarmup(sbox_worker w,
   // what the blob was built with. A stale or cross-engine blob is dropped here
   // and we continue WITHOUT a snapshot rather than feed V8 an incompatible blob.
   if (g_have_snapshot) {
-    auto p_compat = reinterpret_cast<decltype(&v8_jsi_abi_snapshot_check)>(
+    auto p_compat = reinterpret_cast<v8_jsi_abi_snapshot_check_fn>(
         ::GetProcAddress(guest, "v8_jsi_abi_snapshot_check"));
-    auto p_compat_str =
-        reinterpret_cast<decltype(&v8_jsi_abi_snapshot_compat_to_string)>(
-            ::GetProcAddress(guest, "v8_jsi_abi_snapshot_compat_to_string"));
+    auto p_compat_str = reinterpret_cast<v8_jsi_abi_snapshot_compat_to_string_fn>(
+        ::GetProcAddress(guest, "v8_jsi_abi_snapshot_compat_to_string"));
     if (p_compat) {
-      const int code =
+      const v8_jsi_abi_snapshot_compat code =
           p_compat(reinterpret_cast<const uint8_t*>(g_snapshot_blob.data()),
                    g_snapshot_blob.size());
-      if (code != 0) {
+      if (code != v8_jsi_abi_snapshot_compat_ok) {
         const char* why = p_compat_str ? p_compat_str(code) : "incompatible";
         printf("[v8host] warmup: bound startup snapshot rejected (%s); failing "
                "closed\n", why);

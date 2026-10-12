@@ -134,10 +134,11 @@ typedef uint16_t jsi_char16;
 typedef struct jsi_config_s* jsi_config;
 
 /* Standard data-deleter callback used when ownership of a buffer or other
- * pointer crosses the DLL boundary. The implementation that handed the
- * pointer over also supplies this callback so the consumer can free it
- * with the same allocator that allocated it. */
-typedef void(JSI_ABI_CDECL *jsi_data_delete_cb)(void *data, void *deleter_data);
+ * pointer crosses the DLL boundary. The side that hands the pointer over also
+ * supplies this callback so the receiver can free it with the same allocator
+ * that allocated it. Called as delete_cb(user_data, data): user_data is the
+ * deleter's own context, data is the pointer being released. */
+typedef void(JSI_ABI_CDECL *jsi_data_delete_cb)(void *user_data, void *data);
 
 /*==========================================================================
  * Status

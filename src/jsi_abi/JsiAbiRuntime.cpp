@@ -1480,15 +1480,21 @@ void JsiAbiRuntime::popScope(ScopeState *state) {
 std::unique_ptr<facebook::jsi::Runtime> makeJsiAbiRuntime(
     jsi_create_runtime_fn create_runtime,
     jsi_configure_runtime_cb configure,
-    void *configure_data) {
+    void *user_data) {
   // Inject the consumer's compiled JSI_ABI_VERSION (Node-API Model B). The
   // create function hands back a runtime with refcount 1; the wrapper adopts
-  // that ref (destructor releases). nullptr means the implementation is too old
-  // for this consumer's version, or the configure callback returned an error.
-  jsi_runtime *rt = create_runtime(JSI_ABI_VERSION, configure, configure_data);
-  if (!rt) {
-    throw facebook::jsi::JSINativeException(
-        "JSI ABI runtime creation failed: version unsupported or configure error");
+  // that ref (destructor releases).
+  jsi_runtime *rt = nullptr;
+  jsi_status status =
+      create_runtime(JSI_ABI_VERSION, configure, user_data, &rt);
+  if (status != jsi_status_ok || !rt) {
+    char message[64];
+    std::snprintf(
+        message,
+        sizeof(message),
+        "JSI ABI runtime creation failed with status 0x%04X",
+        static_cast<unsigned int>(status));
+    throw facebook::jsi::JSINativeException(message);
   }
   return std::make_unique<JsiAbiRuntime>(rt);
 }

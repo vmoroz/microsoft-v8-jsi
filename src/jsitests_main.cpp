@@ -199,7 +199,7 @@ TEST(JsiAbiConfig, RuntimeFromConfigEvaluates) {
     v8_jsi_abi_config_set_initial_heap_size(cfg, 0);
     v8_jsi_abi_config_set_maximum_heap_size(cfg, 0);
     v8_jsi_abi_config_set_thread_pool_size(cfg, 0);
-    v8_jsi_abi_config_set_debugger_runtime_name_utf8(cfg, "config-smoke");
+    v8_jsi_abi_config_set_debugger_runtime_name_utf8(cfg, "config-smoke", JSI_ABI_AUTO_LENGTH);
     v8_jsi_abi_config_set_inspector_enabled(cfg, false);
     v8_jsi_abi_config_set_inspector_port(cfg, 9223);
     v8_jsi_abi_config_set_inspector_break_on_start(cfg, false);
@@ -409,8 +409,6 @@ TEST(JsiAbiTaskRunner, LifecycleAndPostTask) {
 // verify the inspector::Agent is created/started/torn down without crashing,
 // not to exercise the protocol. Mark skipped on inspector-disabled builds so
 // the test corpus stays portable during transitional rebuilds.
-extern "C" JSI_ABI_API void JSI_ABI_CDECL v8_jsi_abi_runtime_open_inspector(jsi_runtime *runtime);
-
 TEST(JsiAbiInspector, LifecycleAndOpen) {
 #if !defined(_WIN32) || !defined(V8JSI_ENABLE_INSPECTOR)
   GTEST_SKIP() << "Inspector not enabled in this build";
@@ -439,7 +437,7 @@ TEST(JsiAbiInspector, LifecycleAndOpen) {
   EXPECT_EQ(result.getNumber(), 42.0);
 
   // Calling v8_jsi_abi_runtime_open_inspector again on an already-started agent must be safe.
-  v8_jsi_abi_runtime_open_inspector(::jsi::abi::getAbiRuntime(*runtime));
+  EXPECT_EQ(v8_jsi_abi_runtime_open_inspector(::jsi::abi::getAbiRuntime(*runtime)), jsi_status_ok);
 
   // Tear down — Agent::removeContext + Agent::stop run inside the runtime
   // destructor; the test passes if nothing crashes.
@@ -608,7 +606,8 @@ struct AbiSourceBuffer : public jsi_buffer {
 // Exercises the only path through which a non-JS error message flows back to
 // the consumer.
 TEST(JsiAbiQueryInterface, UnknownIidReturnsError) {
-  jsi_runtime *rt = v8_jsi_abi_runtime_create(JSI_ABI_VERSION, nullptr, nullptr);
+  jsi_runtime *rt = nullptr;
+  ASSERT_EQ(v8_jsi_abi_runtime_create(JSI_ABI_VERSION, nullptr, nullptr, &rt), jsi_status_ok);
   ASSERT_NE(rt, nullptr);
 
   // Bogus IID — reserved-bit-pattern that will never collide with any
@@ -640,7 +639,8 @@ TEST(JsiAbiQueryInterface, UnknownIidReturnsError) {
 // Status-plus-out contract: JSI_ABI_AUTO_LENGTH inputs, a NULL output is
 // invalid_arg, and a failing call reports the JS band with its output zeroed.
 TEST(JsiAbiStatus, OutputsAndAutoLength) {
-  jsi_runtime *rt = v8_jsi_abi_runtime_create(JSI_ABI_VERSION, nullptr, nullptr);
+  jsi_runtime *rt = nullptr;
+  ASSERT_EQ(v8_jsi_abi_runtime_create(JSI_ABI_VERSION, nullptr, nullptr, &rt), jsi_status_ok);
   ASSERT_NE(rt, nullptr);
   const jsi_runtime_api *api = rt->api;
   void *scope = nullptr;
@@ -685,6 +685,103 @@ TEST(JsiAbiStatus, OutputsAndAutoLength) {
 
   EXPECT_EQ(api->pop_scope(rt, scope), jsi_status_ok);
   api->release(rt);
+}
+
+// Runtime creation reports failures through jsi_status and leaves the output
+// NULL.
+TEST(JsiAbiCreate, StatusAndOutput) {
+  EXPECT_EQ(v8_jsi_abi_runtime_create(JSI_ABI_VERSION, nullptr, nullptr, nullptr), jsi_status_invalid_arg);
+
+  jsi_runtime *rt = reinterpret_cast<jsi_runtime *>(uintptr_t{1});
+  EXPECT_EQ(
+      v8_jsi_abi_runtime_create(JSI_ABI_VERSION + 1, nullptr, nullptr, &rt), jsi_status_version_mismatch);
+  EXPECT_EQ(rt, nullptr);
+
+  // A configure callback failure is returned as is.
+  rt = reinterpret_cast<jsi_runtime *>(uintptr_t{1});
+  jsi_configure_runtime_cb failing = [](void *, jsi_config) -> jsi_status { return jsi_status_native_error; };
+  EXPECT_EQ(v8_jsi_abi_runtime_create(JSI_ABI_VERSION, failing, nullptr, &rt), jsi_status_native_error);
+  EXPECT_EQ(rt, nullptr);
+}
+
+namespace {
+struct DeleterProbe {
+  int calls{0};
+  void *firstArg{nullptr};
+  void *secondArg{nullptr};
+  jsi_status setterStatus{jsi_status_ok};
+  jsi_status laterSetterStatus{jsi_status_ok};
+};
+
+void JSI_ABI_CDECL probeDelete(void *delete_data, void *data) {
+  auto *probe = static_cast<DeleterProbe *>(delete_data);
+  ++probe->calls;
+  probe->firstArg = delete_data;
+  probe->secondArg = data;
+}
+
+uint8_t kFakeSnapshot[4] = {1, 2, 3, 4};
+} // namespace
+
+// jsi_data_delete_cb receives (delete_data, data) in that order. The startup
+// snapshot is released with the config when configure fails, before any
+// isolate reads it.
+TEST(JsiAbiConfig, DeleterArgumentOrder) {
+  DeleterProbe probe;
+  jsi_configure_runtime_cb configure = [](void *user_data, jsi_config cfg) -> jsi_status {
+    auto *p = static_cast<DeleterProbe *>(user_data);
+    p->setterStatus = v8_jsi_abi_config_set_startup_snapshot(
+        cfg, kFakeSnapshot, sizeof(kFakeSnapshot), &probeDelete, p);
+    return jsi_status_native_error;
+  };
+  jsi_runtime *rt = nullptr;
+  EXPECT_EQ(v8_jsi_abi_runtime_create(JSI_ABI_VERSION, configure, &probe, &rt), jsi_status_native_error);
+  EXPECT_EQ(rt, nullptr);
+  EXPECT_EQ(probe.setterStatus, jsi_status_ok);
+  EXPECT_EQ(probe.calls, 1);
+  EXPECT_EQ(probe.firstArg, &probe);
+  EXPECT_EQ(probe.secondArg, static_cast<void *>(kFakeSnapshot));
+}
+
+// A failing setter poisons the config: later setters report the same status,
+// release the data they were given, and runtime creation fails with it.
+TEST(JsiAbiConfig, FailingSetterPoisonsConfig) {
+  DeleterProbe probe;
+  jsi_configure_runtime_cb configure = [](void *user_data, jsi_config cfg) -> jsi_status {
+    auto *p = static_cast<DeleterProbe *>(user_data);
+    p->setterStatus = v8_jsi_abi_config_set_debugger_runtime_name_utf8(cfg, nullptr, 5);
+    p->laterSetterStatus = v8_jsi_abi_config_set_startup_snapshot(
+        cfg, kFakeSnapshot, sizeof(kFakeSnapshot), &probeDelete, p);
+    return jsi_status_ok;
+  };
+  jsi_runtime *rt = reinterpret_cast<jsi_runtime *>(uintptr_t{1});
+  EXPECT_EQ(v8_jsi_abi_runtime_create(JSI_ABI_VERSION, configure, &probe, &rt), jsi_status_invalid_arg);
+  EXPECT_EQ(rt, nullptr);
+  EXPECT_EQ(probe.setterStatus, jsi_status_invalid_arg);
+  EXPECT_EQ(probe.laterSetterStatus, jsi_status_invalid_arg);
+  EXPECT_EQ(probe.calls, 1);
+  EXPECT_EQ(probe.firstArg, &probe);
+  EXPECT_EQ(probe.secondArg, static_cast<void *>(kFakeSnapshot));
+}
+
+TEST(JsiAbiProcess, SetV8FlagsRejectsNullArgs) {
+  EXPECT_EQ(v8_jsi_abi_set_v8_flags(nullptr, nullptr, false), jsi_status_invalid_arg);
+  size_t argc = 1;
+  EXPECT_EQ(v8_jsi_abi_set_v8_flags(&argc, nullptr, false), jsi_status_invalid_arg);
+  argc = 0;
+  EXPECT_EQ(v8_jsi_abi_set_v8_flags(&argc, nullptr, false), jsi_status_ok);
+}
+
+TEST(JsiAbiSnapshot, CheckAndCreateArgs) {
+  EXPECT_EQ(v8_jsi_abi_snapshot_check(kFakeSnapshot, 1), v8_jsi_abi_snapshot_compat_truncated);
+  EXPECT_STRNE(v8_jsi_abi_snapshot_compat_to_string(v8_jsi_abi_snapshot_compat_truncated), "");
+
+  uint8_t *blob = reinterpret_cast<uint8_t *>(uintptr_t{1});
+  size_t blobSize = 1;
+  EXPECT_EQ(v8_jsi_abi_snapshot_create(nullptr, 0, "x.js", false, &blob, &blobSize), jsi_status_invalid_arg);
+  EXPECT_EQ(blob, nullptr);
+  EXPECT_EQ(blobSize, 0u);
+  v8_jsi_abi_snapshot_destroy(nullptr);
 }
 
 int main(int argc, char **argv) {

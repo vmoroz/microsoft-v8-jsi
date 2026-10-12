@@ -35,26 +35,28 @@
 namespace jsi::abi {
 
 /// The engine's flat runtime-creation export, as a function-pointer type.
-/// Each engine provides one (e.g. v8_jsi_abi_runtime_create). Takes the consumer's
-/// compiled JSI_ABI_VERSION + a configure callback/context; returns a runtime
-/// with refcount 1, or nullptr on version mismatch / configure failure.
-using jsi_create_runtime_fn = jsi_runtime *(JSI_ABI_CDECL *)(
-    uint32_t requested_abi_version,
+/// Each engine provides one (e.g. v8_jsi_abi_runtime_create). Takes the
+/// consumer's compiled JSI_ABI_VERSION + a configure callback/context; on
+/// success sets *out_runtime to a runtime with refcount 1.
+using jsi_create_runtime_fn = jsi_status(JSI_ABI_CDECL *)(
+    uint32_t abi_version,
     jsi_configure_runtime_cb configure,
-    void *configure_data);
+    void *user_data,
+    jsi_runtime **out_runtime);
 
 /// Create a new JSI runtime via the engine's flat create function. This wrapper
 /// is compiled into the consumer, so it injects the consumer's JSI_ABI_VERSION
-/// for free (Node-API Model B).
+/// for free (Node-API Model B). Throws facebook::jsi::JSINativeException
+/// naming the status if creation fails.
 /// \param create_runtime The engine's create export (e.g. v8_jsi_abi_runtime_create).
 /// \param configure Optional callback that populates the factory-owned config
 ///   via engine-specific setters (e.g. v8_jsi_abi_config_set_*); nullptr = defaults.
-/// \param configure_data Opaque context passed through to configure.
+/// \param user_data Opaque context passed through to configure.
 /// \return A facebook::jsi::Runtime that owns one ref on the new runtime.
 std::unique_ptr<facebook::jsi::Runtime> makeJsiAbiRuntime(
     jsi_create_runtime_fn create_runtime,
     jsi_configure_runtime_cb configure = nullptr,
-    void *configure_data = nullptr);
+    void *user_data = nullptr);
 
 /// Wrap an existing jsi_runtime. The returned wrapper holds its own ref
 /// (add_ref is called on entry), so the caller's ref is independent.

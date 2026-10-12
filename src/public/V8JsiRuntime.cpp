@@ -30,16 +30,16 @@ class V8JsiBuffer final : public facebook::jsi::Buffer {
       const uint8_t *buffer,
       size_t bufferSize,
       jsi_data_delete_cb bufferDeleteCallback,
-      void *deleterData) noexcept
+      void *bufferDeleteData) noexcept
       : buffer_(buffer),
         bufferSize_(bufferSize),
         bufferDeleteCallback_(bufferDeleteCallback),
-        deleterData_(deleterData) {}
+        bufferDeleteData_(bufferDeleteData) {}
 
   ~V8JsiBuffer() override {
     if (bufferDeleteCallback_) {
       bufferDeleteCallback_(
-          const_cast<uint8_t *>(buffer_), deleterData_);
+          bufferDeleteData_, const_cast<uint8_t *>(buffer_));
     }
   }
 
@@ -53,7 +53,7 @@ class V8JsiBuffer final : public facebook::jsi::Buffer {
   const uint8_t *buffer_;
   size_t bufferSize_;
   jsi_data_delete_cb bufferDeleteCallback_;
-  void *deleterData_;
+  void *bufferDeleteData_;
 };
 
 // Adapter from the consumer's std::shared_ptr<facebook::jsi::PreparedScriptStore>
@@ -69,9 +69,9 @@ class V8ScriptCache {
       std::shared_ptr<facebook::jsi::PreparedScriptStore> scriptStore) {
     v8_jsi_abi_config_set_script_cache(
         config,
-        new V8ScriptCache(std::move(scriptStore)),
         &LoadScript,
         &StoreScript,
+        new V8ScriptCache(std::move(scriptStore)),
         &Delete,
         nullptr);
   }
@@ -91,7 +91,7 @@ class V8ScriptCache {
       const uint8_t **buffer,
       size_t *bufferSize,
       jsi_data_delete_cb *bufferDeleteCallback,
-      void **deleterData) {
+      void **bufferDeleteData) {
     auto &scriptStore =
         reinterpret_cast<V8ScriptCache *>(scriptCache)->scriptStore_;
     std::shared_ptr<const facebook::jsi::Buffer> preparedScript =
@@ -102,17 +102,17 @@ class V8ScriptCache {
     if (preparedScript) {
       *buffer = preparedScript->data();
       *bufferSize = preparedScript->size();
-      *bufferDeleteCallback = [](void * /*data*/, void *deleterData) {
+      *bufferDeleteCallback = [](void *deleteData, void * /*data*/) {
         delete reinterpret_cast<
-            std::shared_ptr<const facebook::jsi::Buffer> *>(deleterData);
+            std::shared_ptr<const facebook::jsi::Buffer> *>(deleteData);
       };
-      *deleterData = new std::shared_ptr<const facebook::jsi::Buffer>(
+      *bufferDeleteData = new std::shared_ptr<const facebook::jsi::Buffer>(
           std::move(preparedScript));
     } else {
       *buffer = nullptr;
       *bufferSize = 0;
       *bufferDeleteCallback = nullptr;
-      *deleterData = nullptr;
+      *bufferDeleteData = nullptr;
     }
   }
 
@@ -126,18 +126,18 @@ class V8ScriptCache {
       const uint8_t *buffer,
       size_t bufferSize,
       jsi_data_delete_cb bufferDeleteCallback,
-      void *deleterData) {
+      void *bufferDeleteData) {
     auto &scriptStore =
         reinterpret_cast<V8ScriptCache *>(scriptCache)->scriptStore_;
     scriptStore->persistPreparedScript(
         std::make_shared<V8JsiBuffer>(
-            buffer, bufferSize, bufferDeleteCallback, deleterData),
+            buffer, bufferSize, bufferDeleteCallback, bufferDeleteData),
         facebook::jsi::ScriptSignature{sourceUrl, sourceHash},
         facebook::jsi::JSRuntimeSignature{runtimeName, runtimeVersion},
         cacheTag);
   }
 
-  static void __cdecl Delete(void *scriptCache, void * /*deleterData*/) {
+  static void __cdecl Delete(void * /*deleteData*/, void *scriptCache) {
     delete reinterpret_cast<V8ScriptCache *>(scriptCache);
   }
 
@@ -156,8 +156,8 @@ class V8TaskRunner {
                      std::shared_ptr<JSITaskRunner> taskRunner) {
     v8_jsi_abi_config_set_task_runner(
         config,
-        new V8TaskRunner(std::move(taskRunner)),
         &PostTask,
+        new V8TaskRunner(std::move(taskRunner)),
         &Delete,
         nullptr);
   }
@@ -174,15 +174,15 @@ class V8TaskRunner {
     CTask(void *taskData,
           v8_jsi_abi_task_run_cb taskRunCb,
           jsi_data_delete_cb taskDataDeleteCb,
-          void *deleterData) noexcept
+          void *taskDataDeleteData) noexcept
         : taskData_(taskData),
           taskRunCb_(taskRunCb),
           taskDataDeleteCb_(taskDataDeleteCb),
-          deleterData_(deleterData) {}
+          taskDataDeleteData_(taskDataDeleteData) {}
 
     ~CTask() override {
       if (taskDataDeleteCb_) {
-        taskDataDeleteCb_(taskData_, deleterData_);
+        taskDataDeleteCb_(taskDataDeleteData_, taskData_);
       }
     }
 
@@ -199,7 +199,7 @@ class V8TaskRunner {
     void *taskData_;
     v8_jsi_abi_task_run_cb taskRunCb_;
     jsi_data_delete_cb taskDataDeleteCb_;
-    void *deleterData_;
+    void *taskDataDeleteData_;
   };
 
   static void __cdecl PostTask(
@@ -207,14 +207,14 @@ class V8TaskRunner {
       void *taskData,
       v8_jsi_abi_task_run_cb taskRunCb,
       jsi_data_delete_cb taskDataDeleteCb,
-      void *deleterData) {
+      void *taskDataDeleteData) {
     auto &taskRunner =
         reinterpret_cast<V8TaskRunner *>(taskRunnerData)->taskRunner_;
     taskRunner->postTask(std::make_unique<CTask>(
-        taskData, taskRunCb, taskDataDeleteCb, deleterData));
+        taskData, taskRunCb, taskDataDeleteCb, taskDataDeleteData));
   }
 
-  static void __cdecl Delete(void *taskRunnerData, void * /*deleterData*/) {
+  static void __cdecl Delete(void * /*deleteData*/, void *taskRunnerData) {
     delete reinterpret_cast<V8TaskRunner *>(taskRunnerData);
   }
 
@@ -226,7 +226,7 @@ void applyArgs(jsi_config cfg, const V8RuntimeArgs &args) {
   v8_jsi_abi_config_set_maximum_heap_size(cfg, args.maximum_heap_size_in_bytes);
   v8_jsi_abi_config_set_thread_pool_size(cfg, args.flags.thread_pool_size);
   v8_jsi_abi_config_set_debugger_runtime_name_utf8(
-      cfg, args.debuggerRuntimeName.c_str());
+      cfg, args.debuggerRuntimeName.data(), args.debuggerRuntimeName.size());
   v8_jsi_abi_config_set_inspector_enabled(cfg, args.flags.enableInspector);
   v8_jsi_abi_config_set_inspector_port(cfg, args.inspectorPort);
   v8_jsi_abi_config_set_inspector_break_on_start(cfg, args.flags.waitForDebugger);
@@ -261,9 +261,9 @@ void applyArgs(jsi_config cfg, const V8RuntimeArgs &args) {
         cfg,
         (*held)->data(),
         (*held)->size(),
-        [](void * /*data*/, void *deleterData) {
+        [](void *deleteData, void * /*data*/) {
           delete reinterpret_cast<
-              std::shared_ptr<const facebook::jsi::Buffer> *>(deleterData);
+              std::shared_ptr<const facebook::jsi::Buffer> *>(deleteData);
         },
         held);
   }
