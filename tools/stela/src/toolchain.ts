@@ -1,6 +1,7 @@
-// Locates the Visual Studio C/C++ toolchain for the compile-matrix tests:
-// MSVC through vcvarsall (one cached environment per target arch) and the
-// clang that ships with VS (component Microsoft.VisualStudio.Component.VC.Llvm.Clang).
+// Locates the Visual Studio C/C++ toolchain for compile checks (Stela's
+// compile matrix and the repo's public-header gate): MSVC through vcvarsall
+// (one cached environment per target arch) and the clang that ships with VS
+// (component Microsoft.VisualStudio.Component.VC.Llvm.Clang).
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -92,6 +93,15 @@ export interface CompileResult {
   readonly job: CompileJob;
   readonly ok: boolean;
   readonly output: string;
+}
+
+/** Resolves an executable such as `cl.exe` on a vcvars environment's PATH. */
+export function resolveOnPath(exe: string, env: NodeJS.ProcessEnv): string {
+  const pathVar = env.Path ?? env.PATH ?? "";
+  for (const d of pathVar.split(";")) {
+    if (d && existsSync(path.join(d, exe))) return path.join(d, exe);
+  }
+  throw new Error(`${exe} not found on the vcvars PATH`);
 }
 
 /** Runs jobs in parallel; a job passes when the compiler exits with 0. */

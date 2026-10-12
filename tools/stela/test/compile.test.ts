@@ -5,14 +5,21 @@
 // mode, where every annotation must reach the AST.
 
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { DEFAULT_TEMPLATE } from "../src/stela.ts";
 import { generateLibraryHeader, parseTemplate } from "../src/vendor.ts";
 import { templateV2 } from "./helpers.ts";
-import { type CompileJob, type MsvcArch, type Toolchain, findToolchain, runJobs } from "./toolchain.ts";
+import {
+  type CompileJob,
+  type MsvcArch,
+  type Toolchain,
+  findToolchain,
+  resolveOnPath,
+  runJobs,
+} from "../src/toolchain.ts";
 
 const fixtures = path.join(import.meta.dirname, "fixtures");
 const templateText = readFileSync(DEFAULT_TEMPLATE, "utf8");
@@ -296,11 +303,3 @@ describe("generated headers compile", () => {
     }
   });
 });
-
-function resolveOnPath(exe: string, env: NodeJS.ProcessEnv): string {
-  const pathVar = env.Path ?? env.PATH ?? "";
-  for (const d of pathVar.split(";")) {
-    if (d && existsSync(path.join(d, exe))) return path.join(d, exe);
-  }
-  throw new Error(`${exe} not found on the vcvars PATH`);
-}

@@ -193,3 +193,11 @@ The `scripts/` folder holds the TypeScript build/sync tooling (`build.ts`,
 `sync.ts`, AI-merge, plus tests via `npm test`, type-checking via
 `npm run typecheck`, and lint/format via `npm run fix`). Run TypeScript with
 `node <script>.ts` directly.
+
+The public C ABI headers have a compile gate: `node --test
+scripts/header-check.ts` compiles each one on its own as C and C++ with MSVC
+and VS clang, warnings as errors, for x64, x86, and arm64. A header that hasn't
+migrated to the C ABI conventions yet is marked `pending` there and reports
+without failing. `tools/stela/` holds Stela, the C ABI header tool;
+`node tools/stela/src/stela.ts vendor --check` verifies the generated
+`<lib>_stela.h` files (see `tools/stela/README.md`).

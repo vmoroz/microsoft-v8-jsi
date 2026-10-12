@@ -347,6 +347,28 @@ extends:
               version: '24.x'
 
           - ${{ if eq(parameters.fakeBuild, false) }}:
+              # C ABI header gates, before the long builds so they fail fast.
+              # x64 only: the checks cross-compile for x64, x86, and arm64. The
+              # generated <lib>_stela.h files must be current, Stela's tests
+              # must pass, and every public C ABI header must compile on its own
+              # as C and C++ with MSVC and VS clang (scripts/header-check.ts).
+            - ${{ if eq(sb.BuildPlatform, 'x64') }}:
+              - pwsh: |
+                  node tools/stela/src/stela.ts vendor --check
+                  if ($LASTEXITCODE -ne 0) {
+                    throw "Generated <lib>_stela.h files are stale (exit $LASTEXITCODE); run: node tools/stela/src/stela.ts vendor"
+                  }
+                  node --test "tools/stela/test/**/*.test.ts"
+                  if ($LASTEXITCODE -ne 0) {
+                    throw "Stela tests FAILED (exit $LASTEXITCODE)"
+                  }
+                  node --test scripts/header-check.ts
+                  if ($LASTEXITCODE -ne 0) {
+                    throw "Public C ABI header checks FAILED (exit $LASTEXITCODE)"
+                  }
+                displayName: C ABI header gates (Stela vendor check, Stela tests, header checks)
+                workingDirectory: $(Build.SourcesDirectory)
+
               # BinSkim (run by --check) installs from the react-native-public ADO
               # feed; authenticate the NuGet client for that restore.
             - task: NuGetToolInstaller@1
