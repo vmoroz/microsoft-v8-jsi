@@ -27,6 +27,7 @@
       "prefix": "v8_jsi_abi",
       "macroPrefix": "V8_JSI_ABI",
       "headers": ["src/jsi_abi/v8_jsi_abi.h"],
+      "includeDirs": ["src"],
       "status": "jsi_status",
       "stelaHeader": false
     }

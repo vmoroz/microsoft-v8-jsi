@@ -1,11 +1,12 @@
 # Stela
 
-Stela checks C ABI headers: an annotation vocabulary, and (in later stages) an
-extractor, a model, lint rules, an ABI diff, and manifests embedded in
-binaries. It incubates here with no dependency on v8-jsi code, so it can move
-to its own repository unchanged.
+Stela checks C ABI headers. It currently provides the annotation vocabulary,
+the native extractor, and `stela vendor`. Later stages add model merging, lint
+rules, ABI diff, generators, and manifests embedded in binaries. It incubates
+here with no dependency on v8-jsi code, so it can move to its own repository
+unchanged.
 
-Status: stage S1, the annotation template and `stela vendor`.
+Status: stage S2, the native extractor and `stela.raw/1`.
 
 ## Requirements
 
@@ -13,6 +14,31 @@ Status: stage S1, the annotation template and `stela vendor`.
 - For the compile-matrix tests: Visual Studio with the C++ tools and the
   "C++ Clang Compiler for Windows" component
   (`Microsoft.VisualStudio.Component.VC.Llvm.Clang`).
+
+## Extractor
+
+`extract/stela_extract.c` is a C17 libclang client. It parses one target and
+writes deterministic `stela.raw/1` JSON. The Node helper in
+`src/extractor.ts` builds it on demand with the host-native MSVC and libclang,
+keys the output by the sources and libclang binary, and supplies the selected
+target's MSVC and Windows SDK include paths.
+
+The native command is:
+
+```text
+stela-extract --target <triple> --root <dir> --out <file.json>
+              [--include <dir>]... [--define <NAME[=VALUE]>]...
+              [--owns <path>]... <header>...
+```
+
+The default owned paths are the entry headers. Declarations are assigned by
+their macro expansion location. Any parse error exits with code 2 and does not
+replace an existing output.
+
+The vendored libclang C API headers are pinned to LLVM 22.1.3. Set
+`STELA_LIBCLANG_DIR` to override the host-native directory containing
+`libclang.dll`; the matching import library must be in the sibling `lib`
+directory.
 
 ## The annotation template
 
@@ -91,7 +117,7 @@ version) and compiles them alone and together, in both include orders:
 - extractor mode (`-DSTELA_EXTRACT`), where every annotation must reach the
   AST, and default mode, where none may.
 
-Without Visual Studio the compile-matrix tests are skipped.
+Without Visual Studio the compile-matrix and extractor tests are skipped.
 
 ## License
 
