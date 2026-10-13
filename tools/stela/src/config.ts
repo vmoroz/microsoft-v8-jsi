@@ -1,6 +1,5 @@
-// Loads and validates stela.config.json (Stela design §8.2). Only the keys
-// that the implemented commands need are interpreted; the rest of the §8.2
-// schema is accepted so the file can grow ahead of the tool.
+// Loads and validates stela.config.json (Stela design §8.2). The `lint` and
+// `diff` sections are accepted but not interpreted yet.
 
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -19,6 +18,14 @@ export interface LibraryConfig {
   readonly stelaNames: Readonly<Record<string, string>>;
   /** The library's status type (§8.2 `status`). */
   readonly status: string;
+  /** Include directories a consumer puts on its path, absolute paths. */
+  readonly includeDirs: readonly string[];
+  /** Files or directories whose declarations belong to the library, absolute paths. */
+  readonly owns: readonly string[];
+  /** Preprocessor definitions, `NAME` or `NAME=VALUE`. */
+  readonly defines: readonly string[];
+  /** The targets this library is extracted for: its own list, or the global one. */
+  readonly targets: readonly string[];
 }
 
 export interface StelaConfig {
@@ -26,6 +33,8 @@ export interface StelaConfig {
   readonly file: string;
   /** The directory that config paths are relative to. */
   readonly root: string;
+  /** The global target list, in order. Empty when the config sets none. */
+  readonly targets: readonly string[];
   readonly libraries: readonly LibraryConfig[];
 }
 
@@ -45,6 +54,17 @@ const LIBRARY_KEYS = new Set([
 ]);
 const LOWER_SNAKE_RE = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
 const UPPER_SNAKE_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$/;
+const TARGET_RE = /^[a-z0-9_]+(?:-[a-z0-9_.]+)+$/;
+const DEFINE_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/;
+
+function targetList(value: unknown, where: string): string[] {
+  const list = stringList(value, where);
+  for (const target of list) {
+    if (!TARGET_RE.test(target)) throw new StelaError(`${where}: "${target}" is not a target triple`);
+  }
+  if (new Set(list).size !== list.length) throw new StelaError(`${where} lists a target twice`);
+  return list;
+}
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -70,6 +90,7 @@ export function parseConfig(json: unknown, file: string): StelaConfig {
   if (!Array.isArray(json.libraries) || json.libraries.length === 0) {
     throw new StelaError(`${file}: "libraries" must be a non-empty array`);
   }
+  const globalTargets = targetList(json.targets, `${file}: "targets"`);
 
   const libraries: LibraryConfig[] = [];
   const names = new Set<string>();
@@ -140,9 +161,43 @@ export function parseConfig(json: unknown, file: string): StelaConfig {
     if (typeof status !== "string" || !LOWER_SNAKE_RE.test(status)) {
       throw new StelaError(`${where}: "status" must be a lowercase_snake type name`);
     }
-    libraries.push({ name, prefix, macroPrefix, headers, stelaHeader, stelaNames, status });
+    const resolve = (list: string[]) => list.map((p) => path.resolve(root, p));
+    const includeDirs = resolve(stringList(raw.includeDirs, `${where}: "includeDirs"`));
+    const owns = raw.owns === undefined ? headers : resolve(stringList(raw.owns, `${where}: "owns"`));
+    const defines = stringList(raw.defines, `${where}: "defines"`);
+    for (const define of defines) {
+      if (!DEFINE_RE.test(define)) throw new StelaError(`${where}: "defines" has a bad entry "${define}"`);
+    }
+    let targets = globalTargets;
+    if (raw.targets !== undefined) {
+      targets = targetList(raw.targets, `${where}: "targets"`);
+      if (targets.length === 0) throw new StelaError(`${where}: "targets" must not be empty`);
+      if (globalTargets.length > 0) {
+        const extra = targets.filter((t) => !globalTargets.includes(t));
+        if (extra.length > 0) {
+          throw new StelaError(`${where}: "targets" must be a subset of the global "targets"; extra: ${extra.join(", ")}`);
+        }
+        // Keep the global order, so models don't depend on how a library lists them.
+        targets = globalTargets.filter((t) => targets.includes(t));
+      }
+    }
+    libraries.push({
+      name,
+      prefix,
+      macroPrefix,
+      headers,
+      stelaHeader,
+      stelaNames,
+      status,
+      includeDirs,
+      owns,
+      defines,
+      targets,
+    });
   });
-  return { file: path.resolve(file), root, libraries };
+  // Without a global list, the model's targets are the libraries' own, in order.
+  const targets = globalTargets.length > 0 ? globalTargets : [...new Set(libraries.flatMap((l) => l.targets))];
+  return { file: path.resolve(file), root, targets, libraries };
 }
 
 export function loadConfig(file: string): StelaConfig {

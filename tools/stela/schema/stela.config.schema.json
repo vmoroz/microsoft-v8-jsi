@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microsoft.github.io/stela/schema/stela.config.schema.json",
+  "title": "Stela configuration",
+  "description": "stela.config.json (design §8.2). Paths are relative to the file's directory. The CLI also checks what a schema can't: unique names, generated files, and macro prefixes; and that each library's targets are a subset of the global list.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "libraries"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schema": {"const": "stela.config/1"},
+    "targets": {
+      "$ref": "#/$defs/targets",
+      "description": "Every target the model covers, in model order. Required by `stela extract`."
+    },
+    "libraries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/library"}
+    },
+    "lint": {"type": "object", "description": "Reserved for stela lint (S4)."},
+    "diff": {"type": "object", "description": "Reserved for stela diff (S5)."}
+  },
+  "$defs": {
+    "lowerSnake": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"},
+    "upperSnake": {"type": "string", "pattern": "^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$"},
+    "paths": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "targets": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z0-9_]+(?:-[a-z0-9_.]+)+$"}
+    },
+    "library": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "prefix", "macroPrefix"],
+      "properties": {
+        "name": {"$ref": "#/$defs/lowerSnake"},
+        "prefix": {"$ref": "#/$defs/lowerSnake"},
+        "macroPrefix": {"$ref": "#/$defs/upperSnake"},
+        "headers": {"$ref": "#/$defs/paths", "description": "Entry headers, in include order."},
+        "includeDirs": {
+          "$ref": "#/$defs/paths",
+          "description": "Include directories, as a consumer sets them; generated tests include each entry header relative to the first one that holds it."
+        },
+        "owns": {
+          "$ref": "#/$defs/paths",
+          "description": "Files or directories whose declarations belong to the library. Default: the entry headers."
+        },
+        "defines": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$"},
+          "description": "NAME or NAME=VALUE, defined before the entry headers when extracting and in generated tests."
+        },
+        "targets": {
+          "allOf": [{"$ref": "#/$defs/targets"}, {"minItems": 1}],
+          "description": "The library's targets when it doesn't ship on every global target."
+        },
+        "status": {"$ref": "#/$defs/lowerSnake", "description": "Status type name. Default: <prefix>_status."},
+        "stelaHeader": {
+          "oneOf": [
+            {"type": "string", "pattern": "\\.h$"},
+            {"const": false}
+          ],
+          "description": "The generated <lib>_stela.h, or false for an extension library that uses another library's. Default: <macroPrefix lowercased>_stela.h next to the first header."
+        },
+        "stelaNames": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        }
+      },
+      "anyOf": [
+        {"required": ["headers"]},
+        {"required": ["stelaHeader"], "properties": {"stelaHeader": {"type": "string"}}}
+      ]
+    }
+  }
+}

@@ -39,6 +39,44 @@ test("explicit stelaHeader, extension libraries, and other §8.2 keys", () => {
   assert.equal(config.libraries[2].status, "jsi_status");
 });
 
+test("extraction keys: includeDirs, owns, defines, and targets", () => {
+  const x64 = "x86_64-pc-windows-msvc";
+  const x86 = "i686-pc-windows-msvc";
+  const arm64 = "aarch64-pc-windows-msvc";
+  const config = parse(
+    [
+      lib({ includeDirs: ["src/public"], defines: ["V8HOST_EXPERIMENTAL", "V8HOST_LEVEL=2"] }),
+      { ...lib({ name: "ext", prefix: "ext", macroPrefix: "EXT" }), stelaHeader: false, owns: ["a.h"], targets: [arm64, x64] },
+    ],
+    { targets: [x64, x86, arm64] },
+  );
+  const [host, ext] = config.libraries;
+  assert.deepEqual(config.targets, [x64, x86, arm64]);
+  assert.deepEqual(host.includeDirs, [path.join(root, "src", "public")]);
+  assert.deepEqual(host.owns, host.headers);
+  assert.deepEqual(host.defines, ["V8HOST_EXPERIMENTAL", "V8HOST_LEVEL=2"]);
+  assert.deepEqual(host.targets, [x64, x86, arm64]);
+  assert.deepEqual(ext.owns, [path.join(root, "a.h")]);
+  // A library's targets keep the global order.
+  assert.deepEqual(ext.targets, [x64, arm64]);
+
+  // Without a global list, the model's targets are the libraries' own, in order.
+  const local = parse([lib({ targets: [x86] }), { ...lib({ name: "b", prefix: "b", macroPrefix: "B" }), targets: [x64, x86] }]);
+  assert.deepEqual(local.targets, [x86, x64]);
+
+  const bad = (extra: Record<string, unknown>, top: Record<string, unknown> = {}) =>
+    assert.throws(() => parse([lib(extra)], top), StelaError);
+  bad({ includeDirs: "src" });
+  bad({ defines: ["1BAD"] });
+  bad({ defines: ["A B"] });
+  bad({ targets: [] });
+  bad({ targets: ["x64"] });
+  bad({ targets: [x64, x64] });
+  bad({ targets: [arm64] }, { targets: [x64] });
+  bad({}, { targets: [x64, x64] });
+  bad({}, { targets: "x86_64-pc-windows-msvc" });
+});
+
 test("invalid configs are rejected", () => {
   const bad = (libraries: unknown[], top: Record<string, unknown> = {}) =>
     assert.throws(() => parse(libraries, top), StelaError);

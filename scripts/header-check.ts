@@ -13,12 +13,21 @@
 // A header that hasn't migrated to the conventions yet carries `pending`: its
 // checks still run and report, as node:test `todo` tests, but don't fail the
 // gate. Remove `pending` in the change that migrates the header.
+//
+// A second block runs Stela's generated layout tests: it extracts every library
+// in stela.config.json and compiles static asserts of each record's size,
+// alignment, and field offsets and each enumerator's value, on every target.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
+import { compileJobs, compileUnits, msvcEnvs } from "../tools/stela/src/compile.ts";
+import { loadConfig } from "../tools/stela/src/config.ts";
+import { extractModel } from "../tools/stela/src/extract.ts";
+import { generate } from "../tools/stela/src/generators.ts";
+import { formatMismatch } from "../tools/stela/src/model.ts";
 import {
   type CompileJob,
   type CompileResult,
@@ -192,5 +201,62 @@ describe("public C ABI headers compile standalone", () => {
         if (failures) assert.fail(failures);
       });
     }
+  }
+});
+
+// Stela layout tests (Stela design §11): extract every library in
+// stela.config.json for its targets, then check each size, alignment, field
+// offset, and enumerator value Clang computed against what clang and MSVC
+// compile, as C and C++, on every target.
+describe("Stela layout tests compile", () => {
+  const config = loadConfig(path.join(repoRoot, "stela.config.json"));
+  let dir = "";
+  let setupError: string | undefined;
+  const results = new Map<string, CompileResult[]>();
+
+  before(async () => {
+    const tc = await findToolchain();
+    if (typeof tc === "string") {
+      setupError = `toolchain: ${tc}`;
+      return;
+    }
+    try {
+      const { model, mismatches } = await extractModel(config);
+      if (mismatches.length > 0) {
+        setupError = mismatches.map(formatMismatch).join("\n");
+        return;
+      }
+      dir = mkdtempSync(path.join(os.tmpdir(), "header-check-layout-"));
+      const files = generate("layout-tests", model);
+      for (const file of files) {
+        const target = path.join(dir, ...file.path.split("/"));
+        mkdirSync(path.dirname(target), { recursive: true });
+        writeFileSync(target, file.text);
+      }
+      const units = compileUnits(model, config.root, dir, files);
+      const done = await runJobs(compileJobs(tc, await msvcEnvs(tc, units), units));
+      for (const result of done) {
+        const library = path.basename(result.job.cwd);
+        const list = results.get(library) ?? [];
+        list.push(result);
+        results.set(library, list);
+      }
+    } catch (e) {
+      setupError = (e as Error).message;
+    }
+  });
+
+  after(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  for (const library of config.libraries) {
+    test(`${library.name} layout`, () => {
+      assert.equal(setupError, undefined, setupError);
+      const list = results.get(library.name) ?? [];
+      assert.ok(list.length > 0, "no compile jobs ran");
+      const failures = report(list);
+      if (failures) assert.fail(failures);
+    });
   }
 });

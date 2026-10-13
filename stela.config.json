@@ -1,5 +1,6 @@
 {
   "schema": "stela.config/1",
+  "targets": ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc", "aarch64-pc-windows-msvc"],
   "libraries": [
     {
       "name": "sbox",
@@ -20,6 +21,7 @@
       "prefix": "jsi",
       "macroPrefix": "JSI_ABI",
       "headers": ["src/jsi_abi/jsi_abi.h"],
+      "includeDirs": ["src"],
       "stelaHeader": "src/jsi_abi/jsi_abi_stela.h"
     },
     {

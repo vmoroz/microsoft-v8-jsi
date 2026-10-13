@@ -1131,6 +1131,59 @@ static void append_annotations(Buffer *buffer, CXCursor cursor) {
 
 static void append_type(Buffer *buffer, CXType type, CXCursor cursor);
 
+typedef struct {
+  Buffer *buffer;
+  bool first;
+} FieldsContext;
+
+typedef struct {
+  Buffer *buffer;
+  bool first;
+  bool unsigned_values;
+} EnumeratorsContext;
+
+static enum CXChildVisitResult append_field_visitor(
+    CXCursor cursor, CXCursor parent, CXClientData client_data);
+static enum CXChildVisitResult append_enumerator_visitor(
+    CXCursor cursor, CXCursor parent, CXClientData client_data);
+static bool enum_type_is_unsigned(CXType type);
+
+/*
+ * A struct, union, or enum with neither a tag nor a typedef name has no name
+ * C code can spell; Clang's spelling holds its absolute path. Such a type is
+ * written inline instead: its fields, or its integer type and enumerators.
+ */
+static bool append_anonymous_type(Buffer *buffer, CXType type) {
+  CXCursor declaration = clang_getTypeDeclaration(type);
+  enum CXCursorKind kind = clang_getCursorKind(declaration);
+  if (kind != CXCursor_StructDecl && kind != CXCursor_UnionDecl && kind != CXCursor_EnumDecl) {
+    return false;
+  }
+  if (clang_Cursor_isAnonymous(declaration) == 0) {
+    return false;
+  }
+  if (kind == CXCursor_EnumDecl) {
+    CXType underlying = clang_getEnumDeclIntegerType(declaration);
+    EnumeratorsContext enumerators;
+    enumerators.buffer = buffer;
+    enumerators.first = true;
+    enumerators.unsigned_values = enum_type_is_unsigned(underlying);
+    buffer_append(buffer, "{\"enum\": {\"type\": ");
+    append_type(buffer, underlying, clang_getNullCursor());
+    buffer_append(buffer, ", \"enumerators\": [");
+    clang_visitChildren(declaration, append_enumerator_visitor, &enumerators);
+  } else {
+    FieldsContext fields;
+    fields.buffer = buffer;
+    fields.first = true;
+    buffer_append(
+        buffer, kind == CXCursor_StructDecl ? "{\"struct\": {\"fields\": [" : "{\"union\": {\"fields\": [");
+    clang_visitChildren(declaration, append_field_visitor, &fields);
+  }
+  buffer_append(buffer, "]}");
+  return true;
+}
+
 static void append_parameter(
     Buffer *buffer, CXType type, CXCursor cursor, const char *fallback_name) {
   char *name = NULL;
@@ -1198,8 +1251,8 @@ static void append_type(Buffer *buffer, CXType type, CXCursor cursor) {
   } else if (builtin != NULL) {
     buffer_append(buffer, "{\"builtin\": ");
     append_json_string(buffer, builtin);
-  } else {
-    spelling = take_cx_string(clang_getTypeSpelling(type));
+  } else if (!append_anonymous_type(buffer, type)) {
+    spelling = take_cx_string(clang_getTypeSpelling(clang_getUnqualifiedType(type)));
     if (strncmp(spelling, "struct ", 7) == 0) {
       memmove(spelling, spelling + 7, strlen(spelling + 7) + 1);
     } else if (strncmp(spelling, "union ", 6) == 0) {
@@ -1340,11 +1393,6 @@ static CXType effective_function_type(CXType type) {
   return type;
 }
 
-typedef struct {
-  Buffer *buffer;
-  bool first;
-} FieldsContext;
-
 static enum CXChildVisitResult append_field_visitor(
     CXCursor cursor, CXCursor parent, CXClientData client_data) {
   FieldsContext *context = (FieldsContext *)client_data;
@@ -1402,12 +1450,6 @@ static enum CXChildVisitResult append_offset_visitor(
   }
   return CXChildVisit_Continue;
 }
-
-typedef struct {
-  Buffer *buffer;
-  bool first;
-  bool unsigned_values;
-} EnumeratorsContext;
 
 static enum CXChildVisitResult append_enumerator_visitor(
     CXCursor cursor, CXCursor parent, CXClientData client_data) {
@@ -1518,6 +1560,18 @@ static void append_typedef_declaration(
   buffer_append(buffer, "}\n        }\n      }");
 }
 
+/*
+ * "typedef struct { ... } name;" gives the record the typedef's name, but C
+ * code can't spell its type "struct name". Clang's USR marks such a record
+ * ("c:@SA@name", "c:@UA@name"), however macros spell the declaration.
+ */
+static bool is_tagless_record(CXCursor cursor) {
+  char *usr = take_cx_string(clang_getCursorUSR(cursor));
+  bool tagless = strncmp(usr, "c:@SA@", 6) == 0 || strncmp(usr, "c:@UA@", 6) == 0;
+  free(usr);
+  return tagless;
+}
+
 static void append_record_declaration(
     Buffer *buffer,
     const Options *options,
@@ -1527,6 +1581,9 @@ static void append_record_declaration(
   FieldsContext fields;
   OffsetsContext offsets;
   append_common_declaration(buffer, options, declaration, kind);
+  if (is_tagless_record(declaration->cursor)) {
+    buffer_append(buffer, ",\n        \"tagless\": true");
+  }
   buffer_append(buffer, ",\n        \"fields\": [");
   fields.buffer = buffer;
   fields.first = true;

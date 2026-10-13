@@ -105,8 +105,60 @@
             },
             "const": {"const": true}
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["struct"],
+          "description": "A struct with neither a tag nor a typedef name, written inline.",
+          "properties": {
+            "struct": {"$ref": "#/$defs/inlineRecord"},
+            "const": {"const": true}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["union"],
+          "description": "A union with neither a tag nor a typedef name, written inline.",
+          "properties": {
+            "union": {"$ref": "#/$defs/inlineRecord"},
+            "const": {"const": true}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enum"],
+          "description": "An enum with neither a tag nor a typedef name, written inline.",
+          "properties": {
+            "enum": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type", "enumerators"],
+              "properties": {
+                "type": {"$ref": "#/$defs/type"},
+                "enumerators": {
+                  "type": "array",
+                  "items": {"$ref": "#/$defs/enumerator"}
+                }
+              }
+            },
+            "const": {"const": true}
+          }
         }
       ]
+    },
+    "inlineRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fields"],
+      "properties": {
+        "fields": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/field"}
+        }
+      }
     },
     "parameter": {
       "type": "object",
@@ -189,6 +241,10 @@
         },
         "variadic": {"type": "boolean"},
         "type": {"$ref": "#/$defs/type"},
+        "tagless": {
+          "const": true,
+          "description": "A struct or union defined without a tag (typedef struct { ... } name;); C can't spell it `struct name`."
+        },
         "fields": {
           "type": "array",
           "items": {"$ref": "#/$defs/field"}

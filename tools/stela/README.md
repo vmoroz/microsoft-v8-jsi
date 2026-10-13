@@ -1,12 +1,12 @@
 # Stela
 
 Stela checks C ABI headers. It currently provides the annotation vocabulary,
-the native extractor, and `stela vendor`. Later stages add model merging, lint
-rules, ABI diff, generators, and manifests embedded in binaries. It incubates
-here with no dependency on v8-jsi code, so it can move to its own repository
-unchanged.
+the native extractor, `stela vendor`, the merged `stela.model/1`, and the
+header-test and layout-test generators. Later stages add lint rules, ABI diff,
+more generators, and manifests embedded in binaries. It incubates here with no
+dependency on v8-jsi code, so it can move to its own repository unchanged.
 
-Status: stage S2, the native extractor and `stela.raw/1`.
+Status: stage S3, the CLI, the model, and the test generators.
 
 ## Requirements
 
@@ -64,13 +64,56 @@ regenerate.
 ```powershell
 node tools\stela\src\stela.ts vendor            # write each library's <lib>_stela.h
 node tools\stela\src\stela.ts vendor --check    # exit 1 if any file is missing or stale
+node tools\stela\src\stela.ts extract           # write out\stela\stela.model.json
+node tools\stela\src\stela.ts gen layout-tests --out out\stela\tests
 ```
 
 Options: `--config <file>` (default `stela.config.json` in the current
-directory) and `--template <file>` (default `include/stela.h`). Paths in the
-configuration are relative to the configuration file.
+directory), `--template <file>` (`vendor`; default `include/stela.h`),
+`--out <file>` (`extract`; default `out/stela/<config name>.model.json` next to
+the configuration), and `--model <file>` (`gen`; default the `extract`
+output). Paths in the configuration are relative to the configuration file.
+Every command writes a file only when its content changes.
 
-Exit codes: 0 success, 1 out-of-date files, 2 usage or configuration errors.
+Exit codes: 0 success; 1 check failures (out-of-date files, a declaration that
+differs between targets); 2 usage, configuration, or tool errors.
+
+## The model (`stela.model/1`)
+
+`stela extract` runs the extractor for every library on each of its targets,
+in parallel, and merges the results. Facts that must agree on every target
+(types, fields, enumerators, documentation, annotations) appear once; sizes,
+alignments, offsets, and enumerator values go under `perTarget`. A declaration
+missing on some targets lists the ones it has in `targets`. Any other
+difference between targets is an error: `extract` prints the first differing
+path for each declaration, exits 1, and writes nothing.
+
+Declarations keep source order. Keys have a fixed order and the JSON is
+compact (a container that fits in 100 columns stays on one line), so the same
+headers always give the same bytes. Opaque records carry `incomplete: true`
+and no layout; a record defined without a tag carries `tagless: true`. A field
+whose type has neither a tag nor a typedef name (`union { … } data;`) carries
+that type inline, as `{"union": {"fields": [...]}}`, so no absolute path from
+Clang's spelling reaches the model.
+[`schema/stela.model.schema.json`](schema/stela.model.schema.json) describes
+the format.
+
+## Generators
+
+`stela gen <generator> --out <dir>` writes one directory per library:
+
+- `header-tests`: `<header>.header.c` and `.cpp` per entry header. Each
+  defines the library's defines and includes its header alone, twice, to check
+  the include guard.
+- `layout-tests`: `layout.c` and `layout.cpp`. Static asserts of each record's
+  size, alignment, and field offsets (except bit-fields and anonymous members),
+  each object typedef's size and alignment, and each enumerator's value. Layout
+  checks are grouped by target under the compiler's architecture macros.
+
+Both compile with clang (`-ffreestanding -nostdlibinc`, warnings as errors)
+and MSVC (`/W4 /WX`) for each target, as C and C++. Header tests keep the
+C99 floor; layout tests need C11 for `_Static_assert`. v8-jsi runs the layout
+tests in `scripts/header-check.ts`.
 
 ## Configuration (`stela.config.json`)
 
@@ -95,8 +138,17 @@ Exit codes: 0 success, 1 out-of-date files, 2 usage or configuration errors.
 - `stelaNames` gives one annotation a longer name if it clashes with a library
   macro that can't change: `{ "DEPRECATED": "V8HOST_STELA_DEPRECATED" }`.
 - `status` names the library's status type (default `<prefix>_status`).
-- `targets`, `includeDirs`, `owns`, `defines`, `lint`, and `diff` are reserved
-  for later stages and accepted now.
+- `targets` (top level) lists every target the model covers, as clang
+  triples; a library's own `targets` narrows it to a subset, in the same
+  order.
+- `includeDirs` lists include directories as a consumer sets them (the
+  generated tests spell each `#include` relative to the first one that holds
+  the header); `owns` lists the files or directories whose declarations belong
+  to the library (default: the entry headers); `defines` are `NAME` or
+  `NAME=VALUE`.
+- `lint` and `diff` are reserved for later stages and accepted now.
+- [`schema/stela.config.schema.json`](schema/stela.config.schema.json)
+  describes the format.
 
 ## Tests
 

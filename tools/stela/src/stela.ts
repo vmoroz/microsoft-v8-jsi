@@ -2,11 +2,14 @@
 // The Stela CLI. Run with Node.js 24+: node tools/stela/src/stela.ts <command>.
 // Exit codes: 0 success; 1 check failures; 2 usage or tool errors.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig } from "./config.ts";
 import { StelaError } from "./errors.ts";
+import { extractModel } from "./extract.ts";
+import { GENERATORS, generate } from "./generators.ts";
+import { defaultModelPath, formatMismatch, readModel, serializeModel } from "./model.ts";
 import { generateLibraryHeader, normalizeText, parseTemplate } from "./vendor.ts";
 
 export const DEFAULT_TEMPLATE = path.join(import.meta.dirname, "..", "include", "stela.h");
@@ -18,6 +21,15 @@ commands:
              --config <file>    default: stela.config.json
              --template <file>  default: tools/stela/include/stela.h
              --check            report out-of-date files instead of writing
+  extract  extract every library for every target and merge stela.model/1
+             --config <file>    default: stela.config.json
+             --out <file>       default: out/stela/<config name>.model.json
+  gen      <generator> --out <dir>   generators: ${GENERATORS.join(", ")}
+             --model <file>     default: the extract default for --config
+             --config <file>    default: stela.config.json
+
+exit codes: 0 success; 1 check failures (stale files, target mismatches);
+            2 usage or tool errors
 `;
 
 interface Io {
@@ -86,12 +98,78 @@ function vendor(argv: string[], io: Io): number {
   return 0;
 }
 
-export function main(argv: string[], io: Io): number {
+/** Writes `text` only when the bytes differ; replaces an existing file atomically. */
+function writeIfChanged(file: string, text: string): "wrote" | "unchanged" {
+  const bytes = Buffer.from(text, "utf8");
+  if (existsSync(file) && readFileSync(file).equals(bytes)) return "unchanged";
+  mkdirSync(path.dirname(file), { recursive: true });
+  const temp = `${file}.${process.pid}.tmp`;
+  writeFileSync(temp, bytes);
+  renameSync(temp, file);
+  return "wrote";
+}
+
+async function extract(argv: string[], io: Io): Promise<number> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      config: { type: "string", default: "stela.config.json" },
+      out: { type: "string" },
+    },
+    strict: true,
+    allowPositionals: false,
+  });
+  const config = loadConfig(values.config as string);
+  const out = path.resolve(values.out ?? defaultModelPath(config.file));
+  const { model, mismatches } = await extractModel(config);
+  if (mismatches.length > 0) {
+    for (const m of mismatches) io.err(formatMismatch(m));
+    io.err(`${mismatches.length} declaration(s) differ between targets; no model written`);
+    return 1;
+  }
+  const status = writeIfChanged(out, serializeModel(model));
+  const count = model.libraries.reduce((n, l) => n + l.declarations.length, 0);
+  io.out(
+    `${`${status}:`.padEnd(11)}${display(process.cwd(), out)} ` +
+      `(${model.libraries.length} libraries, ${model.targets.length} targets, ${count} declarations)`,
+  );
+  return 0;
+}
+
+function gen(argv: string[], io: Io): number {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      model: { type: "string" },
+      config: { type: "string", default: "stela.config.json" },
+      out: { type: "string" },
+    },
+    strict: true,
+    allowPositionals: true,
+  });
+  if (positionals.length !== 1) throw new StelaError(`gen takes one generator: ${GENERATORS.join(", ")}`);
+  if (values.out === undefined) throw new StelaError("gen needs --out <dir>");
+  const modelFile = values.model ?? defaultModelPath(values.config as string);
+  const files = generate(positionals[0], readModel(modelFile));
+  const outDir = path.resolve(values.out);
+  for (const file of files) {
+    const target = path.join(outDir, ...file.path.split("/"));
+    const status = writeIfChanged(target, file.text);
+    io.out(`${`${status}:`.padEnd(11)}${display(process.cwd(), target)}`);
+  }
+  return 0;
+}
+
+export async function main(argv: string[], io: Io): Promise<number> {
   const [command, ...rest] = argv;
   try {
     switch (command) {
       case "vendor":
         return vendor(rest, io);
+      case "extract":
+        return await extract(rest, io);
+      case "gen":
+        return gen(rest, io);
       case undefined:
       case "help":
       case "--help":
@@ -112,7 +190,7 @@ export function main(argv: string[], io: Io): number {
 }
 
 if (import.meta.main) {
-  process.exitCode = main(process.argv.slice(2), {
+  process.exitCode = await main(process.argv.slice(2), {
     out: (line) => process.stdout.write(line + "\n"),
     err: (line) => process.stderr.write(line + "\n"),
   });

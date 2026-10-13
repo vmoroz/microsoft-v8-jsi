@@ -208,6 +208,9 @@ The public C ABI headers have a compile gate: `node --test
 scripts/header-check.ts` compiles each one on its own as C and C++ with MSVC
 and VS clang, warnings as errors, for x64, x86, and arm64. A header that hasn't
 migrated to the C ABI conventions yet is marked `pending` there and reports
-without failing. `tools/stela/` holds Stela, the C ABI header tool;
+without failing. The same gate runs Stela's generated layout tests, which check
+each library's struct layouts and enumerator values on every target.
+`tools/stela/` holds Stela, the C ABI header tool;
 `node tools/stela/src/stela.ts vendor --check` verifies the generated
-`<lib>_stela.h` files (see `tools/stela/README.md`).
+`<lib>_stela.h` files, and `stela.ts extract` writes the merged API model to
+`out/stela/stela.model.json` (see `tools/stela/README.md`).
