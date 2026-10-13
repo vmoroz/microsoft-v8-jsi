@@ -1,5 +1,4 @@
-// Loads and validates stela.config.json (Stela design §8.2). The `lint` and
-// `diff` sections are accepted but not interpreted yet.
+// Loads and validates stela.config.json (Stela design §8.2).
 
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -28,6 +27,14 @@ export interface LibraryConfig {
   readonly targets: readonly string[];
 }
 
+export type LintSeverity = "error" | "warning" | "info" | "off";
+
+export interface LintConfig {
+  readonly rules: Readonly<Record<string, LintSeverity>>;
+  /** Integer macros that the macro_constants rule permits. */
+  readonly macroConstants: readonly string[];
+}
+
 export interface StelaConfig {
   /** Absolute path of the config file. */
   readonly file: string;
@@ -36,6 +43,7 @@ export interface StelaConfig {
   /** The global target list, in order. Empty when the config sets none. */
   readonly targets: readonly string[];
   readonly libraries: readonly LibraryConfig[];
+  readonly lint: LintConfig;
 }
 
 const TOP_LEVEL_KEYS = new Set(["$schema", "schema", "targets", "libraries", "lint", "diff"]);
@@ -56,6 +64,8 @@ const LOWER_SNAKE_RE = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
 const UPPER_SNAKE_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$/;
 const TARGET_RE = /^[a-z0-9_]+(?:-[a-z0-9_.]+)+$/;
 const DEFINE_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/;
+const LINT_KEYS = new Set(["rules", "macroConstants"]);
+const LINT_SEVERITIES = new Set<LintSeverity>(["error", "warning", "info", "off"]);
 
 function targetList(value: unknown, where: string): string[] {
   const list = stringList(value, where);
@@ -76,6 +86,33 @@ function stringList(value: unknown, where: string): string[] {
     throw new StelaError(`${where} must be an array of non-empty strings`);
   }
   return value as string[];
+}
+
+function lintConfig(value: unknown, where: string): LintConfig {
+  if (value === undefined) return { rules: {}, macroConstants: [] };
+  if (!isObject(value)) throw new StelaError(`${where} must be an object`);
+  for (const key of Object.keys(value)) {
+    if (!LINT_KEYS.has(key)) throw new StelaError(`${where}: unknown key "${key}"`);
+  }
+  const rules: Record<string, LintSeverity> = {};
+  if (value.rules !== undefined) {
+    if (!isObject(value.rules)) throw new StelaError(`${where}.rules must be an object`);
+    for (const [rule, severity] of Object.entries(value.rules)) {
+      if (!/^[a-z][a-z0-9_]*$/.test(rule) || !LINT_SEVERITIES.has(severity as LintSeverity)) {
+        throw new StelaError(
+          `${where}.rules.${rule} must be "error", "warning", "info", or "off"`,
+        );
+      }
+      rules[rule] = severity as LintSeverity;
+    }
+  }
+  const macroConstants = stringList(value.macroConstants, `${where}.macroConstants`);
+  for (const name of macroConstants) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(name)) {
+      throw new StelaError(`${where}.macroConstants has a bad macro name "${name}"`);
+    }
+  }
+  return { rules, macroConstants };
 }
 
 export function parseConfig(json: unknown, file: string): StelaConfig {
@@ -197,7 +234,13 @@ export function parseConfig(json: unknown, file: string): StelaConfig {
   });
   // Without a global list, the model's targets are the libraries' own, in order.
   const targets = globalTargets.length > 0 ? globalTargets : [...new Set(libraries.flatMap((l) => l.targets))];
-  return { file: path.resolve(file), root, targets, libraries };
+  return {
+    file: path.resolve(file),
+    root,
+    targets,
+    libraries,
+    lint: lintConfig(json.lint, `${file}: "lint"`),
+  };
 }
 
 export function loadConfig(file: string): StelaConfig {

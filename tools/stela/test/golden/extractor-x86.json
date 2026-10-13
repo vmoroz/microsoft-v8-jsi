@@ -100,7 +100,7 @@
         "name": "probe_status",
         "location": {"file": "probe.h", "line": 26, "column": 1},
         "doc": "A fixed-width status.",
-        "annotations": [],
+        "annotations": [{"key": "enum", "value": "probe_status"}],
         "type": {"name": "int32_t"},
         "enumerators": [{"name": "probe_status_ok", "value": 0, "doc": null}, {"name": "probe_status_failed", "value": 28673, "doc": "An unexpected failure."}],
         "perTarget": {

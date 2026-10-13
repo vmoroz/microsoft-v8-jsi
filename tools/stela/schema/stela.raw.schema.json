@@ -210,6 +210,11 @@
           "type": "array",
           "items": {"type": "integer"}
         },
+        "fieldCallingConventions": {
+          "type": "array",
+          "items": {"type": ["string", "null"]},
+          "description": "Effective calling convention for each function-pointer field; null for other fields."
+        },
         "callingConvention": {"type": "string"},
         "value": {"type": "string", "pattern": "^-?[0-9]+$"}
       }

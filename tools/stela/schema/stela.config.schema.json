@@ -18,7 +18,7 @@
       "minItems": 1,
       "items": {"$ref": "#/$defs/library"}
     },
-    "lint": {"type": "object", "description": "Reserved for stela lint (S4)."},
+    "lint": {"$ref": "#/$defs/lint"},
     "diff": {"type": "object", "description": "Reserved for stela diff (S5)."}
   },
   "$defs": {
@@ -32,6 +32,25 @@
       "type": "array",
       "uniqueItems": true,
       "items": {"type": "string", "pattern": "^[a-z0-9_]+(?:-[a-z0-9_.]+)+$"}
+    },
+    "lint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rules": {
+          "type": "object",
+          "additionalProperties": {
+            "enum": ["error", "warning", "info", "off"]
+          },
+          "description": "Per-rule severity overrides."
+        },
+        "macroConstants": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$"},
+          "description": "Integer macros allowed by the macro_constants rule."
+        }
+      }
     },
     "library": {
       "type": "object",

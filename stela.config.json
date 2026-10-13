@@ -1,6 +1,9 @@
 {
   "schema": "stela.config/1",
   "targets": ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc", "aarch64-pc-windows-msvc"],
+  "lint": {
+    "macroConstants": ["JSI_ABI_POINTER_MASK"]
+  },
   "libraries": [
     {
       "name": "sbox",

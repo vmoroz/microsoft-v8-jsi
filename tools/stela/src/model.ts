@@ -17,11 +17,23 @@ export type JsonObject = { [key: string]: Json };
 
 export interface TypeNode extends JsonObject {}
 
+export interface Annotation {
+  key: string;
+  value?: string;
+}
+
+export interface Parameter {
+  name: string;
+  type: TypeNode;
+  annotations: Annotation[];
+}
+
 export interface TargetFacts {
   canonicalType?: TypeNode;
   size?: number;
   align?: number;
   offsets?: number[];
+  fieldCallingConventions?: (string | null)[];
   callingConvention?: string;
   value?: string;
 }
@@ -29,18 +41,26 @@ export interface TargetFacts {
 export interface Field {
   name: string;
   type: TypeNode;
+  annotations: Annotation[];
+  doc: string | null;
   bitWidth?: number;
 }
 
 export interface Enumerator {
   name: string;
   value: number;
+  doc: string | null;
 }
 
 export interface Declaration {
   kind: "function" | "typedef" | "struct" | "union" | "enum" | "macro";
   name: string;
   location: { file: string; line: number; column: number };
+  doc: string | null;
+  annotations: Annotation[];
+  result?: { type: TypeNode };
+  params?: Parameter[];
+  variadic?: boolean;
   type?: TypeNode;
   fields?: Field[];
   enumerators?: Enumerator[];
@@ -48,6 +68,8 @@ export interface Declaration {
   tagless?: true;
   /** A struct or union declared without a definition (an opaque handle's target). */
   incomplete?: true;
+  functionLike?: boolean;
+  replacement?: string[];
   /** Present only when the declaration exists on some of the library's targets. */
   targets?: string[];
   perTarget?: Record<string, TargetFacts>;
@@ -192,6 +214,7 @@ const SHAPES: Record<Shape, readonly (readonly [string, Child])[]> = {
     ["size", "scalar"],
     ["align", "scalar"],
     ["offsets", "scalar[]"],
+    ["fieldCallingConventions", "scalar[]"],
     ["callingConvention", "scalar"],
     ["value", "scalar"],
   ],

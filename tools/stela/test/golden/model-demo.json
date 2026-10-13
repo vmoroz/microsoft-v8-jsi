@@ -77,7 +77,7 @@
           "name": "demo_status",
           "location": {"file": "include/demo.h", "line": 18, "column": 1},
           "doc": "Status codes.",
-          "annotations": [],
+          "annotations": [{"key": "enum", "value": "demo_status"}],
           "type": {"name": "int32_t"},
           "enumerators": [
             {"name": "demo_status_ok", "value": 0, "doc": null},

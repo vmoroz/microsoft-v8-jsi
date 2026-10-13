@@ -9,6 +9,7 @@ import { loadConfig } from "./config.ts";
 import { StelaError } from "./errors.ts";
 import { extractModel } from "./extract.ts";
 import { GENERATORS, generate } from "./generators.ts";
+import { formatFindings, lintModel } from "./lint.ts";
 import { defaultModelPath, formatMismatch, readModel, serializeModel } from "./model.ts";
 import { generateLibraryHeader, normalizeText, parseTemplate } from "./vendor.ts";
 
@@ -24,6 +25,11 @@ commands:
   extract  extract every library for every target and merge stela.model/1
              --config <file>    default: stela.config.json
              --out <file>       default: out/stela/<config name>.model.json
+  lint     check a stela.model/1 against the C ABI conventions
+             --config <file>    default: stela.config.json
+             --model <file>     default: the extract default for --config
+             --format <format>  text (default) or json
+             --report-only      report errors without failing
   gen      <generator> --out <dir>   generators: ${GENERATORS.join(", ")}
              --model <file>     default: the extract default for --config
              --config <file>    default: stela.config.json
@@ -160,6 +166,37 @@ function gen(argv: string[], io: Io): number {
   return 0;
 }
 
+function lint(argv: string[], io: Io): number {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      model: { type: "string" },
+      config: { type: "string", default: "stela.config.json" },
+      format: { type: "string", default: "text" },
+      "report-only": { type: "boolean", default: false },
+    },
+    strict: true,
+    allowPositionals: false,
+  });
+  if (values.format !== "text" && values.format !== "json") {
+    throw new StelaError('lint --format must be "text" or "json"');
+  }
+  const config = loadConfig(values.config as string);
+  const modelFile = path.resolve(values.model ?? defaultModelPath(config.file));
+  const findings = lintModel(readModel(modelFile), config);
+  const text = formatFindings(findings, values.format);
+  if (text !== "") io.out(text);
+  if (values.format === "text") {
+    const counts = { error: 0, warning: 0, info: 0 };
+    for (const finding of findings) counts[finding.severity]++;
+    io.out(
+      `${findings.length} finding(s): ${counts.error} error(s), ` +
+        `${counts.warning} warning(s), ${counts.info} info`,
+    );
+  }
+  return values["report-only"] || !findings.some((f) => f.severity === "error") ? 0 : 1;
+}
+
 export async function main(argv: string[], io: Io): Promise<number> {
   const [command, ...rest] = argv;
   try {
@@ -168,6 +205,8 @@ export async function main(argv: string[], io: Io): Promise<number> {
         return vendor(rest, io);
       case "extract":
         return await extract(rest, io);
+      case "lint":
+        return lint(rest, io);
       case "gen":
         return gen(rest, io);
       case undefined:

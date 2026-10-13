@@ -32,9 +32,9 @@
 #undef STELA_FLAGS
 #if STELA_FIXED_ENUMS_
 #define STELA_ENUM(type, name) \
-  enum name : type;            \
-  typedef enum name name;      \
-  enum name : type
+  enum name : type;                                  \
+  typedef enum name name;                            \
+  enum STELA_ANNOTATE_("enum=" #name) name : type
 #define STELA_FLAGS(type, name) \
   typedef type name;            \
   enum STELA_ANNOTATE_("flags=" #name) : type

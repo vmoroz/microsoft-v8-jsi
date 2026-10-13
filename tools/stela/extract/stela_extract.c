@@ -1412,7 +1412,7 @@ static enum CXChildVisitResult append_field_visitor(
   append_json_string(context->buffer, name);
   free(name);
   buffer_append(context->buffer, ", \"type\": ");
-  append_type(context->buffer, type, clang_getNullCursor());
+  append_type(context->buffer, type, cursor);
   buffer_append(context->buffer, ", \"annotations\": ");
   append_annotations(context->buffer, cursor);
   buffer_append(context->buffer, ", \"doc\": ");
@@ -1447,6 +1447,54 @@ static enum CXChildVisitResult append_offset_visitor(
     buffer_append_signed(context->buffer, bits);
   } else {
     buffer_append_signed(context->buffer, bits / 8);
+  }
+  return CXChildVisit_Continue;
+}
+
+typedef struct {
+  Buffer *buffer;
+  bool first;
+} FieldCallingConventionsContext;
+
+static enum CXChildVisitResult find_function_field_visitor(
+    CXCursor cursor, CXCursor parent, CXClientData client_data) {
+  bool *found = (bool *)client_data;
+  CXType function_type;
+  (void)parent;
+  if (clang_getCursorKind(cursor) != CXCursor_FieldDecl) {
+    return CXChildVisit_Continue;
+  }
+  function_type = effective_function_type(clang_getCursorType(cursor));
+  if (function_type.kind == CXType_FunctionProto ||
+      function_type.kind == CXType_FunctionNoProto) {
+    *found = true;
+    return CXChildVisit_Break;
+  }
+  return CXChildVisit_Continue;
+}
+
+static enum CXChildVisitResult append_field_calling_convention_visitor(
+    CXCursor cursor, CXCursor parent, CXClientData client_data) {
+  FieldCallingConventionsContext *context =
+      (FieldCallingConventionsContext *)client_data;
+  CXType function_type;
+  (void)parent;
+  if (clang_getCursorKind(cursor) != CXCursor_FieldDecl) {
+    return CXChildVisit_Continue;
+  }
+  if (!context->first) {
+    buffer_append(context->buffer, ", ");
+  }
+  context->first = false;
+  function_type = effective_function_type(clang_getCursorType(cursor));
+  if (function_type.kind == CXType_FunctionProto ||
+      function_type.kind == CXType_FunctionNoProto) {
+    append_json_string(
+        context->buffer,
+        calling_convention_name(
+            clang_getFunctionTypeCallingConv(function_type)));
+  } else {
+    buffer_append(context->buffer, "null");
   }
   return CXChildVisit_Continue;
 }
@@ -1580,6 +1628,8 @@ static void append_record_declaration(
   CXType type = clang_getCursorType(declaration->cursor);
   FieldsContext fields;
   OffsetsContext offsets;
+  FieldCallingConventionsContext field_calling_conventions;
+  bool has_function_field = false;
   append_common_declaration(buffer, options, declaration, kind);
   if (is_tagless_record(declaration->cursor)) {
     buffer_append(buffer, ",\n        \"tagless\": true");
@@ -1598,6 +1648,19 @@ static void append_record_declaration(
   offsets.buffer = buffer;
   offsets.first = true;
   clang_visitChildren(declaration->cursor, append_offset_visitor, &offsets);
+  clang_visitChildren(
+      declaration->cursor,
+      find_function_field_visitor,
+      &has_function_field);
+  if (has_function_field) {
+    buffer_append(buffer, "], \"fieldCallingConventions\": [");
+    field_calling_conventions.buffer = buffer;
+    field_calling_conventions.first = true;
+    clang_visitChildren(
+        declaration->cursor,
+        append_field_calling_convention_visitor,
+        &field_calling_conventions);
+  }
   buffer_append(buffer, "]}\n        }\n      }");
 }
 

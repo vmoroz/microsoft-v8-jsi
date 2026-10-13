@@ -116,6 +116,7 @@ const MSVC_ARCHS: MsvcArch[] = ["x64", "x86", "arm64"];
 
 // What extractor mode must see in the AST, per fixture.
 const ALPHA_ANNOTATIONS: Record<string, number> = {
+  "stela:enum=alpha_status": 1,
   "stela:flags=alpha_flags": 1,
   "stela:nullable": 5,
   "stela:transfer=none": 1,
@@ -140,6 +141,7 @@ const ALPHA_ANNOTATIONS: Record<string, number> = {
   "stela:scope=call": 1,
 };
 const BETA_ANNOTATIONS: Record<string, number> = {
+  "stela:enum=beta_status": 1,
   "stela:flags=beta_open_flags": 1,
   "stela:since=2": 1,
   "stela:thread=any": 1,
@@ -291,10 +293,14 @@ describe("generated headers compile", () => {
         assert.deepEqual(counts, {}, r.job.label);
         continue;
       }
-      // The C fallback (C11) has no fixed enums, so the flags annotation and
-      // the enum names exist only with fixed enums (C++ and C23).
+      // The C fallback (C11) has no fixed enums, so enum provenance
+      // annotations and enum names exist only with fixed enums (C++ and C23).
       const want = { ...expected[tu] };
-      if (std === "c11") for (const k of Object.keys(want)) if (k.startsWith("stela:flags=")) delete want[k];
+      if (std === "c11") {
+        for (const k of Object.keys(want)) {
+          if (k.startsWith("stela:enum=") || k.startsWith("stela:flags=")) delete want[k];
+        }
+      }
       assert.deepEqual(counts, want, r.job.label);
       if (std !== "c11") {
         assert.match(r.output, /EnumDecl\b[^\n]* alpha_status 'int32_t'/, r.job.label);

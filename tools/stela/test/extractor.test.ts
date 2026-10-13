@@ -105,6 +105,39 @@ test("different absolute roots produce byte-identical output", async (t) => {
   assert.equal(await extract(first, targets[0][1]), await extract(second, targets[0][1]));
 });
 
+test("record facts include function-pointer field calling conventions", async (t) => {
+  if (unavailable) return t.skip(unavailable);
+  const root = tempDir(t, "extract-field-cdecl");
+  const header = path.join(root, "slots.h");
+  const out = path.join(root, "slots.json");
+  writeFileSync(
+    header,
+    "typedef struct probe_api {\n" +
+      "  void (__cdecl *run)(void *user_data);\n" +
+      "  void *state;\n" +
+      "} probe_api;\n",
+  );
+  await runExtractor({
+    target: "i686-pc-windows-msvc",
+    root,
+    out,
+    headers: [header],
+  });
+  const raw = JSON.parse(readFileSync(out, "utf8"));
+  const record = raw.declarations.find(
+    (declaration: { kind: string; name: string }) =>
+      declaration.kind === "struct" && declaration.name === "probe_api",
+  );
+  assert.deepEqual(
+    record.perTarget["i686-pc-windows-msvc"].fieldCallingConventions,
+    ["c", null],
+  );
+  assert.equal(
+    record.fields[0].type.pointer.function.params[0].name,
+    "user_data",
+  );
+});
+
 test("parse errors return 2 and do not replace an existing model", async (t) => {
   if (unavailable) return t.skip(unavailable);
   const root = prepareFixture(t, "extract-error");

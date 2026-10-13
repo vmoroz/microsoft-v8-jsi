@@ -1,12 +1,12 @@
 # Stela
 
 Stela checks C ABI headers. It currently provides the annotation vocabulary,
-the native extractor, `stela vendor`, the merged `stela.model/1`, and the
-header-test and layout-test generators. Later stages add lint rules, ABI diff,
-more generators, and manifests embedded in binaries. It incubates here with no
+the native extractor, `stela vendor`, the merged `stela.model/1`, the
+header-test and layout-test generators, and C ABI convention lint. Later stages
+add ABI diff, more generators, and manifests embedded in binaries. It incubates here with no
 dependency on v8-jsi code, so it can move to its own repository unchanged.
 
-Status: stage S3, the CLI, the model, and the test generators.
+Status: stage S4, lint.
 
 ## Requirements
 
@@ -65,18 +65,35 @@ regenerate.
 node tools\stela\src\stela.ts vendor            # write each library's <lib>_stela.h
 node tools\stela\src\stela.ts vendor --check    # exit 1 if any file is missing or stale
 node tools\stela\src\stela.ts extract           # write out\stela\stela.model.json
+node tools\stela\src\stela.ts lint              # check the extracted model
+node tools\stela\src\stela.ts lint --report-only # report without failing
 node tools\stela\src\stela.ts gen layout-tests --out out\stela\tests
 ```
 
 Options: `--config <file>` (default `stela.config.json` in the current
 directory), `--template <file>` (`vendor`; default `include/stela.h`),
 `--out <file>` (`extract`; default `out/stela/<config name>.model.json` next to
-the configuration), and `--model <file>` (`gen`; default the `extract`
-output). Paths in the configuration are relative to the configuration file.
-Every command writes a file only when its content changes.
+the configuration), and `--model <file>` (`lint` and `gen`; default the `extract` output), and
+`--format text|json` (`lint`). Paths in the configuration are relative to the
+configuration file. Every command writes a file only when its content changes.
 
-Exit codes: 0 success; 1 check failures (out-of-date files, a declaration that
-differs between targets); 2 usage, configuration, or tool errors.
+Exit codes: 0 success; 1 check failures (lint errors, out-of-date files, or a
+declaration that differs between targets); 2 usage, configuration, or tool
+errors. `lint --report-only` reports errors but exits 0.
+
+## Lint
+
+`stela lint` applies the v1 rules from the Stela design to every declaration in
+the model. It also uses the configuration to verify generated Stela headers and
+to reject definitions or preprocessor tests of reserved Stela macros. Text
+output is deterministic and compiler-shaped; JSON output is an array of finding
+objects.
+
+Errors fail the command. `bool_type` and `macro_constants` default to warnings,
+and `annotation_redundant` defaults to informational. Override a rule with
+`lint.rules` in `stela.config.json`, using `error`, `warning`, `info`, or `off`.
+List intentional integer macros in `lint.macroConstants`. A declaration can
+suppress one rule with `<LIB>_ALLOW(rule)`.
 
 ## The model (`stela.model/1`)
 
