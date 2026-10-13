@@ -183,6 +183,7 @@ if (!$FakeBuild) {
 Copy-Item "$jsigitpath\node-api\js_native_api_types.h" -Destination "$OutputPath\build\native\include\node-api\"
 Copy-Item "$jsigitpath\node-api\js_native_api.h" -Destination "$OutputPath\build\native\include\node-api\"
 Copy-Item "$jsigitpath\node-api\js_runtime_api.h" -Destination "$OutputPath\build\native\include\node-api\"
+Copy-Item "$jsigitpath\node-api\v8_api.h" -Destination "$OutputPath\build\native\include\node-api\"
 
 Copy-Item "$jsigitpath\node-api-jsi\ApiLoaders\JSRuntimeApi.cpp" -Destination "$OutputPath\build\native\include\node-api-jsi\ApiLoaders\"
 Copy-Item "$jsigitpath\node-api-jsi\ApiLoaders\JSRuntimeApi.h" -Destination "$OutputPath\build\native\include\node-api-jsi\ApiLoaders\"
@@ -200,7 +201,6 @@ Copy-Item "$jsigitpath\node-api-jsi\NodeApiJsiRuntime.h" -Destination "$OutputPa
 Copy-Item "$jsigitpath\public\compat.h" -Destination "$OutputPath\build\native\include\"
 Copy-Item "$jsigitpath\public\Readme.md" -Destination "$OutputPath\build\native\include\"
 Copy-Item "$jsigitpath\public\ScriptStore.h" -Destination "$OutputPath\build\native\include\"
-Copy-Item "$jsigitpath\public\v8_api.h" -Destination "$OutputPath\build\native\include\"
 Copy-Item "$jsigitpath\public\V8JsiRuntime.h" -Destination "$OutputPath\build\native\include\"
 
 Copy-Item "$jsigitpath\jsi\jsi.h" -Destination "$OutputPath\build\native\jsi\jsi\"

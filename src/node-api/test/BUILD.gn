@@ -340,10 +340,10 @@ executable("node_lite") {
 
   sources = [
     "../../public/compat.h",
-    "../../public/v8_api.h",
     "../js_native_api.h",
     "../js_native_api_types.h",
     "../js_runtime_api.h",
+    "../v8_api.h",
     "child_process.cpp",
     "child_process.h",
     "node_api_test.cpp",

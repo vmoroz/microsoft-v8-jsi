@@ -33,7 +33,7 @@
 #include "V8JsiRuntime_impl.h"
 #include "js_native_api_v8.h"
 #include "public/ScriptStore.h"
-#include "public/v8_api.h"
+#include "v8_api.h"
 
 #define CHECKED_ENV(env)                                                       \
   ((env) == nullptr)                                                           \

@@ -26,6 +26,8 @@ unit tests.
   Node.js without changes.
 - js_runtime_api.h - extensions to the N-API to host JavaScript engine. It
   is not part of Node.js code.
+- v8_api.h - V8-specific extensions to js_runtime_api.h. It is not part of
+  Node.js code.
 
 ## NAPI implementation files
 

@@ -20,7 +20,7 @@ EXTERN_C_START
 
 JSR_API v8_config_enable_multithreading(jsr_config config, bool value);
 
-JSR_API v8_platform_dispose();
+JSR_API v8_platform_dispose(void);
 
 EXTERN_C_END
 

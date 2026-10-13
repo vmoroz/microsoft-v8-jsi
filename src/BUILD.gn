@@ -61,8 +61,8 @@ target("shared_library", "v8jsi") {
       "node-api/js_runtime_api.h",
       "node-api/util-inl.h",
       "node-api/v8_api.cpp",
+      "node-api/v8_api.h",
       "public/compat.h",
-      "public/v8_api.h",
     ]
   }
 
@@ -207,8 +207,8 @@ target("executable", "jsitests") {
     "jsi/test/testlib.h",
     "jsi/test/testlib_ext.cpp",
     "jsi/threadsafe.h",
+    "node-api/v8_api.h",
     "public/compat.h",
-    "public/v8_api.h",
     "testmain.cpp",
   ]
 

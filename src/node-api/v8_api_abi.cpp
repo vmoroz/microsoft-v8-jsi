@@ -35,7 +35,7 @@
 // in js_native_api_v8_internals.h.
 #include "js_native_api.h"
 #include "js_runtime_api.h"
-#include "public/v8_api.h"
+#include "v8_api.h"
 
 #include "js_native_api_v8.h"
 

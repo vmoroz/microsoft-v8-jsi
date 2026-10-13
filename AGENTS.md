@@ -123,10 +123,11 @@ The binary-stable C ABI for JSI (see "ABI architecture" below).
 - `V8JsiRuntime.h` + `V8JsiRuntime.cpp` — the legacy public `makeV8Runtime` API
   (the `.cpp` is consumer-compiled source)
 - `ScriptStore.h` — prepared-script storage interface
-- `v8_api.h` — V8-specific Node-API config extensions
 
 ### Node-API (`src/node-api/`)
 - `js_runtime_api.h` — the `jsr_*` JSI runtime API
+- `v8_api.h` — V8-specific Node-API config extensions (ships beside
+  `js_runtime_api.h` in `include\node-api`)
 - `v8_api_abi.cpp` — Node-API → JSI-ABI bridge
 - standard Node-API headers (`js_native_api*.h`, `util-inl.h`, `env-inl.h`) are
   vendored from Node.js
@@ -138,7 +139,7 @@ The binary-stable C ABI for JSI (see "ABI architecture" below).
 ## ABI architecture
 
 > The JSI ABI surface (`src/jsi_abi/*.h`, `src/node-api/js_runtime_api.h`,
-> `src/public/v8_api.h`) is **experimental and not yet ABI-stable** — each header
+> `src/node-api/v8_api.h`) is **experimental and not yet ABI-stable** — each header
 > carries a banner saying so. Nothing depends on it as a stable contract yet,
 > which is why it can still be reshaped freely.
 

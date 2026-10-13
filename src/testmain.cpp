@@ -8,7 +8,7 @@
 #include "node-api-jsi/NodeApiJsiRuntime.h"
 #include "public/ScriptStore.h"
 #include "public/V8JsiRuntime.h"
-#include "public/v8_api.h"
+#include "node-api/v8_api.h"
 
 using namespace Microsoft::NodeApiJsi;
 

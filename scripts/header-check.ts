@@ -49,11 +49,7 @@ const HEADERS: readonly Header[] = [
   { root: "src", include: "jsi_abi/jsi_abi_stela.h" },
   { root: "src", include: "jsi_abi/v8_jsi_abi.h" },
   { root: "src/node-api", include: "js_runtime_api.h" },
-  {
-    root: "src/public",
-    include: "v8_api.h",
-    pending: "needs src/node-api on the include path; moving it there fixes it",
-  },
+  { root: "src/node-api", include: "v8_api.h" },
 ];
 
 const CLANG_WARNINGS = ["-Wall", "-Wextra", "-Wpedantic", "-Wdocumentation", "-Werror"];

@@ -106,9 +106,9 @@
       '<(v8jsi_root)/src/node-api/js_native_api_v8_internals_abi.h',
       '<(v8jsi_root)/src/node-api/js_runtime_api.h',
       '<(v8jsi_root)/src/node-api/util-inl.h',
+      '<(v8jsi_root)/src/node-api/v8_api.h',
       '<(v8jsi_root)/src/node-api/v8_api_abi.cpp',
       '<(v8jsi_root)/src/public/compat.h',
-      '<(v8jsi_root)/src/public/v8_api.h',
     ],
 
     # Windows-specific sources

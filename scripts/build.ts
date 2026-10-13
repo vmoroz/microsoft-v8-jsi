@@ -682,7 +682,6 @@ function packNuGet(outputPath: string, platforms: string[], configurations: stri
     "compat.h",
     "Readme.md",
     "ScriptStore.h",
-    "v8_api.h",
     "V8JsiRuntime.h",
   ]) {
     copyFile(file, path.join(srcDir, "public"), includeDir);
@@ -717,11 +716,13 @@ function packNuGet(outputPath: string, platforms: string[], configurations: stri
   // file's <ClCompile> include.
   copyFile("V8JsiRuntime.cpp", path.join(srcDir, "public"), jsiPublicDir);
 
-  // Node-API headers
+  // Node-API headers. v8_api.h ships beside js_runtime_api.h, which it
+  // includes by bare name.
   for (const file of [
     "js_native_api_types.h",
     "js_native_api.h",
     "js_runtime_api.h",
+    "v8_api.h",
   ]) {
     copyFile(file, path.join(srcDir, "node-api"), nodeApiDir, true);
   }
