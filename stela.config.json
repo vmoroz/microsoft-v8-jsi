@@ -4,6 +4,15 @@
   "lint": {
     "macroConstants": ["JSI_ABI_POINTER_MASK"]
   },
+  "diff": {
+    "baselines": {
+      "sbox": "api/sbox.model.json",
+      "v8host": "api/v8host.model.json",
+      "jsi_abi": "api/jsi_abi.model.json",
+      "v8_jsi_abi": "api/v8_jsi_abi.model.json",
+      "v8_node_api": "api/v8_node_api.model.json"
+    }
+  },
   "libraries": [
     {
       "name": "sbox",

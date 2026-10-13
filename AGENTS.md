@@ -204,12 +204,15 @@ The `scripts/` folder holds the TypeScript build/sync tooling (`build.ts`,
 `node <script>.ts` directly.
 
 The public C ABI headers have a compile gate: `node --test
-scripts/header-check.ts` compiles each one on its own as C and C++ with MSVC
-and VS clang, warnings as errors, for x64, x86, and arm64. A header that hasn't
-migrated to the C ABI conventions yet is marked `pending` there and reports
-without failing. The same gate runs Stela's generated layout tests, which check
-each library's struct layouts and enumerator values on every target, and
-requires `stela lint` to report no findings.
+scripts/header-check.ts` extracts the Stela model once and compiles Stela's
+generated header tests: each entry header on its own, as C and C++, with MSVC
+and VS clang, warnings as errors, for x64, x86, and arm64. The same gate runs
+Stela's generated layout tests, which check each library's struct layouts and
+enumerator values on every target. It also requires `stela lint` to report no
+findings and `stela diff` to find no breaks against the committed baselines in
+`api/<library>.model.json`. A deliberate ABI break refreshes the baseline in
+the same change (`node tools/stela/src/stela.ts baseline`), and an addition
+needs the library's `*_ABI_VERSION` raised.
 `tools/stela/` holds Stela, the C ABI header tool;
 `node tools/stela/src/stela.ts vendor --check` verifies the generated
 `<lib>_stela.h` files, and `stela.ts extract` writes the merged API model to

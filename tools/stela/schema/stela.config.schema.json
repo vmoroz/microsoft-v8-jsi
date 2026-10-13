@@ -19,7 +19,7 @@
       "items": {"$ref": "#/$defs/library"}
     },
     "lint": {"$ref": "#/$defs/lint"},
-    "diff": {"type": "object", "description": "Reserved for stela diff (S5)."}
+    "diff": {"$ref": "#/$defs/diff"}
   },
   "$defs": {
     "lowerSnake": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"},
@@ -49,6 +49,21 @@
           "uniqueItems": true,
           "items": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$"},
           "description": "Integer macros allowed by the macro_constants rule."
+        }
+      }
+    },
+    "diff": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "baselines": {
+          "type": "object",
+          "additionalProperties": {"type": "string", "pattern": "\\.json$"},
+          "description": "Library name → its baseline stela.model/1, written by `stela baseline` and compared by `stela diff`."
+        },
+        "experimental": {
+          "$ref": "#/$defs/paths",
+          "description": "Headers whose declarations are experimental: `stela diff` reports their breaks as notes."
         }
       }
     },

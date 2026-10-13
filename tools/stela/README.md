@@ -2,11 +2,12 @@
 
 Stela checks C ABI headers. It currently provides the annotation vocabulary,
 the native extractor, `stela vendor`, the merged `stela.model/1`, the
-header-test and layout-test generators, and C ABI convention lint. Later stages
-add ABI diff, more generators, and manifests embedded in binaries. It incubates here with no
+header-test and layout-test generators, C ABI convention lint, and ABI diff
+against committed baselines. Later stages add more generators and manifests
+embedded in binaries. It incubates here with no
 dependency on v8-jsi code, so it can move to its own repository unchanged.
 
-Status: stage S4, lint.
+Status: stage S5, diff.
 
 ## Requirements
 
@@ -68,18 +69,23 @@ node tools\stela\src\stela.ts extract           # write out\stela\stela.model.js
 node tools\stela\src\stela.ts lint              # check the extracted model
 node tools\stela\src\stela.ts lint --report-only # report without failing
 node tools\stela\src\stela.ts gen layout-tests --out out\stela\tests
+node tools\stela\src\stela.ts diff              # compare the model with the baselines
+node tools\stela\src\stela.ts diff --base old.model.json --head new.model.json
+node tools\stela\src\stela.ts baseline          # refresh every configured baseline
 ```
 
 Options: `--config <file>` (default `stela.config.json` in the current
 directory), `--template <file>` (`vendor`; default `include/stela.h`),
 `--out <file>` (`extract`; default `out/stela/<config name>.model.json` next to
-the configuration), and `--model <file>` (`lint` and `gen`; default the `extract` output), and
-`--format text|json` (`lint`). Paths in the configuration are relative to the
+the configuration), `--model <file>` (`lint`, `gen`, and `baseline`; default
+the `extract` output), `--base` and `--head <file>` (`diff`; default the
+configured baselines and the `extract` output), and `--format text|json`
+(`lint` and `diff`). Paths in the configuration are relative to the
 configuration file. Every command writes a file only when its content changes.
 
-Exit codes: 0 success; 1 check failures (lint errors, out-of-date files, or a
-declaration that differs between targets); 2 usage, configuration, or tool
-errors. `lint --report-only` reports errors but exits 0.
+Exit codes: 0 success; 1 check failures (lint errors, ABI breaks, out-of-date
+files, or a declaration that differs between targets); 2 usage, configuration,
+or tool errors. `lint --report-only` reports errors but exits 0.
 
 ## Lint
 
@@ -97,6 +103,53 @@ suppress one rule with `<LIB>_ALLOW(rule)`.
 
 In v8-jsi, lint is a gate: `scripts/header-check.ts` runs it on the extracted
 model and fails on any finding, at any severity.
+
+## Diff
+
+`stela diff` compares two models and classifies each change as a break, an
+addition, or a note. Breaks include:
+
+- a declaration or target removed;
+- a changed signature, calling convention, typedef, enumerator value, or
+  macro value;
+- a changed size, alignment, or offset;
+- a table slot reordered, removed, or inserted;
+- a changed contract annotation, such as `transfer` or `count`.
+
+Additions are new declarations, enumerators, and targets, and fields appended
+to a struct that starts with `struct_size` or to a function table. Notes cover
+docs, `deprecated`, parameter names, and a raised `*_ABI_VERSION`.
+
+Annotations are compared in effect. One that only restates what a name
+implies, such as `out` on an `out_` parameter, is no change, and references
+such as `count=n` compare by position.
+
+`nullable` is a break when it narrows what a caller may pass or widens what it
+may get back. On callbacks and struct fields, either side may implement them,
+so any `nullable` change is a break.
+
+A library with additions must raise its `*_ABI_VERSION`. An extension library
+with no version macro of its own uses the one from the library that owns its
+status type. Without a raise, `diff` reports `version_not_bumped` as a break.
+
+Breaks in a declaration annotated `experimental`, or in a header listed in
+`diff.experimental`, are reported as notes. The baseline decides: marking a
+stable declaration experimental, or moving it into such a header, doesn't
+excuse breaking it.
+
+Text output is one compiler-shaped line per change, followed by a summary
+line. JSON output is an array of finding objects. The exit code is 1 if any
+break remains.
+
+`stela diff` with no `--base` compares the model with the configured
+`diff.baselines`, covering only the libraries that have one. `stela baseline`
+writes each baseline from the current model, one library per file, as
+`stela.model/1`.
+
+In v8-jsi the baselines are `api/<library>.model.json`, and
+`scripts/header-check.ts` fails on any break. A deliberate break refreshes the
+affected baseline in the same change.
+
 ## The model (`stela.model/1`)
 
 `stela extract` runs the extractor for every library on each of its targets,
@@ -131,8 +184,8 @@ the format.
 
 Both compile with clang (`-ffreestanding -nostdlibinc`, warnings as errors)
 and MSVC (`/W4 /WX`) for each target, as C and C++. Header tests keep the
-C99 floor; layout tests need C11 for `_Static_assert`. v8-jsi runs the layout
-tests in `scripts/header-check.ts`.
+C99 floor; layout tests need C11 for `_Static_assert`. v8-jsi runs both in
+`scripts/header-check.ts`.
 
 ## Configuration (`stela.config.json`)
 
@@ -165,7 +218,10 @@ tests in `scripts/header-check.ts`.
   the header); `owns` lists the files or directories whose declarations belong
   to the library (default: the entry headers); `defines` are `NAME` or
   `NAME=VALUE`.
-- `lint` and `diff` are reserved for later stages and accepted now.
+- `lint` sets rule severities (`rules`) and intentional integer macros
+  (`macroConstants`).
+- `diff.baselines` maps library names to baseline model files, and
+  `diff.experimental` lists headers whose breaks `diff` reports as notes.
 - [`schema/stela.config.schema.json`](schema/stela.config.schema.json)
   describes the format.
 

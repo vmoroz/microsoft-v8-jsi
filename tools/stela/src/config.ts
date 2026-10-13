@@ -35,6 +35,13 @@ export interface LintConfig {
   readonly macroConstants: readonly string[];
 }
 
+export interface DiffConfig {
+  /** Library name → absolute path of its baseline model, in library order. */
+  readonly baselines: Readonly<Record<string, string>>;
+  /** Absolute paths of headers whose breaks `diff` reports as notes. */
+  readonly experimental: readonly string[];
+}
+
 export interface StelaConfig {
   /** Absolute path of the config file. */
   readonly file: string;
@@ -44,6 +51,7 @@ export interface StelaConfig {
   readonly targets: readonly string[];
   readonly libraries: readonly LibraryConfig[];
   readonly lint: LintConfig;
+  readonly diff: DiffConfig;
 }
 
 const TOP_LEVEL_KEYS = new Set(["$schema", "schema", "targets", "libraries", "lint", "diff"]);
@@ -65,6 +73,7 @@ const UPPER_SNAKE_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$/;
 const TARGET_RE = /^[a-z0-9_]+(?:-[a-z0-9_.]+)+$/;
 const DEFINE_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/;
 const LINT_KEYS = new Set(["rules", "macroConstants"]);
+const DIFF_KEYS = new Set(["baselines", "experimental"]);
 const LINT_SEVERITIES = new Set<LintSeverity>(["error", "warning", "info", "off"]);
 
 function targetList(value: unknown, where: string): string[] {
@@ -113,6 +122,41 @@ function lintConfig(value: unknown, where: string): LintConfig {
     }
   }
   return { rules, macroConstants };
+}
+
+function diffConfig(
+  value: unknown,
+  where: string,
+  root: string,
+  libraries: readonly LibraryConfig[],
+): DiffConfig {
+  if (value === undefined) return { baselines: {}, experimental: [] };
+  if (!isObject(value)) throw new StelaError(`${where} must be an object`);
+  for (const key of Object.keys(value)) {
+    if (!DIFF_KEYS.has(key)) throw new StelaError(`${where}: unknown key "${key}"`);
+  }
+  const baselines: Record<string, string> = {};
+  if (value.baselines !== undefined) {
+    if (!isObject(value.baselines)) throw new StelaError(`${where}.baselines must be an object`);
+    for (const name of Object.keys(value.baselines)) {
+      if (!libraries.some((l) => l.name === name)) {
+        throw new StelaError(`${where}.baselines names unknown library "${name}"`);
+      }
+    }
+    // Library order, so commands that walk baselines are deterministic.
+    for (const library of libraries) {
+      const file = value.baselines[library.name];
+      if (file === undefined) continue;
+      if (typeof file !== "string" || !file.endsWith(".json")) {
+        throw new StelaError(`${where}.baselines.${library.name} must be a .json path`);
+      }
+      baselines[library.name] = path.resolve(root, file);
+    }
+  }
+  const experimental = stringList(value.experimental, `${where}.experimental`).map((p) =>
+    path.resolve(root, p),
+  );
+  return { baselines, experimental };
 }
 
 export function parseConfig(json: unknown, file: string): StelaConfig {
@@ -240,6 +284,7 @@ export function parseConfig(json: unknown, file: string): StelaConfig {
     targets,
     libraries,
     lint: lintConfig(json.lint, `${file}: "lint"`),
+    diff: diffConfig(json.diff, `${file}: "diff"`, root, libraries),
   };
 }
 

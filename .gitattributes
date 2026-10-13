@@ -8,3 +8,5 @@ tools/stela/include/stela.h text eol=lf
 tools/stela/test/golden/*.json text eol=lf
 tools/stela/third_party/** text eol=lf
 *_stela.h text eol=lf
+# `stela baseline` writes LF; keep checkouts byte-identical to what it writes.
+api/*.model.json text eol=lf

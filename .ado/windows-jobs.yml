@@ -350,8 +350,11 @@ extends:
               # C ABI header gates, before the long builds so they fail fast.
               # x64 only: the checks cross-compile for x64, x86, and arm64. The
               # generated <lib>_stela.h files must be current, Stela's tests
-              # must pass, and every public C ABI header must compile on its own
-              # as C and C++ with MSVC and VS clang (scripts/header-check.ts).
+              # must pass, and scripts/header-check.ts must pass: every public
+              # C ABI header compiles on its own as C and C++ with MSVC and VS
+              # clang, the layout tests pass, `stela lint` is clean, and
+              # `stela diff` finds no breaks against the committed baselines
+              # (api/*.model.json).
             - ${{ if eq(sb.BuildPlatform, 'x64') }}:
               - pwsh: |
                   node tools/stela/src/stela.ts vendor --check
@@ -366,7 +369,7 @@ extends:
                   if ($LASTEXITCODE -ne 0) {
                     throw "Public C ABI header checks FAILED (exit $LASTEXITCODE)"
                   }
-                displayName: C ABI header gates (Stela vendor check, Stela tests, header checks)
+                displayName: C ABI header gates (Stela vendor check, Stela tests, header, layout, lint, and ABI diff checks)
                 workingDirectory: $(Build.SourcesDirectory)
 
               # BinSkim (run by --check) installs from the react-native-public ADO

@@ -5,7 +5,8 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { loadConfig } from "./config.ts";
+import { type StelaConfig, loadConfig } from "./config.ts";
+import { diffModels, experimentalHeaders, formatDiff, libraryModel, loadBaselines, summarizeDiff } from "./diff.ts";
 import { StelaError } from "./errors.ts";
 import { extractModel } from "./extract.ts";
 import { GENERATORS, generate } from "./generators.ts";
@@ -33,9 +34,19 @@ commands:
   gen      <generator> --out <dir>   generators: ${GENERATORS.join(", ")}
              --model <file>     default: the extract default for --config
              --config <file>    default: stela.config.json
+  diff     classify the changes between two models as breaks, additions, notes
+             --config <file>    default: stela.config.json; not read when
+                                both --base and --head are given
+             --base <file>      default: the config's diff.baselines
+             --head <file>      default: the extract default for --config
+             --format <format>  text (default) or json
+  baseline write each configured diff baseline from the current model
+             [<library>...]     default: every library in diff.baselines
+             --config <file>    default: stela.config.json
+             --model <file>     default: the extract default for --config
 
-exit codes: 0 success; 1 check failures (stale files, target mismatches);
-            2 usage or tool errors
+exit codes: 0 success; 1 check failures (stale files, target mismatches,
+            ABI breaks); 2 usage or tool errors
 `;
 
 interface Io {
@@ -197,6 +208,62 @@ function lint(argv: string[], io: Io): number {
   return values["report-only"] || !findings.some((f) => f.severity === "error") ? 0 : 1;
 }
 
+function diff(argv: string[], io: Io): number {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      config: { type: "string" },
+      base: { type: "string" },
+      head: { type: "string" },
+      format: { type: "string", default: "text" },
+    },
+    strict: true,
+    allowPositionals: false,
+  });
+  if (values.format !== "text" && values.format !== "json") {
+    throw new StelaError('diff --format must be "text" or "json"');
+  }
+  const needsConfig = values.config !== undefined || values.base === undefined || values.head === undefined;
+  const config: StelaConfig | undefined = needsConfig ? loadConfig(values.config ?? "stela.config.json") : undefined;
+  const base = values.base === undefined ? loadBaselines(config!) : readModel(values.base);
+  const head = readModel(path.resolve(values.head ?? defaultModelPath(config!.file)));
+  const findings = diffModels(base, head, {
+    experimentalHeaders: config === undefined ? [] : experimentalHeaders(config),
+    // Against configured baselines, libraries without one aren't compared.
+    libraries: values.base === undefined ? Object.keys(config!.diff.baselines) : undefined,
+  });
+  const text = formatDiff(findings, values.format);
+  if (text !== "") io.out(text);
+  if (values.format === "text") io.out(summarizeDiff(findings));
+  return findings.some((f) => f.class === "break") ? 1 : 0;
+}
+
+function baseline(argv: string[], io: Io): number {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      config: { type: "string", default: "stela.config.json" },
+      model: { type: "string" },
+    },
+    strict: true,
+    allowPositionals: true,
+  });
+  const config = loadConfig(values.config as string);
+  const configured = Object.keys(config.diff.baselines);
+  if (configured.length === 0) throw new StelaError(`${config.file}: no "diff.baselines" are configured`);
+  for (const name of positionals) {
+    if (!configured.includes(name)) throw new StelaError(`library "${name}" has no entry in "diff.baselines"`);
+  }
+  const model = readModel(path.resolve(values.model ?? defaultModelPath(config.file)));
+  const names = positionals.length === 0 ? configured : configured.filter((n) => positionals.includes(n));
+  for (const name of names) {
+    const file = config.diff.baselines[name];
+    const status = writeIfChanged(file, serializeModel(libraryModel(model, name)));
+    io.out(`${`${status}:`.padEnd(11)}${display(process.cwd(), file)}`);
+  }
+  return 0;
+}
+
 export async function main(argv: string[], io: Io): Promise<number> {
   const [command, ...rest] = argv;
   try {
@@ -209,6 +276,10 @@ export async function main(argv: string[], io: Io): Promise<number> {
         return lint(rest, io);
       case "gen":
         return gen(rest, io);
+      case "diff":
+        return diff(rest, io);
+      case "baseline":
+        return baseline(rest, io);
       case undefined:
       case "help":
       case "--help":

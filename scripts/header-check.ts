@@ -1,6 +1,14 @@
-// Public C ABI header gate (C ABI conventions §2 and §14). Each covered header
-// must compile on its own, as C and as C++, with MSVC and with clang, warnings
-// as errors, for every shipped architecture (x64, x86, arm64).
+// Public C ABI header gate (C ABI conventions §2 and §14; Stela design §13).
+// It extracts every library in stela.config.json once, for every target, then:
+//
+// - compiles Stela's generated header tests: each entry header on its own,
+//   included twice, as C and as C++, with clang and MSVC, warnings as errors,
+//   for every target (x64, x86, arm64);
+// - compiles Stela's generated layout tests: static asserts of each record's
+//   size, alignment, and field offsets and each enumerator's value;
+// - requires `stela lint` to report no findings at all;
+// - requires `stela diff` against the committed baselines (api/*.model.json)
+//   to report no breaks.
 //
 //   node --test scripts/header-check.ts
 //   node --test --test-name-pattern=sbox scripts/header-check.ts
@@ -10,14 +18,9 @@
 // <wchar.h>, <windows.h>, and C++ headers fail. MSVC runs with the vcvars
 // environment of each target architecture.
 //
-// A header that hasn't migrated to the conventions yet carries `pending`: its
-// checks still run and report, as node:test `todo` tests, but don't fail the
-// gate. Remove `pending` in the change that migrates the header.
-//
-// A second block runs Stela's generated layout tests: it extracts every library
-// in stela.config.json and compiles static asserts of each record's size,
-// alignment, and field offsets and each enumerator's value, on every target.
-// The same model must also pass `stela lint` with no findings at all.
+// The generated <lib>_stela.h files aren't compiled on their own here: every
+// entry header includes its library's, `stela vendor --check` keeps them
+// current, and Stela's own tests compile the template across its matrix.
 
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -26,111 +29,14 @@ import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { compileJobs, compileUnits, msvcEnvs } from "../tools/stela/src/compile.ts";
 import { loadConfig } from "../tools/stela/src/config.ts";
+import { diffModels, experimentalHeaders, formatDiff, loadBaselines } from "../tools/stela/src/diff.ts";
 import { extractModel } from "../tools/stela/src/extract.ts";
 import { generate } from "../tools/stela/src/generators.ts";
 import { formatFindings, lintModel } from "../tools/stela/src/lint.ts";
 import { type Model, formatMismatch } from "../tools/stela/src/model.ts";
-import {
-  type CompileJob,
-  type CompileResult,
-  type MsvcArch,
-  type Toolchain,
-  findToolchain,
-  resolveOnPath,
-  runJobs,
-} from "../tools/stela/src/toolchain.ts";
-
-interface Header {
-  /** Repo-relative directory a consumer puts on its include path. */
-  readonly root: string;
-  /** The header as a consumer includes it, relative to `root`. */
-  readonly include: string;
-  /** Why the header doesn't pass yet, and which change fixes it. */
-  readonly pending?: string;
-}
-
-// The include roots mirror the NuGet layout (scripts/build.ts): the jsi_abi
-// headers are included as "jsi_abi/<file>" from the package's jsi folder.
-const HEADERS: readonly Header[] = [
-  { root: "deps/chromium/sandbox_dll", include: "sbox.h" },
-  { root: "deps/chromium/sandbox_dll", include: "sbox_stela.h" },
-  { root: "src/public", include: "v8host_client.h" },
-  { root: "src/public", include: "v8host_stela.h" },
-  { root: "src", include: "jsi_abi/jsi_abi.h" },
-  { root: "src", include: "jsi_abi/jsi_abi_stela.h" },
-  { root: "src", include: "jsi_abi/v8_jsi_abi.h" },
-  { root: "src", include: "node-api/v8_node_api.h" },
-  { root: "src/node-api", include: "v8_node_api_stela.h" },
-];
-
-const CLANG_WARNINGS = ["-Wall", "-Wextra", "-Wpedantic", "-Wdocumentation", "-Werror"];
-const CLANG_TARGETS: Record<MsvcArch, string> = {
-  x64: "x86_64-pc-windows-msvc",
-  x86: "i686-pc-windows-msvc",
-  arm64: "aarch64-pc-windows-msvc",
-};
-// The conventions' floors (C99, C++11) and the build's default (C17, C++17).
-const CLANG_MODES = [
-  ["c", "c99"],
-  ["c", "c17"],
-  ["c++", "c++11"],
-  ["c++", "c++17"],
-] as const;
-// MSVC's oldest modes (C11, C++14) and the build's default (C17, C++17).
-const MSVC_MODES = [
-  ["c", "/std:c11"],
-  ["c", "/std:c17"],
-  ["c++", "/std:c++14"],
-  ["c++", "/std:c++17"],
-] as const;
-const ARCHS: readonly MsvcArch[] = ["x64", "x86", "arm64"];
-const COMPILERS = ["clang", "msvc"] as const;
-type Compiler = (typeof COMPILERS)[number];
+import { type CompileResult, findToolchain, runJobs } from "../tools/stela/src/toolchain.ts";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
-
-function jobsFor(
-  tc: Toolchain,
-  envs: Record<MsvcArch, NodeJS.ProcessEnv>,
-  dir: string,
-  header: Header,
-  tu: string,
-): Record<Compiler, CompileJob[]> {
-  const root = path.join(repoRoot, header.root);
-  const clang: CompileJob[] = [];
-  const msvc: CompileJob[] = [];
-  for (const arch of ARCHS) {
-    for (const [lang, std] of CLANG_MODES) {
-      clang.push({
-        label: `clang ${arch} ${std}`,
-        exe: tc.clang,
-        args: [
-          "-fsyntax-only",
-          "-ffreestanding",
-          "-nostdlibinc",
-          `--target=${CLANG_TARGETS[arch]}`,
-          "-x",
-          lang,
-          `-std=${std}`,
-          ...CLANG_WARNINGS,
-          "-fno-color-diagnostics",
-          "-I",
-          root,
-          tu,
-        ],
-        cwd: dir,
-      });
-    }
-    const env = envs[arch];
-    for (const [lang, std] of MSVC_MODES) {
-      const args = ["/nologo", "/Zs", "/W4", "/WX", lang === "c" ? "/TC" : "/TP", std];
-      if (lang === "c++") args.push("/permissive-");
-      args.push("/I", root, tu);
-      msvc.push({ label: `cl ${arch} ${std}`, exe: resolveOnPath("cl.exe", env), args, cwd: dir, env });
-    }
-  }
-  return { clang, msvc };
-}
 
 /** Groups failures by their first diagnostic so one broken line reads once. */
 function report(results: readonly CompileResult[]): string {
@@ -152,69 +58,12 @@ function report(results: readonly CompileResult[]): string {
   return parts.join("\n");
 }
 
-describe("public C ABI headers compile standalone", () => {
-  let dir = "";
-  let setupError: string | undefined;
-  const results = new Map<string, CompileResult[]>();
-  const key = (header: Header, compiler: Compiler) => `${header.include} ${compiler}`;
-
-  before(async () => {
-    const tc = await findToolchain();
-    if (typeof tc === "string") {
-      setupError = tc;
-      return;
-    }
-    dir = mkdtempSync(path.join(os.tmpdir(), "header-check-"));
-    const envs = {} as Record<MsvcArch, NodeJS.ProcessEnv>;
-    for (const arch of ARCHS) envs[arch] = await tc.msvcEnv(arch);
-    const all: { key: string; job: CompileJob }[] = [];
-    HEADERS.forEach((header, index) => {
-      // Including the header twice also checks its include guard. The typedef
-      // keeps a macro-only header's C translation unit from being empty.
-      const tu = `tu${index}.c`;
-      writeFileSync(
-        path.join(dir, tu),
-        `#include "${header.include}"\n#include "${header.include}"\ntypedef int header_check_nonempty;\n`,
-      );
-      const jobs = jobsFor(tc, envs, dir, header, tu);
-      for (const compiler of COMPILERS) {
-        for (const job of jobs[compiler]) all.push({ key: key(header, compiler), job });
-      }
-    });
-    const done = await runJobs(all.map((j) => j.job));
-    done.forEach((result, i) => {
-      const list = results.get(all[i].key) ?? [];
-      list.push(result);
-      results.set(all[i].key, list);
-    });
-  });
-
-  after(() => {
-    if (dir) rmSync(dir, { recursive: true, force: true });
-  });
-
-  for (const header of HEADERS) {
-    for (const compiler of COMPILERS) {
-      test(`${header.include} (${compiler})`, { todo: header.pending ?? false }, () => {
-        assert.equal(setupError, undefined, `toolchain: ${setupError}`);
-        const list = results.get(key(header, compiler)) ?? [];
-        assert.ok(list.length > 0, "no compile jobs ran");
-        const failures = report(list);
-        if (failures) assert.fail(failures);
-      });
-    }
-  }
-});
-
-// Stela layout tests (Stela design §11): extract every library in
-// stela.config.json for its targets, then check each size, alignment, field
-// offset, and enumerator value Clang computed against what clang and MSVC
-// compile, as C and C++, on every target.
-describe("Stela layout tests compile", () => {
+describe("public C ABI headers", () => {
   const config = loadConfig(path.join(repoRoot, "stela.config.json"));
   let dir = "";
   let setupError: string | undefined;
   let extracted: Model | undefined;
+  /** Compile results by generated file, as `<library>/<file name>`. */
   const results = new Map<string, CompileResult[]>();
 
   before(async () => {
@@ -230,8 +79,8 @@ describe("Stela layout tests compile", () => {
         return;
       }
       extracted = model;
-      dir = mkdtempSync(path.join(os.tmpdir(), "header-check-layout-"));
-      const files = generate("layout-tests", model);
+      dir = mkdtempSync(path.join(os.tmpdir(), "header-check-"));
+      const files = [...generate("header-tests", model), ...generate("layout-tests", model)];
       for (const file of files) {
         const target = path.join(dir, ...file.path.split("/"));
         mkdirSync(path.dirname(target), { recursive: true });
@@ -240,10 +89,11 @@ describe("Stela layout tests compile", () => {
       const units = compileUnits(model, config.root, dir, files);
       const done = await runJobs(compileJobs(tc, await msvcEnvs(tc, units), units));
       for (const result of done) {
-        const library = path.basename(result.job.cwd);
-        const list = results.get(library) ?? [];
+        // Job labels start with the generated file's name; its directory is the library.
+        const key = `${path.basename(result.job.cwd)}/${result.job.label.split(" ")[0]}`;
+        const list = results.get(key) ?? [];
         list.push(result);
-        results.set(library, list);
+        results.set(key, list);
       }
     } catch (e) {
       setupError = (e as Error).message;
@@ -254,23 +104,45 @@ describe("Stela layout tests compile", () => {
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
+  function check(keys: (key: string) => boolean): void {
+    assert.equal(setupError, undefined, setupError ?? "setup failed");
+    const list = [...results].filter(([key]) => keys(key)).flatMap(([, r]) => r);
+    assert.ok(list.length > 0, "no compile jobs ran");
+    const failures = report(list);
+    if (failures) assert.fail(failures);
+  }
+
+  // Header tests (Stela design §11): `<library>/<header stem>.header.{c,cpp}`.
   for (const library of config.libraries) {
-    test(`${library.name} layout`, () => {
-      assert.equal(
-        setupError,
-        undefined,
-        setupError ?? "layout test setup failed",
-      );
-      const list = results.get(library.name) ?? [];
-      assert.ok(list.length > 0, "no compile jobs ran");
-      const failures = report(list);
-      if (failures) assert.fail(failures);
-    });
+    for (const header of library.headers) {
+      const stem = path.basename(header).replace(/\.[^.]*$/, "");
+      for (const ext of ["c", "cpp"]) {
+        const file = `${library.name}/${stem}.header.${ext}`;
+        test(`${file} compiles`, () => check((key) => key === file));
+      }
+    }
+  }
+
+  for (const library of config.libraries) {
+    test(`${library.name} layout`, () =>
+      check((key) => key.startsWith(`${library.name}/`) && !/\.header\.(c|cpp)$/.test(key)));
   }
 
   test("stela lint is clean", () => {
     assert.ok(extracted, setupError ?? "model extraction failed");
     const findings = lintModel(extracted, config);
     assert.equal(findings.length, 0, formatFindings(findings, "text"));
+  });
+
+  // A break needs a deliberate baseline refresh (`stela baseline`) in the same
+  // change; an addition needs the library's *_ABI_VERSION bumped.
+  test("stela diff against the baselines has no breaks", () => {
+    assert.ok(extracted, setupError ?? "model extraction failed");
+    const findings = diffModels(loadBaselines(config), extracted, {
+      experimentalHeaders: experimentalHeaders(config),
+      libraries: Object.keys(config.diff.baselines),
+    });
+    const breaks = findings.filter((f) => f.class === "break");
+    assert.equal(breaks.length, 0, formatDiff(breaks, "text"));
   });
 });
