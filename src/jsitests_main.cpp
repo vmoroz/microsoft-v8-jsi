@@ -1057,6 +1057,46 @@ TEST(JsiAbiStatus, OutputsAndAutoLength) {
   api->release(rt);
 }
 
+// The cache callbacks get a NUL-terminated copy of a length-delimited URL.
+TEST(JsiAbiScriptCache, CallbacksGetTerminatedUrl) {
+  struct Seen {
+    std::vector<std::string> urls;
+  } seen;
+  jsi_configure_runtime_cb configure = [](void *user_data,
+                                          jsi_config cfg) -> jsi_status {
+    auto load = [](void *data, const char *source_url, uint64_t, const char *,
+                   uint64_t, const char *, const uint8_t **, size_t *,
+                   jsi_data_delete_cb *, void **) {
+      static_cast<Seen *>(data)->urls.emplace_back(source_url);
+    };
+    auto store = [](void *data, const char *source_url, uint64_t, const char *,
+                    uint64_t, const char *, const uint8_t *bytes, size_t,
+                    jsi_data_delete_cb delete_cb, void *delete_data) {
+      static_cast<Seen *>(data)->urls.emplace_back(source_url);
+      if (delete_cb)
+        delete_cb(delete_data, const_cast<uint8_t *>(bytes));
+    };
+    return v8_jsi_abi_config_set_script_cache(
+        cfg, load, store, user_data, nullptr, nullptr);
+  };
+  jsi_runtime *rt = nullptr;
+  ASSERT_EQ(v8_jsi_abi_runtime_create(JSI_ABI_VERSION, configure, &seen, &rt), jsi_status_ok);
+  ASSERT_NE(rt, nullptr);
+
+  const char url[] = {'a', '.', 'j', 's', 'X', 'Y'};
+  jsi_prepared_javascript *prepared = nullptr;
+  ASSERT_EQ(
+      rt->api->prepare_javascript(rt, new AbiSourceBuffer("1 + 1"), url, 4, &prepared),
+      jsi_status_ok);
+  ASSERT_NE(prepared, nullptr);
+  prepared->api->release(prepared);
+
+  ASSERT_EQ(seen.urls.size(), 2u);
+  EXPECT_EQ(seen.urls[0], "a.js");
+  EXPECT_EQ(seen.urls[1], "a.js");
+  rt->api->release(rt);
+}
+
 // Runtime creation reports failures through jsi_status and leaves the output
 // NULL.
 TEST(JsiAbiCreate, StatusAndOutput) {

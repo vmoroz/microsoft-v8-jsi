@@ -956,8 +956,8 @@ bool PopWorkerExit(router::Connection& conn, uint32_t session_id = 1) {
   return PopFrame(conn, &h) && h.type == protocol::MessageType::WORKER_EXIT &&
       h.session_id == session_id && h.run_id == 0 && h.request_id == 0 && conn.out_queue.empty();
 }
-bool LifecycleAbi6(std::string* detail) {
-  bool ok = SBOX_ABI_VERSION == 6u;
+bool LifecycleAbi7(std::string* detail) {
+  bool ok = SBOX_ABI_VERSION == 7u;
   for (const auto* dll : {L"v8host.dll", L"v8host_abi4_plugin.dll"}) {
     HMODULE module = ::LoadLibraryExW((ExecutableDirectory() + L"\\" + dll).c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
@@ -966,18 +966,18 @@ bool LifecycleAbi6(std::string* detail) {
     auto entry = reinterpret_cast<sbox_plugin_main_fn>(::GetProcAddress(module, SBOX_PLUGIN_ENTRY));
     const bool old = std::wstring(dll) == L"v8host_abi4_plugin.dll";
     const sbox_plugin_api* plugin = nullptr;
-    ok = entry && entry(old ? 4u : 6u, &plugin) == sbox_status_ok && plugin &&
-        plugin->abi_version == (old ? 4u : 6u) && plugin->configure && plugin->broker_run &&
+    ok = entry && entry(old ? 4u : 7u, &plugin) == sbox_status_ok && plugin &&
+        plugin->abi_version == (old ? 4u : 7u) && plugin->configure && plugin->broker_run &&
         plugin->warmup && plugin->run && plugin->shutdown && ok;
     plugin = nullptr;
-    ok = entry && entry(old ? 6u : 4u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
+    ok = entry && entry(old ? 7u : 4u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
     ::FreeLibrary(module);
   }
   DWORD code = 0;
   const std::wstring command = L"\"" + ExecutableDirectory() +
       L"\\sbox.exe\" --broker --plugin v8host_abi4_plugin.dll";
   ok = v8host::test::RunProcess(command, &code) && code == 3 && ok;
-  if (!ok) *detail = "matching ABI/4-6 rejection";
+  if (!ok) *detail = "matching ABI/4-7 rejection";
   return ok;
 }
 bool CoreLifecycleCase(const wchar_t* args, std::string* detail) {
@@ -5734,7 +5734,7 @@ int main(int argc, char** argv) {
       {"router", "worker-mailbox-pump-bound", MailboxPumpBound},
       {"cancel", "cancels-first", CancelsFirst},
       {"cancel", "completes-first", CompletesFirst},
-      {"run", "lifecycle-abi6", LifecycleAbi6},
+      {"run", "lifecycle-abi7", LifecycleAbi7},
       {"run", "exit-fact-origin", ExitFactOrigin},
       {"run", "exit-fact-final-drain", ExitFinalDrain},
       {"run", "smoke-lifecycle-two", SmokeLifecycleTwo},

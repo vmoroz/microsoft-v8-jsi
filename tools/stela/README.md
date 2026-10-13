@@ -95,6 +95,8 @@ and `annotation_redundant` defaults to informational. Override a rule with
 List intentional integer macros in `lint.macroConstants`. A declaration can
 suppress one rule with `<LIB>_ALLOW(rule)`.
 
+In v8-jsi, lint is a gate: `scripts/header-check.ts` runs it on the extracted
+model and fails on any finding, at any severity.
 ## The model (`stela.model/1`)
 
 `stela extract` runs the extractor for every library on each of its targets,

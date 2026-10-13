@@ -30,8 +30,29 @@ namespace router = v8host::coordinator;
 // sbox.h strings are sbox_char16, the same UTF-16 code unit as wchar_t here.
 static_assert(sizeof(sbox_char16) == sizeof(wchar_t),
               "sbox_char16 must match wchar_t");
-const wchar_t* AsWide(const sbox_char16* text) {
-  return reinterpret_cast<const wchar_t*>(text);
+
+using BrokerTextGetter = sbox_status(SBOX_CDECL*)(sbox_broker broker,
+                                                  sbox_char16* buffer,
+                                                  size_t buffer_length,
+                                                  size_t* out_length);
+
+// Copies one host string through the sbox_broker_api length-query protocol.
+bool ReadBrokerText(sbox_broker broker,
+                    BrokerTextGetter get,
+                    std::wstring* out) {
+  size_t length = 0;
+  if (get(broker, nullptr, 0, &length) != sbox_status_ok ||
+      length == SIZE_MAX)
+    return false;
+  std::wstring text(length + 1, L'\0');
+  size_t written = 0;
+  if (get(broker, reinterpret_cast<sbox_char16*>(text.data()), text.size(),
+          &written) != sbox_status_ok ||
+      written != length)
+    return false;
+  text.resize(length);
+  *out = std::move(text);
+  return true;
 }
 
 bool IoWithDeadline(HANDLE pipe,
@@ -133,10 +154,12 @@ class PipeSecurity {
 class BrokerService {
  public:
   BrokerService(sbox_broker broker, const sbox_broker_api* api, const sbox_broker_start* start,
+                std::wstring endpoint_name,
                 v8host::PayloadIdentity payload,
                 std::vector<uint8_t> sid,
                 LUID session)
       : broker_(broker), api_(api), start_(start),
+        endpoint_name_(std::move(endpoint_name)),
         payload_(std::move(payload)),
         sid_(std::move(sid)),
         session_(session),
@@ -158,7 +181,7 @@ class BrokerService {
       if (mode_ == v8host::BrokerMode::kDedicated && owner_seen_)
         break;
       HANDLE pipe = ::CreateNamedPipeW(
-          AsWide(start_->endpoint_name),
+          endpoint_name_.c_str(),
           PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
               (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
           PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
@@ -312,7 +335,7 @@ class BrokerService {
     DWORD delay = 10;
     while (::GetTickCount64() < deadline) {
       HANDLE pipe =
-          ::CreateFileW(AsWide(start_->endpoint_name),
+          ::CreateFileW(endpoint_name_.c_str(),
                         GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                         OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
       if (pipe != INVALID_HANDLE_VALUE) {
@@ -331,7 +354,7 @@ class BrokerService {
         return ok;
       }
       if (::GetLastError() == ERROR_PIPE_BUSY)
-        ::WaitNamedPipeW(AsWide(start_->endpoint_name), delay);
+        ::WaitNamedPipeW(endpoint_name_.c_str(), delay);
       else
         ::Sleep(delay);
       delay = (std::min)(delay * 2, static_cast<DWORD>(250));
@@ -445,6 +468,7 @@ class BrokerService {
   sbox_broker broker_;
   const sbox_broker_api* api_;
   const sbox_broker_start* start_;
+  std::wstring endpoint_name_;
   v8host::PayloadIdentity payload_;
   std::vector<uint8_t> sid_;
   LUID session_;
@@ -476,6 +500,8 @@ sbox_status RunBrokerApiOwnershipTest(sbox_broker broker,
   sbox_broker_worker worker = nullptr;
   int32_t exit_code = 0;
   const std::vector<uint8_t> oversize(64 * 1024 + 1, 0);
+  size_t text_length = 0;
+  sbox_char16 short_buffer[1] = {};
   if (api->configure_and_spawn(nullptr, nullptr, 0, nullptr, nullptr,
                                &worker) != sbox_status_invalid_arg ||
       api->configure_and_spawn(broker, nullptr, 0, nullptr, nullptr, nullptr) !=
@@ -484,7 +510,24 @@ sbox_status RunBrokerApiOwnershipTest(sbox_broker broker,
                                nullptr, nullptr, &worker) != sbox_status_invalid_arg ||
       api->post_message(nullptr, sbox_msg_kind_string, "x", 1) != sbox_status_invalid_arg ||
       api->close(nullptr) != sbox_status_invalid_arg ||
-      api->wait(nullptr, &exit_code) != sbox_status_invalid_arg)
+      api->wait(nullptr, &exit_code) != sbox_status_invalid_arg ||
+      api->get_endpoint_name(nullptr, nullptr, 0, &text_length) !=
+          sbox_status_invalid_arg ||
+      api->get_endpoint_name(broker, nullptr, 0, nullptr) !=
+          sbox_status_invalid_arg ||
+      api->get_endpoint_name(broker, nullptr, 1, &text_length) !=
+          sbox_status_invalid_arg ||
+      api->get_endpoint_name(broker, nullptr, 0, &text_length) !=
+          sbox_status_ok ||
+      text_length == 0 ||
+      api->get_endpoint_name(broker, short_buffer, 1, &text_length) !=
+          sbox_status_invalid_arg ||
+      short_buffer[0] != 0 || text_length == 0)
+    return sbox_status_failed;
+  std::wstring endpoint_name;
+  if (!ReadBrokerText(broker, api->get_endpoint_name, &endpoint_name) ||
+      endpoint_name.size() != text_length ||
+      endpoint_name.find(L'\0') != std::wstring::npos)
     return sbox_status_failed;
 
   if (mode[0] == L'l') {  // "leak": abandon a spawned worker for host cleanup.
@@ -519,25 +562,33 @@ sbox_status V8HostBrokerRun(sbox_broker broker,
   wchar_t test_mode[16] = {};
   if (::GetEnvironmentVariableW(L"V8HOST_BROKER_API_TEST", test_mode, 16) > 0 &&
       broker && api && api->struct_size >= sizeof(*api) &&
-      api->configure_and_spawn && api->post_message && api->close && api->wait)
+      api->configure_and_spawn && api->post_message && api->close &&
+      api->wait && api->get_endpoint_name)
     return RunBrokerApiOwnershipTest(broker, api, test_mode);
 #endif
   if (!broker || !api || api->struct_size < sizeof(*api) ||
       !api->configure_and_spawn || !api->post_message || !api->close ||
-      !api->wait || !start || start->struct_size < sizeof(*start) ||
-      !start->endpoint_name || !start->container_sha256 ||
-      !start->plugin_sha256 || !start->container_final_path ||
-      !start->plugin_final_path ||
+      !api->wait || !api->get_endpoint_name ||
+      !api->get_container_final_path || !api->get_plugin_final_path ||
+      !start || start->struct_size < sizeof(*start) ||
+      !start->container_sha256 || !start->plugin_sha256 ||
       (start->mode != sbox_broker_mode_shared &&
        start->mode != sbox_broker_mode_dedicated))
+    return sbox_status_invalid_arg;
+  std::wstring endpoint_name;
+  std::wstring container_final_path;
+  std::wstring plugin_final_path;
+  if (!ReadBrokerText(broker, api->get_endpoint_name, &endpoint_name) ||
+      !ReadBrokerText(broker, api->get_container_final_path,
+                      &container_final_path) ||
+      !ReadBrokerText(broker, api->get_plugin_final_path, &plugin_final_path))
     return sbox_status_invalid_arg;
 
   DWORD error = ERROR_SUCCESS;
   v8host::PayloadIdentity payload;
-  if (!v8host::OpenImmutableFile(AsWide(start->container_final_path),
-                                 &payload.container, &error) ||
-      !v8host::OpenImmutableFile(AsWide(start->plugin_final_path),
-                                 &payload.plugin, &error) ||
+  if (!v8host::OpenImmutableFile(container_final_path, &payload.container,
+                                 &error) ||
+      !v8host::OpenImmutableFile(plugin_final_path, &payload.plugin, &error) ||
       payload.container.machine() != start->native_machine ||
       payload.plugin.machine() != start->native_machine ||
       std::memcmp(payload.container.sha256().data(), start->container_sha256,
@@ -574,11 +625,13 @@ sbox_status V8HostBrokerRun(sbox_broker broker,
               ? v8host::BrokerMode::kShared
               : v8host::BrokerMode::kDedicated,
           nonce_ptr, &expected_endpoint, &endpoint_key) ||
-      expected_endpoint != AsWide(start->endpoint_name))
+      expected_endpoint != endpoint_name)
     return sbox_status_failed;
   printf("[v8host] broker endpoint=%s mode=%s pid=%lu\n",
          v8host::HexPrefix(endpoint_key, 6).c_str(),
          start->mode == sbox_broker_mode_shared ? "shared" : "dedicated",
          ::GetCurrentProcessId());
-  return BrokerService(broker, api, start, std::move(payload), std::move(sid), session).Run();
+  return BrokerService(broker, api, start, std::move(endpoint_name),
+                       std::move(payload), std::move(sid), session)
+      .Run();
 }

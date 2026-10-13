@@ -302,16 +302,18 @@ typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_set_v8_flags_fn)(
  * fails or V8 cannot build the blob; the outputs are zeroed on failure.
  *============================================================================*/
 V8_JSI_ABI_API jsi_status JSI_ABI_CDECL v8_jsi_abi_snapshot_create(
-    const char *script,
+    JSI_ABI_ENCODING(utf8) const char *script,
     size_t script_length,
-    JSI_ABI_NULLABLE const char *source_url,
+    JSI_ABI_NULLABLE JSI_ABI_ENCODING(utf8) JSI_ABI_ZERO_TERMINATED
+        const char *source_url,
     bool jitless,
     uint8_t **out_data,
     size_t *out_size);
 typedef jsi_status(JSI_ABI_CDECL *v8_jsi_abi_snapshot_create_fn)(
-    const char *script,
+    JSI_ABI_ENCODING(utf8) const char *script,
     size_t script_length,
-    JSI_ABI_NULLABLE const char *source_url,
+    JSI_ABI_NULLABLE JSI_ABI_ENCODING(utf8) JSI_ABI_ZERO_TERMINATED
+        const char *source_url,
     bool jitless,
     uint8_t **out_data,
     size_t *out_size);
@@ -418,6 +420,9 @@ typedef const char *(
  * store_cb: receives freshly produced bytes. The consumer must call
  *   data_delete_cb(data_delete_data, data) exactly once when done with them.
  *
+ * Both callbacks receive NUL-terminated UTF-8 source_url, runtime_name, and
+ * cache_tag strings that the runtime owns; they are valid only for the call.
+ *
  * Lifetime: the config takes ownership of user_data when the setter is
  * called; on runtime construction the runtime takes over. When the runtime is
  * destroyed it calls user_data_delete_cb(user_data_delete_data, user_data)
@@ -428,11 +433,11 @@ typedef const char *(
 /// Loads cached bytecode. See the script cache notes above.
 typedef void(JSI_ABI_CDECL *v8_jsi_abi_script_cache_load_cb)(
     JSI_ABI_NULLABLE void *user_data,
-    const char *source_url,
+    JSI_ABI_ENCODING(utf8) JSI_ABI_ZERO_TERMINATED const char *source_url,
     uint64_t source_hash,
-    const char *runtime_name,
+    JSI_ABI_ENCODING(utf8) JSI_ABI_ZERO_TERMINATED const char *runtime_name,
     uint64_t runtime_version,
-    const char *cache_tag,
+    JSI_ABI_ENCODING(utf8) JSI_ABI_ZERO_TERMINATED const char *cache_tag,
     const uint8_t **out_data,
     size_t *out_size,
     jsi_data_delete_cb *out_data_delete_cb,
@@ -441,11 +446,11 @@ typedef void(JSI_ABI_CDECL *v8_jsi_abi_script_cache_load_cb)(
 /// Stores cached bytecode. See the script cache notes above.
 typedef void(JSI_ABI_CDECL *v8_jsi_abi_script_cache_store_cb)(
     JSI_ABI_NULLABLE void *user_data,
-    const char *source_url,
+    JSI_ABI_ENCODING(utf8) JSI_ABI_ZERO_TERMINATED const char *source_url,
     uint64_t source_hash,
-    const char *runtime_name,
+    JSI_ABI_ENCODING(utf8) JSI_ABI_ZERO_TERMINATED const char *runtime_name,
     uint64_t runtime_version,
-    const char *cache_tag,
+    JSI_ABI_ENCODING(utf8) JSI_ABI_ZERO_TERMINATED const char *cache_tag,
     const uint8_t *data,
     size_t size,
     JSI_ABI_NULLABLE JSI_ABI_SCOPE_ASYNC JSI_ABI_CLOSURE(data_delete_data)

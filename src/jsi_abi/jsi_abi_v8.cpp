@@ -1562,6 +1562,10 @@ jsi_status JSI_ABI_CDECL jsi_prepare_javascript(
   static constexpr const char *kCacheTag = "perf";
   static constexpr const char *kRuntimeName = "V8";
   const uint64_t runtime_version = v8::ScriptCompiler::CachedDataVersionTag();
+  // The callbacks get a NUL-terminated copy; the caller's URL may not be.
+  std::string cache_source_url;
+  if (state->script_cache_load_cb || state->script_cache_store_cb)
+    cache_source_url.assign(source_url, source_url_length);
 
   // try cache load.
   v8::ScriptCompiler::CompileOptions options =
@@ -1575,7 +1579,7 @@ jsi_status JSI_ABI_CDECL jsi_prepare_javascript(
   if (state->script_cache_load_cb) {
     state->script_cache_load_cb(
         state->script_cache_data,
-        source_url,
+        cache_source_url.c_str(),
         source_hash,
         kRuntimeName,
         runtime_version,
@@ -1627,7 +1631,7 @@ jsi_status JSI_ABI_CDECL jsi_prepare_javascript(
       };
       state->script_cache_store_cb(
           state->script_cache_data,
-          source_url,
+          cache_source_url.c_str(),
           source_hash,
           kRuntimeName,
           runtime_version,

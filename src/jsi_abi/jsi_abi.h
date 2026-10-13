@@ -547,7 +547,7 @@ struct jsi_runtime_api {
   jsi_status(JSI_ABI_CDECL *evaluate_javascript_source)(
       jsi_runtime *rt,
       JSI_ABI_TRANSFER_FULL jsi_buffer *buffer,
-      JSI_ABI_NULLABLE const char *source_url,
+      JSI_ABI_NULLABLE JSI_ABI_ENCODING(utf8) const char *source_url,
       size_t source_url_length,
       jsi_value *out_value);
 
@@ -559,7 +559,7 @@ struct jsi_runtime_api {
   jsi_status(JSI_ABI_CDECL *prepare_javascript)(
       jsi_runtime *rt,
       JSI_ABI_TRANSFER_FULL jsi_buffer *buffer,
-      JSI_ABI_NULLABLE const char *source_url,
+      JSI_ABI_NULLABLE JSI_ABI_ENCODING(utf8) const char *source_url,
       size_t source_url_length,
       JSI_ABI_TRANSFER_FULL jsi_prepared_javascript **out_prepared);
   jsi_status(JSI_ABI_CDECL *evaluate_prepared_javascript)(

@@ -68,6 +68,9 @@ struct sbox_broker_worker_s {
 struct sbox_broker_s {
   std::wstring self_path;
   std::wstring plugin_name;
+  std::wstring endpoint_name;
+  std::wstring container_final_path;
+  std::wstring plugin_final_path;
   const sbox_plugin_api* plugin = nullptr;
   HMODULE plugin_module = nullptr;
   std::mutex mutex;
@@ -786,12 +789,60 @@ sbox_status SBOX_CDECL BrokerWait(sbox_broker_worker worker,
   return sbox_status_ok;
 }
 
+sbox_status CopyBrokerText(const std::wstring& text,
+                           sbox_char16* buffer,
+                           size_t buffer_length,
+                           size_t* out_length) {
+  if (!out_length || (!buffer && buffer_length != 0))
+    return sbox_status_invalid_arg;
+  *out_length = text.size();
+  if (!buffer)
+    return sbox_status_ok;
+  if (buffer_length <= text.size())
+    return sbox_status_invalid_arg;
+  std::memcpy(buffer, text.c_str(), (text.size() + 1) * sizeof(sbox_char16));
+  return sbox_status_ok;
+}
+
+sbox_status SBOX_CDECL BrokerGetEndpointName(sbox_broker broker,
+                                             sbox_char16* buffer,
+                                             size_t buffer_length,
+                                             size_t* out_length) {
+  if (!broker)
+    return sbox_status_invalid_arg;
+  return CopyBrokerText(broker->endpoint_name, buffer, buffer_length,
+                        out_length);
+}
+
+sbox_status SBOX_CDECL BrokerGetContainerFinalPath(sbox_broker broker,
+                                                   sbox_char16* buffer,
+                                                   size_t buffer_length,
+                                                   size_t* out_length) {
+  if (!broker)
+    return sbox_status_invalid_arg;
+  return CopyBrokerText(broker->container_final_path, buffer, buffer_length,
+                        out_length);
+}
+
+sbox_status SBOX_CDECL BrokerGetPluginFinalPath(sbox_broker broker,
+                                                sbox_char16* buffer,
+                                                size_t buffer_length,
+                                                size_t* out_length) {
+  if (!broker)
+    return sbox_status_invalid_arg;
+  return CopyBrokerText(broker->plugin_final_path, buffer, buffer_length,
+                        out_length);
+}
+
 sbox_broker_api MakeBrokerApi() {
   sbox_broker_api api = SBOX_BROKER_API_INIT;
   api.configure_and_spawn = &BrokerConfigureAndSpawn;
   api.post_message = &BrokerPostMessage;
   api.close = &BrokerClose;
   api.wait = &BrokerWait;
+  api.get_endpoint_name = &BrokerGetEndpointName;
+  api.get_container_final_path = &BrokerGetContainerFinalPath;
+  api.get_plugin_final_path = &BrokerGetPluginFinalPath;
   return api;
 }
 
@@ -821,14 +872,14 @@ int RunBrokerPlugin(int argc,
     printf("[sbox] broker: immutable payload verification failed\n");
     return 3;
   }
+  broker.endpoint_name = endpoint;
+  broker.container_final_path = container_file.final_path();
+  broker.plugin_final_path = plugin_file.final_path();
   sbox_broker_start start = SBOX_BROKER_START_INIT;
   start.mode = mode;
-  start.endpoint_name = WideToSbox(endpoint.c_str());
   start.native_machine = container_file.machine();
   start.container_sha256 = container_file.sha256().data();
   start.plugin_sha256 = plugin_file.sha256().data();
-  start.container_final_path = WideToSbox(container_file.final_path().c_str());
-  start.plugin_final_path = WideToSbox(plugin_file.final_path().c_str());
   start.container_file_token = &container_file;
   start.plugin_file_token = &plugin_file;
   if (mode == sbox_broker_mode_dedicated) {

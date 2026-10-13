@@ -17,6 +17,7 @@
 // A second block runs Stela's generated layout tests: it extracts every library
 // in stela.config.json and compiles static asserts of each record's size,
 // alignment, and field offsets and each enumerator's value, on every target.
+// The same model must also pass `stela lint` with no findings at all.
 
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -27,7 +28,8 @@ import { compileJobs, compileUnits, msvcEnvs } from "../tools/stela/src/compile.
 import { loadConfig } from "../tools/stela/src/config.ts";
 import { extractModel } from "../tools/stela/src/extract.ts";
 import { generate } from "../tools/stela/src/generators.ts";
-import { formatMismatch } from "../tools/stela/src/model.ts";
+import { formatFindings, lintModel } from "../tools/stela/src/lint.ts";
+import { type Model, formatMismatch } from "../tools/stela/src/model.ts";
 import {
   type CompileJob,
   type CompileResult,
@@ -212,6 +214,7 @@ describe("Stela layout tests compile", () => {
   const config = loadConfig(path.join(repoRoot, "stela.config.json"));
   let dir = "";
   let setupError: string | undefined;
+  let extracted: Model | undefined;
   const results = new Map<string, CompileResult[]>();
 
   before(async () => {
@@ -226,6 +229,7 @@ describe("Stela layout tests compile", () => {
         setupError = mismatches.map(formatMismatch).join("\n");
         return;
       }
+      extracted = model;
       dir = mkdtempSync(path.join(os.tmpdir(), "header-check-layout-"));
       const files = generate("layout-tests", model);
       for (const file of files) {
@@ -263,4 +267,10 @@ describe("Stela layout tests compile", () => {
       if (failures) assert.fail(failures);
     });
   }
+
+  test("stela lint is clean", () => {
+    assert.ok(extracted, setupError ?? "model extraction failed");
+    const findings = lintModel(extracted, config);
+    assert.equal(findings.length, 0, formatFindings(findings, "text"));
+  });
 });

@@ -78,7 +78,7 @@ typedef struct v8_node_api_env_scope_s *v8_node_api_env_scope;
  * thread releases the data and must not reenter an environment being torn down.
  */
 typedef void(V8_NODE_API_CDECL *v8_node_api_data_delete_cb)(
-    V8_NODE_API_NULLABLE void *delete_data,
+    V8_NODE_API_NULLABLE void *user_data,
     V8_NODE_API_TRANSFER_FULL void *data);
 
 /**
@@ -109,20 +109,16 @@ typedef void(V8_NODE_API_CDECL *v8_node_api_task_runner_post_task_cb)(
  */
 typedef void(V8_NODE_API_CDECL *v8_node_api_script_cache_load_cb)(
     V8_NODE_API_NULLABLE void *user_data,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_ZERO_TERMINATED
-        const char *source_url_utf8,
+    V8_NODE_API_ZERO_TERMINATED const char *source_url_utf8,
     uint64_t source_hash,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_ZERO_TERMINATED
-        const char *runtime_name_utf8,
+    V8_NODE_API_ZERO_TERMINATED const char *runtime_name_utf8,
     uint64_t runtime_version,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_ZERO_TERMINATED
-        const char *cache_tag_utf8,
-    V8_NODE_API_OUT V8_NODE_API_TRANSFER_FULL const uint8_t **out_buffer,
-    V8_NODE_API_OUT size_t *out_buffer_size,
-    V8_NODE_API_OUT V8_NODE_API_SCOPE_ASYNC
-        V8_NODE_API_CLOSURE(out_delete_data)
-            v8_node_api_data_delete_cb *out_delete_buffer,
-    V8_NODE_API_OUT void **out_delete_data);
+    V8_NODE_API_ZERO_TERMINATED const char *cache_tag_utf8,
+    V8_NODE_API_TRANSFER_FULL const uint8_t **out_buffer,
+    size_t *out_buffer_size,
+    V8_NODE_API_SCOPE_ASYNC V8_NODE_API_CLOSURE(out_delete_data)
+        v8_node_api_data_delete_cb *out_delete_buffer,
+    void **out_delete_data);
 
 /**
  * Synchronously stores a cache buffer. The callback takes ownership of buffer
@@ -131,14 +127,11 @@ typedef void(V8_NODE_API_CDECL *v8_node_api_script_cache_load_cb)(
  */
 typedef void(V8_NODE_API_CDECL *v8_node_api_script_cache_store_cb)(
     V8_NODE_API_NULLABLE void *user_data,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_ZERO_TERMINATED
-        const char *source_url_utf8,
+    V8_NODE_API_ZERO_TERMINATED const char *source_url_utf8,
     uint64_t source_hash,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_ZERO_TERMINATED
-        const char *runtime_name_utf8,
+    V8_NODE_API_ZERO_TERMINATED const char *runtime_name_utf8,
     uint64_t runtime_version,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_ZERO_TERMINATED
-        const char *cache_tag_utf8,
+    V8_NODE_API_ZERO_TERMINATED const char *cache_tag_utf8,
     V8_NODE_API_TRANSFER_FULL const uint8_t *buffer,
     size_t buffer_size,
     V8_NODE_API_SCOPE_ASYNC V8_NODE_API_CLOSURE(delete_data)
@@ -151,7 +144,7 @@ typedef void(V8_NODE_API_CDECL *v8_node_api_script_cache_store_cb)(
  */
 typedef void(V8_NODE_API_CDECL *v8_node_api_utf8_output_cb)(
     V8_NODE_API_NULLABLE void *user_data,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_COUNT(length) const char *data,
+    const char *data,
     size_t length);
 
 /**
@@ -160,8 +153,7 @@ typedef void(V8_NODE_API_CDECL *v8_node_api_utf8_output_cb)(
  */
 typedef void(V8_NODE_API_CDECL *v8_node_api_heap_info_cb)(
     V8_NODE_API_NULLABLE void *user_data,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_ZERO_TERMINATED
-        const char *key_utf8,
+    V8_NODE_API_ZERO_TERMINATED const char *key_utf8,
     int64_t value);
 
 /**
@@ -182,17 +174,15 @@ typedef napi_status(V8_NODE_API_CDECL *v8_node_api_configure_runtime_cb)(
 V8_NODE_API_API napi_status V8_NODE_API_CDECL v8_node_api_runtime_create(
     uint32_t abi_version,
     V8_NODE_API_NULLABLE V8_NODE_API_SCOPE_CALL
-        V8_NODE_API_CLOSURE(user_data)
-            v8_node_api_configure_runtime_cb configure,
+        v8_node_api_configure_runtime_cb configure,
     V8_NODE_API_NULLABLE void *user_data,
-    V8_NODE_API_OUT v8_node_api_runtime *out_runtime);
+    v8_node_api_runtime *out_runtime);
 typedef napi_status(V8_NODE_API_CDECL *v8_node_api_runtime_create_fn)(
     uint32_t abi_version,
     V8_NODE_API_NULLABLE V8_NODE_API_SCOPE_CALL
-        V8_NODE_API_CLOSURE(user_data)
-            v8_node_api_configure_runtime_cb configure,
+        v8_node_api_configure_runtime_cb configure,
     V8_NODE_API_NULLABLE void *user_data,
-    V8_NODE_API_OUT v8_node_api_runtime *out_runtime);
+    v8_node_api_runtime *out_runtime);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_runtime_destroy(v8_node_api_runtime runtime);
@@ -201,10 +191,10 @@ typedef napi_status(V8_NODE_API_CDECL *v8_node_api_runtime_destroy_fn)(
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL v8_node_api_runtime_get_env(
     v8_node_api_runtime runtime,
-    V8_NODE_API_OUT napi_env *out_env);
+    napi_env *out_env);
 typedef napi_status(V8_NODE_API_CDECL *v8_node_api_runtime_get_env_fn)(
     v8_node_api_runtime runtime,
-    V8_NODE_API_OUT napi_env *out_env);
+    napi_env *out_env);
 
 /**
  * Returns a JSI ABI runtime borrowed for the lifetime of runtime. The caller
@@ -213,11 +203,11 @@ typedef napi_status(V8_NODE_API_CDECL *v8_node_api_runtime_get_env_fn)(
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_runtime_get_jsi_runtime(
     v8_node_api_runtime runtime,
-    V8_NODE_API_OUT jsi_runtime **out_runtime);
+    jsi_runtime **out_runtime);
 typedef napi_status(
     V8_NODE_API_CDECL *v8_node_api_runtime_get_jsi_runtime_fn)(
     v8_node_api_runtime runtime,
-    V8_NODE_API_OUT jsi_runtime **out_runtime);
+    jsi_runtime **out_runtime);
 
 /* Factory-owned config setters. A config is valid only in configure. */
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
@@ -232,12 +222,12 @@ typedef napi_status(
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_config_set_inspector_runtime_name_utf8(
     v8_node_api_config config,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_COUNT(length) const char *value,
+    const char *value,
     size_t length);
 typedef napi_status(
     V8_NODE_API_CDECL *v8_node_api_config_set_inspector_runtime_name_utf8_fn)(
     v8_node_api_config config,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_COUNT(length) const char *value,
+    const char *value,
     size_t length);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
@@ -284,9 +274,8 @@ typedef napi_status(
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_config_set_task_runner(
     v8_node_api_config config,
-    V8_NODE_API_SCOPE_NOTIFIED V8_NODE_API_CLOSURE(user_data)
-        V8_NODE_API_DESTROY(delete_user_data)
-            v8_node_api_task_runner_post_task_cb post_task,
+    V8_NODE_API_SCOPE_NOTIFIED V8_NODE_API_DESTROY(delete_user_data)
+        v8_node_api_task_runner_post_task_cb post_task,
     V8_NODE_API_NULLABLE void *user_data,
     V8_NODE_API_NULLABLE V8_NODE_API_SCOPE_ASYNC
         V8_NODE_API_CLOSURE(delete_data)
@@ -294,9 +283,8 @@ v8_node_api_config_set_task_runner(
     V8_NODE_API_NULLABLE void *delete_data);
 typedef napi_status(V8_NODE_API_CDECL *v8_node_api_config_set_task_runner_fn)(
     v8_node_api_config config,
-    V8_NODE_API_SCOPE_NOTIFIED V8_NODE_API_CLOSURE(user_data)
-        V8_NODE_API_DESTROY(delete_user_data)
-            v8_node_api_task_runner_post_task_cb post_task,
+    V8_NODE_API_SCOPE_NOTIFIED V8_NODE_API_DESTROY(delete_user_data)
+        v8_node_api_task_runner_post_task_cb post_task,
     V8_NODE_API_NULLABLE void *user_data,
     V8_NODE_API_NULLABLE V8_NODE_API_SCOPE_ASYNC
         V8_NODE_API_CLOSURE(delete_data)
@@ -315,9 +303,8 @@ v8_node_api_config_set_script_cache(
     V8_NODE_API_SCOPE_NOTIFIED V8_NODE_API_CLOSURE(user_data)
         V8_NODE_API_DESTROY(delete_user_data)
             v8_node_api_script_cache_load_cb load,
-    V8_NODE_API_SCOPE_NOTIFIED V8_NODE_API_CLOSURE(user_data)
-        V8_NODE_API_DESTROY(delete_user_data)
-            v8_node_api_script_cache_store_cb store,
+    V8_NODE_API_SCOPE_NOTIFIED V8_NODE_API_DESTROY(delete_user_data)
+        v8_node_api_script_cache_store_cb store,
     V8_NODE_API_NULLABLE void *user_data,
     V8_NODE_API_NULLABLE V8_NODE_API_SCOPE_ASYNC
         V8_NODE_API_CLOSURE(delete_data)
@@ -328,9 +315,8 @@ typedef napi_status(V8_NODE_API_CDECL *v8_node_api_config_set_script_cache_fn)(
     V8_NODE_API_SCOPE_NOTIFIED V8_NODE_API_CLOSURE(user_data)
         V8_NODE_API_DESTROY(delete_user_data)
             v8_node_api_script_cache_load_cb load,
-    V8_NODE_API_SCOPE_NOTIFIED V8_NODE_API_CLOSURE(user_data)
-        V8_NODE_API_DESTROY(delete_user_data)
-            v8_node_api_script_cache_store_cb store,
+    V8_NODE_API_SCOPE_NOTIFIED V8_NODE_API_DESTROY(delete_user_data)
+        v8_node_api_script_cache_store_cb store,
     V8_NODE_API_NULLABLE void *user_data,
     V8_NODE_API_NULLABLE V8_NODE_API_SCOPE_ASYNC
         V8_NODE_API_CLOSURE(delete_data)
@@ -339,10 +325,10 @@ typedef napi_status(V8_NODE_API_CDECL *v8_node_api_config_set_script_cache_fn)(
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL v8_node_api_env_scope_open(
     napi_env env,
-    V8_NODE_API_OUT v8_node_api_env_scope *out_scope);
+    v8_node_api_env_scope *out_scope);
 typedef napi_status(V8_NODE_API_CDECL *v8_node_api_env_scope_open_fn)(
     napi_env env,
-    V8_NODE_API_OUT v8_node_api_env_scope *out_scope);
+    v8_node_api_env_scope *out_scope);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL v8_node_api_env_scope_close(
     v8_node_api_env_scope scope,
@@ -354,11 +340,11 @@ typedef napi_status(V8_NODE_API_CDECL *v8_node_api_env_scope_close_fn)(
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_env_get_description_utf8(
     napi_env env,
-    V8_NODE_API_OUT const char **out_description);
+    const char **out_description);
 typedef napi_status(
     V8_NODE_API_CDECL *v8_node_api_env_get_description_utf8_fn)(
     napi_env env,
-    V8_NODE_API_OUT const char **out_description);
+    const char **out_description);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_env_queue_microtask(napi_env env, napi_value callback);
@@ -370,36 +356,34 @@ V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_env_drain_microtasks(
     napi_env env,
     int32_t max_count_hint,
-    V8_NODE_API_OUT bool *out_drained);
+    bool *out_drained);
 typedef napi_status(V8_NODE_API_CDECL *v8_node_api_env_drain_microtasks_fn)(
     napi_env env,
     int32_t max_count_hint,
-    V8_NODE_API_OUT bool *out_drained);
+    bool *out_drained);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_env_is_inspectable(
     napi_env env,
-    V8_NODE_API_OUT bool *out_inspectable);
+    bool *out_inspectable);
 typedef napi_status(V8_NODE_API_CDECL *v8_node_api_env_is_inspectable_fn)(
     napi_env env,
-    V8_NODE_API_OUT bool *out_inspectable);
+    bool *out_inspectable);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL v8_node_api_env_run_script_utf8(
     napi_env env,
     napi_value source,
-    V8_NODE_API_NULLABLE V8_NODE_API_ENCODING(utf8)
-        V8_NODE_API_COUNT(source_url_length)
+    V8_NODE_API_NULLABLE V8_NODE_API_COUNT(source_url_length)
         const char *source_url_utf8,
     size_t source_url_length,
-    V8_NODE_API_OUT napi_value *out_result);
+    napi_value *out_result);
 typedef napi_status(V8_NODE_API_CDECL *v8_node_api_env_run_script_utf8_fn)(
     napi_env env,
     napi_value source,
-    V8_NODE_API_NULLABLE V8_NODE_API_ENCODING(utf8)
-        V8_NODE_API_COUNT(source_url_length)
+    V8_NODE_API_NULLABLE V8_NODE_API_COUNT(source_url_length)
         const char *source_url_utf8,
     size_t source_url_length,
-    V8_NODE_API_OUT napi_value *out_result);
+    napi_value *out_result);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_prepared_script_create_utf8(
@@ -410,10 +394,9 @@ v8_node_api_prepared_script_create_utf8(
         V8_NODE_API_CLOSURE(delete_data)
             v8_node_api_data_delete_cb delete_script,
     V8_NODE_API_NULLABLE void *delete_data,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_COUNT(source_url_length)
-        const char *source_url_utf8,
+    V8_NODE_API_COUNT(source_url_length) const char *source_url_utf8,
     size_t source_url_length,
-    V8_NODE_API_OUT v8_node_api_prepared_script *out_script);
+    v8_node_api_prepared_script *out_script);
 typedef napi_status(
     V8_NODE_API_CDECL *v8_node_api_prepared_script_create_utf8_fn)(
     napi_env env,
@@ -423,10 +406,9 @@ typedef napi_status(
         V8_NODE_API_CLOSURE(delete_data)
             v8_node_api_data_delete_cb delete_script,
     V8_NODE_API_NULLABLE void *delete_data,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_COUNT(source_url_length)
-        const char *source_url_utf8,
+    V8_NODE_API_COUNT(source_url_length) const char *source_url_utf8,
     size_t source_url_length,
-    V8_NODE_API_OUT v8_node_api_prepared_script *out_script);
+    v8_node_api_prepared_script *out_script);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_prepared_script_destroy(
@@ -441,50 +423,44 @@ V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_prepared_script_run(
     v8_node_api_prepared_script script,
     napi_env env,
-    V8_NODE_API_OUT napi_value *out_result);
+    napi_value *out_result);
 typedef napi_status(V8_NODE_API_CDECL *v8_node_api_prepared_script_run_fn)(
     v8_node_api_prepared_script script,
     napi_env env,
-    V8_NODE_API_OUT napi_value *out_result);
+    napi_value *out_result);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_env_get_recorded_gc_stats_utf8(
     napi_env env,
-    V8_NODE_API_SCOPE_CALL V8_NODE_API_CLOSURE(user_data)
-        v8_node_api_utf8_output_cb callback,
+    V8_NODE_API_SCOPE_CALL v8_node_api_utf8_output_cb callback,
     V8_NODE_API_NULLABLE void *user_data);
 typedef napi_status(
     V8_NODE_API_CDECL *v8_node_api_env_get_recorded_gc_stats_utf8_fn)(
     napi_env env,
-    V8_NODE_API_SCOPE_CALL V8_NODE_API_CLOSURE(user_data)
-        v8_node_api_utf8_output_cb callback,
+    V8_NODE_API_SCOPE_CALL v8_node_api_utf8_output_cb callback,
     V8_NODE_API_NULLABLE void *user_data);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_env_get_heap_info(
     napi_env env,
     bool include_expensive,
-    V8_NODE_API_SCOPE_CALL V8_NODE_API_CLOSURE(user_data)
-        v8_node_api_heap_info_cb callback,
+    V8_NODE_API_SCOPE_CALL v8_node_api_heap_info_cb callback,
     V8_NODE_API_NULLABLE void *user_data);
 typedef napi_status(V8_NODE_API_CDECL *v8_node_api_env_get_heap_info_fn)(
     napi_env env,
     bool include_expensive,
-    V8_NODE_API_SCOPE_CALL V8_NODE_API_CLOSURE(user_data)
-        v8_node_api_heap_info_cb callback,
+    V8_NODE_API_SCOPE_CALL v8_node_api_heap_info_cb callback,
     V8_NODE_API_NULLABLE void *user_data);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_env_collect_garbage_utf8(
     napi_env env,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_COUNT(cause_length)
-        const char *cause_utf8,
+    V8_NODE_API_COUNT(cause_length) const char *cause_utf8,
     size_t cause_length);
 typedef napi_status(
     V8_NODE_API_CDECL *v8_node_api_env_collect_garbage_utf8_fn)(
     napi_env env,
-    V8_NODE_API_ENCODING(utf8) V8_NODE_API_COUNT(cause_length)
-        const char *cause_utf8,
+    V8_NODE_API_COUNT(cause_length) const char *cause_utf8,
     size_t cause_length);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
@@ -497,29 +473,25 @@ typedef napi_status(
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_env_stop_heap_sampling_utf8(
     napi_env env,
-    V8_NODE_API_SCOPE_CALL V8_NODE_API_CLOSURE(user_data)
-        v8_node_api_utf8_output_cb callback,
+    V8_NODE_API_SCOPE_CALL v8_node_api_utf8_output_cb callback,
     V8_NODE_API_NULLABLE void *user_data);
 typedef napi_status(
     V8_NODE_API_CDECL *v8_node_api_env_stop_heap_sampling_utf8_fn)(
     napi_env env,
-    V8_NODE_API_SCOPE_CALL V8_NODE_API_CLOSURE(user_data)
-        v8_node_api_utf8_output_cb callback,
+    V8_NODE_API_SCOPE_CALL v8_node_api_utf8_output_cb callback,
     V8_NODE_API_NULLABLE void *user_data);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_env_create_heap_snapshot_utf8(
     napi_env env,
     bool capture_numeric_value,
-    V8_NODE_API_SCOPE_CALL V8_NODE_API_CLOSURE(user_data)
-        v8_node_api_utf8_output_cb callback,
+    V8_NODE_API_SCOPE_CALL v8_node_api_utf8_output_cb callback,
     V8_NODE_API_NULLABLE void *user_data);
 typedef napi_status(
     V8_NODE_API_CDECL *v8_node_api_env_create_heap_snapshot_utf8_fn)(
     napi_env env,
     bool capture_numeric_value,
-    V8_NODE_API_SCOPE_CALL V8_NODE_API_CLOSURE(user_data)
-        v8_node_api_utf8_output_cb callback,
+    V8_NODE_API_SCOPE_CALL v8_node_api_utf8_output_cb callback,
     V8_NODE_API_NULLABLE void *user_data);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
@@ -531,31 +503,31 @@ typedef napi_status(
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_env_has_unhandled_promise_rejection(
     napi_env env,
-    V8_NODE_API_OUT bool *out_has_rejection);
+    bool *out_has_rejection);
 typedef napi_status(
     V8_NODE_API_CDECL *v8_node_api_env_has_unhandled_promise_rejection_fn)(
     napi_env env,
-    V8_NODE_API_OUT bool *out_has_rejection);
+    bool *out_has_rejection);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_env_get_and_clear_last_unhandled_promise_rejection(
     napi_env env,
-    V8_NODE_API_OUT napi_value *out_rejection);
+    napi_value *out_rejection);
 typedef napi_status(
     V8_NODE_API_CDECL
         *v8_node_api_env_get_and_clear_last_unhandled_promise_rejection_fn)(
     napi_env env,
-    V8_NODE_API_OUT napi_value *out_rejection);
+    napi_value *out_rejection);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL
 v8_node_api_env_create_module(
     napi_env root_env,
     int32_t api_version,
-    V8_NODE_API_OUT napi_env *out_env);
+    napi_env *out_env);
 typedef napi_status(V8_NODE_API_CDECL *v8_node_api_env_create_module_fn)(
     napi_env root_env,
     int32_t api_version,
-    V8_NODE_API_OUT napi_env *out_env);
+    napi_env *out_env);
 
 V8_NODE_API_API napi_status V8_NODE_API_CDECL v8_node_api_env_run_task(
     napi_env env,

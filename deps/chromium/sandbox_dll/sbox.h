@@ -66,7 +66,7 @@
 #endif
 #endif
 
-#define SBOX_ABI_VERSION 6u
+#define SBOX_ABI_VERSION 7u
 
 #ifdef __cplusplus
 extern "C" {
@@ -167,27 +167,25 @@ typedef void(SBOX_CDECL* sbox_message_cb)(SBOX_NULLABLE void* user_data,
 
 /**
  * Host-owned identity storage borrowed only for broker_run. The opaque tokens
- * are never serialized and must not be closed by the plugin.
+ * are never serialized and must not be closed by the plugin. The endpoint name
+ * and final paths are read through sbox_broker_api.
  */
 typedef struct sbox_broker_start {
   uint32_t struct_size;                     ///< sizeof(sbox_broker_start)
   sbox_broker_mode mode;                    ///< how the broker was started
-  const sbox_char16* endpoint_name;         ///< the rendezvous endpoint name
   uint16_t native_machine;                  ///< sbox.exe's PE machine (IMAGE_FILE_MACHINE_*)
   uint16_t reserved;                        ///< zero
   const uint8_t* container_sha256;          ///< 32-byte hash of sbox.exe
   const uint8_t* plugin_sha256;             ///< 32-byte hash of the plugin DLL
-  const sbox_char16* container_final_path;  ///< sbox.exe's final path
-  const sbox_char16* plugin_final_path;     ///< the plugin DLL's final path
   const void* container_file_token;         ///< opaque host token for sbox.exe
   const void* plugin_file_token;            ///< opaque host token for the plugin
   /// The dedicated-mode launch nonce; NULL in shared mode.
   SBOX_NULLABLE const uint8_t* dedicated_nonce;
   size_t dedicated_nonce_size;              ///< the nonce's size in bytes
 } sbox_broker_start;
-#define SBOX_BROKER_START_INIT                                              \
-  {sizeof(sbox_broker_start), sbox_broker_mode_dedicated, NULL, 0, 0, NULL, \
-   NULL, NULL, NULL, NULL, NULL, NULL, 0}
+#define SBOX_BROKER_START_INIT                                           \
+  {sizeof(sbox_broker_start), sbox_broker_mode_dedicated, 0, 0, NULL, NULL, \
+   NULL, NULL, NULL, 0}
 
 /**
  * sbox.exe -> plugin, BROKER role: worker spawning and the broker side of the
@@ -203,6 +201,13 @@ typedef struct sbox_broker_start {
  * Callbacks must return promptly and never block or call close/wait; wait
  * gives the reader 5 s to join; a callback still running after that budget is
  * unsupported.
+ *
+ * The get_* text slots copy host text into a caller-owned buffer. Each sets
+ * *out_length to the text's length in sbox_char16 units, without the NUL.
+ * With a NULL buffer and buffer_length 0 it only reports the length. Otherwise
+ * buffer_length must exceed the length; the slot then writes the text and a
+ * NUL. A buffer that is too small gets sbox_status_invalid_arg, nothing
+ * written, and the required length in *out_length.
  */
 typedef struct sbox_broker_api {
   uint32_t struct_size;  ///< sizeof(sbox_broker_api)
@@ -227,8 +232,26 @@ typedef struct sbox_broker_api {
   /// once per worker.
   sbox_status(SBOX_CDECL* wait)(sbox_broker_worker worker,
                                 int32_t* out_exit_code);
+  /// Copies the rendezvous endpoint name.
+  sbox_status(SBOX_CDECL* get_endpoint_name)(sbox_broker broker,
+                                             SBOX_NULLABLE sbox_char16* buffer,
+                                             size_t buffer_length,
+                                             size_t* out_length);
+  /// Copies sbox.exe's final path.
+  sbox_status(SBOX_CDECL* get_container_final_path)(
+      sbox_broker broker,
+      SBOX_NULLABLE sbox_char16* buffer,
+      size_t buffer_length,
+      size_t* out_length);
+  /// Copies the plugin DLL's final path.
+  sbox_status(SBOX_CDECL* get_plugin_final_path)(
+      sbox_broker broker,
+      SBOX_NULLABLE sbox_char16* buffer,
+      size_t buffer_length,
+      size_t* out_length);
 } sbox_broker_api;
-#define SBOX_BROKER_API_INIT {sizeof(sbox_broker_api), NULL, NULL, NULL, NULL}
+#define SBOX_BROKER_API_INIT \
+  {sizeof(sbox_broker_api), NULL, NULL, NULL, NULL, NULL, NULL, NULL}
 
 /**
  * sbox.exe -> plugin, BROKER role: services configure() uses to describe the
@@ -247,21 +270,25 @@ typedef struct sbox_config_api {
                                          sbox_integrity_level delayed);
   /// Adds a path pattern the worker may access.
   sbox_status(SBOX_CDECL* add_file_rule)(sbox_config config,
-                                         const sbox_char16* pattern,
+                                         SBOX_ZERO_TERMINATED
+                                             const sbox_char16* pattern,
                                          bool readonly);
   /// Adds an AppContainer capability SID.
-  sbox_status(SBOX_CDECL* add_capability)(sbox_config config,
-                                          const sbox_char16* capability_sid);
+  sbox_status(SBOX_CDECL* add_capability)(
+      sbox_config config,
+      SBOX_ZERO_TERMINATED const sbox_char16* capability_sid);
   /// AppContainer mode, optionally less-privileged (LPAC), with its profile
-  /// name.
-  sbox_status(SBOX_CDECL* set_app_container)(sbox_config config,
-                                             bool enabled,
-                                             bool lpac,
-                                             const sbox_char16* profile);
+  /// name. The profile may be NULL or empty only when enabled is false.
+  sbox_status(SBOX_CDECL* set_app_container)(
+      sbox_config config,
+      bool enabled,
+      bool lpac,
+      SBOX_NULLABLE SBOX_ZERO_TERMINATED const sbox_char16* profile);
   /// A DLL the worker will LoadLibrary pre-lockdown. sbox verifies each
   /// (app-dir filename only, Authenticode). The plugin DLL itself is implicit.
-  sbox_status(SBOX_CDECL* allow_engine_dll)(sbox_config config,
-                                            const sbox_char16* filename);
+  sbox_status(SBOX_CDECL* allow_engine_dll)(
+      sbox_config config,
+      SBOX_ZERO_TERMINATED const sbox_char16* filename);
   /// Opaque app-knowledge blob carried broker -> worker; sbox NEVER interprets
   /// it. The plugin encodes its own run profile here (e.g. jitless engine
   /// choice, snapshot path) and reads it back in warmup via
