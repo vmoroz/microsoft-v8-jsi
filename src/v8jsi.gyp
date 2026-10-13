@@ -95,7 +95,8 @@
 
     # Node-API sources — restored to the GYP build after being lost in the
     # GN→GYP migration. Always-on; v8jsi.dll ships with Node-API support.
-    # Office, RNW, and other consumers depend on the napi_* / jsr_* exports.
+    # Office, RNW, and other consumers depend on the napi_* /
+    # v8_node_api_* exports.
     'v8jsi_node_api_sources': [
       '<(v8jsi_root)/src/node-api/env-inl.h',
       '<(v8jsi_root)/src/node-api/js_native_api.h',
@@ -104,9 +105,9 @@
       '<(v8jsi_root)/src/node-api/js_native_api_v8.h',
       '<(v8jsi_root)/src/node-api/js_native_api_v8_internals.h',
       '<(v8jsi_root)/src/node-api/js_native_api_v8_internals_abi.h',
-      '<(v8jsi_root)/src/node-api/js_runtime_api.h',
+      '<(v8jsi_root)/src/node-api/v8_node_api.h',
+      '<(v8jsi_root)/src/node-api/v8_node_api_stela.h',
       '<(v8jsi_root)/src/node-api/util-inl.h',
-      '<(v8jsi_root)/src/node-api/v8_api.h',
       '<(v8jsi_root)/src/node-api/v8_api_abi.cpp',
       '<(v8jsi_root)/src/public/compat.h',
     ],
@@ -233,6 +234,7 @@
         'JSI_ABI_BUILDING',
         'JSI_ABI_IMPL',
         'V8_JSI_ABI_IMPL',
+        'V8_NODE_API_IMPL',
         'V8JSI_ENABLE_NODE_API',
       ],
 

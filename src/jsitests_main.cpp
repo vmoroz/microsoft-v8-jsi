@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 #include <jsi/jsi.h>
+#include <algorithm>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -15,7 +16,7 @@
 #include "jsi_abi/JsiAbiRuntime.h"
 #include "jsi_abi/jsi_abi_helpers.h"
 #include "jsi_abi/v8_jsi_abi.h"
-#include "js_runtime_api.h"
+#include "v8_node_api.h"
 
 // test-only hook (declared in jsi_abi_v8.cpp). Posts a task to the
 // runtime's foreground task runner — used by JsiAbiTaskRunner.LifecycleAndPostTask
@@ -444,32 +445,38 @@ TEST(JsiAbiInspector, LifecycleAndOpen) {
 #endif
 }
 
-// Node-API revival smoke test. Confirms that the napi_*/jsr_* surface
+namespace {
+
+napi_status V8_NODE_API_CDECL configureNodeApiGc(
+    void*,
+    v8_node_api_config config) {
+  return v8_node_api_config_set_gc_api_enabled(config, true);
+}
+
+}  // namespace
+
+// Node-API revival smoke test. Confirms that the napi_*/v8_node_api_* surface
 // compiled into v8jsi.dll works end-to-end:
-//   1. Build a jsr_config and create a jsr_runtime.
+//   1. Create a v8_node_api_runtime with a pull-config callback.
 //   2. Obtain the napi_env and open an env scope.
 //   3. Run a trivial JS script via napi_run_script and read back a number.
 //   4. Tear down env scope and runtime.
 // The point is to prove the path is wired, not to exhaustively cover Node-API.
 // Full N-API conformance comes back later.
 TEST(NodeApiSmoke, CreateRuntimeAndRunScript) {
-  jsr_config config{};
-  ASSERT_EQ(jsr_create_config(&config), napi_ok);
-  ASSERT_NE(config, nullptr);
-  jsr_config_enable_gc_api(config, true);
-
-  jsr_runtime runtime{};
-  ASSERT_EQ(jsr_create_runtime(config, &runtime), napi_ok);
+  v8_node_api_runtime runtime{};
+  ASSERT_EQ(
+      v8_node_api_runtime_create(
+          V8_NODE_API_ABI_VERSION, configureNodeApiGc, nullptr, &runtime),
+      napi_ok);
   ASSERT_NE(runtime, nullptr);
-  // jsr_create_runtime takes ownership of config-owned state; safe to free now.
-  ASSERT_EQ(jsr_delete_config(config), napi_ok);
 
   napi_env env{};
-  ASSERT_EQ(jsr_runtime_get_node_api_env(runtime, &env), napi_ok);
+  ASSERT_EQ(v8_node_api_runtime_get_env(runtime, &env), napi_ok);
   ASSERT_NE(env, nullptr);
 
-  jsr_napi_env_scope envScope{};
-  ASSERT_EQ(jsr_open_napi_env_scope(env, &envScope), napi_ok);
+  v8_node_api_env_scope envScope{};
+  ASSERT_EQ(v8_node_api_env_scope_open(env, &envScope), napi_ok);
 
   {
     napi_handle_scope handleScope{};
@@ -481,7 +488,14 @@ TEST(NodeApiSmoke, CreateRuntimeAndRunScript) {
         napi_ok);
 
     napi_value result{};
-    ASSERT_EQ(jsr_run_script(env, source, "w6-smoke.js", &result), napi_ok);
+    ASSERT_EQ(
+        v8_node_api_env_run_script_utf8(
+            env,
+            source,
+            "w6-smoke.js",
+            V8_NODE_API_AUTO_LENGTH,
+            &result),
+        napi_ok);
 
     double value{};
     ASSERT_EQ(napi_get_value_double(env, result, &value), napi_ok);
@@ -490,37 +504,35 @@ TEST(NodeApiSmoke, CreateRuntimeAndRunScript) {
     ASSERT_EQ(napi_close_handle_scope(env, handleScope), napi_ok);
   }
 
-  ASSERT_EQ(jsr_close_napi_env_scope(env, envScope), napi_ok);
-  ASSERT_EQ(jsr_delete_runtime(runtime), napi_ok);
+  ASSERT_EQ(v8_node_api_env_scope_close(envScope, env), napi_ok);
+  ASSERT_EQ(v8_node_api_runtime_destroy(runtime), napi_ok);
 }
 
 // dual-API smoke test. The original reason `V8RuntimeEnv : public V8Runtime`
-// existed was so a consumer could create a runtime via Node-API (jsr_*) and
+// existed was so a consumer could create a runtime via Node-API and
 // also reach into the same V8 isolate through the JSI APIs. Now the
 // inheritance is gone, but the contract is preserved through:
 //   1. v8_jsi_abi_runtime_create + v8_attach_node_api as the underlying primitives.
-//   2. jsr_create_runtime as the same convenience entry point, internally
+//   2. v8_node_api_runtime_create as the same convenience entry point, internally
 //      calling those two.
-//   3. jsr_runtime_get_jsi_runtime as the accessor that lets a napi-created
+//   3. v8_node_api_runtime_get_jsi_runtime as the accessor that lets a napi-created
 //      runtime hand back a jsi_runtime * a JsiAbiRuntime can wrap.
 // The test sets a global property from the napi side and reads it back from
 // the JSI side over the same V8 isolate — the smallest possible exercise of
 // the dual-API contract.
 TEST(DualApi, NodeApiAndJsiShareIsolate) {
-  jsr_config config{};
-  ASSERT_EQ(jsr_create_config(&config), napi_ok);
-  jsr_config_enable_gc_api(config, true);
-
-  jsr_runtime runtime{};
-  ASSERT_EQ(jsr_create_runtime(config, &runtime), napi_ok);
-  ASSERT_EQ(jsr_delete_config(config), napi_ok);
+  v8_node_api_runtime runtime{};
+  ASSERT_EQ(
+      v8_node_api_runtime_create(
+          V8_NODE_API_ABI_VERSION, configureNodeApiGc, nullptr, &runtime),
+      napi_ok);
 
   // Node-API side: set globalThis.W8DualValue = 42.
   napi_env env{};
-  ASSERT_EQ(jsr_runtime_get_node_api_env(runtime, &env), napi_ok);
+  ASSERT_EQ(v8_node_api_runtime_get_env(runtime, &env), napi_ok);
 
-  jsr_napi_env_scope envScope{};
-  ASSERT_EQ(jsr_open_napi_env_scope(env, &envScope), napi_ok);
+  v8_node_api_env_scope envScope{};
+  ASSERT_EQ(v8_node_api_env_scope_open(env, &envScope), napi_ok);
   {
     napi_handle_scope handleScope{};
     ASSERT_EQ(napi_open_handle_scope(env, &handleScope), napi_ok);
@@ -533,20 +545,27 @@ TEST(DualApi, NodeApiAndJsiShareIsolate) {
                                  &source),
         napi_ok);
     napi_value result{};
-    ASSERT_EQ(jsr_run_script(env, source, "w8-dual-set.js", &result), napi_ok);
+    ASSERT_EQ(
+        v8_node_api_env_run_script_utf8(
+            env,
+            source,
+            "w8-dual-set.js",
+            V8_NODE_API_AUTO_LENGTH,
+            &result),
+        napi_ok);
 
     ASSERT_EQ(napi_close_handle_scope(env, handleScope), napi_ok);
   }
-  ASSERT_EQ(jsr_close_napi_env_scope(env, envScope), napi_ok);
+  ASSERT_EQ(v8_node_api_env_scope_close(envScope, env), napi_ok);
 
   // JSI side: pull the underlying jsi_runtime out and wrap it as a
   // JsiAbiRuntime. Read back the property; assert it matches.
   jsi_runtime *abiRuntime{};
-  ASSERT_EQ(jsr_runtime_get_jsi_runtime(runtime, &abiRuntime), napi_ok);
+  ASSERT_EQ(v8_node_api_runtime_get_jsi_runtime(runtime, &abiRuntime), napi_ok);
   ASSERT_NE(abiRuntime, nullptr);
 
   // Wrap the ABI runtime as a jsi::Runtime. wrapJsiRuntime adds its own ref,
-  // independent of the one held by the jsr_runtime — both sides can release
+  // independent of the one held by the v8_node_api_runtime — both sides can release
   // in any order; the runtime is destroyed when the last ref drops.
   auto wrapper = ::jsi::abi::wrapJsiRuntime(abiRuntime);
   facebook::jsi::Runtime &jsiRt = *wrapper;
@@ -555,7 +574,358 @@ TEST(DualApi, NodeApiAndJsiShareIsolate) {
   ASSERT_TRUE(v.isNumber());
   EXPECT_EQ(v.getNumber(), 42.0);
 
-  ASSERT_EQ(jsr_delete_runtime(runtime), napi_ok);
+  ASSERT_EQ(v8_node_api_runtime_destroy(runtime), napi_ok);
+}
+
+namespace {
+
+struct NodeApiDeleteProbe {
+  void* expectedData{};
+  int calls{};
+  bool argumentsCorrect{true};
+};
+
+void V8_NODE_API_CDECL deleteNodeApiProbe(void* delete_data, void* data) {
+  auto* probe = static_cast<NodeApiDeleteProbe*>(delete_data);
+  ++probe->calls;
+  probe->argumentsCorrect =
+      probe->argumentsCorrect && data == probe->expectedData;
+}
+
+void V8_NODE_API_CDECL ignorePostedTask(
+    void*,
+    void* task_data,
+    v8_node_api_task_run_cb,
+    v8_node_api_data_delete_cb delete_task,
+    void* delete_data) {
+  if (delete_task) {
+    EXPECT_NE(task_data, delete_data);
+    delete_task(delete_data, task_data);
+  }
+}
+
+void V8_NODE_API_CDECL emptyScriptCacheLoad(
+    void*,
+    const char*,
+    uint64_t,
+    const char*,
+    uint64_t,
+    const char*,
+    const uint8_t** out_buffer,
+    size_t* out_buffer_size,
+    v8_node_api_data_delete_cb* out_delete_buffer,
+    void** out_delete_data) {
+  *out_buffer = nullptr;
+  *out_buffer_size = 0;
+  *out_delete_buffer = nullptr;
+  *out_delete_data = nullptr;
+}
+
+void V8_NODE_API_CDECL discardScriptCacheStore(
+    void*,
+    const char*,
+    uint64_t,
+    const char*,
+    uint64_t,
+    const char*,
+    const uint8_t* buffer,
+    size_t,
+    v8_node_api_data_delete_cb delete_buffer,
+    void* delete_data) {
+  if (delete_buffer) {
+    delete_buffer(delete_data, const_cast<uint8_t*>(buffer));
+  }
+}
+
+struct NodeApiConfigureTestState {
+  NodeApiDeleteProbe* runnerProbe;
+  void* runnerData;
+  NodeApiDeleteProbe* cacheProbe;
+  void* cacheData;
+  napi_status result;
+  bool poison;
+};
+
+struct NodeApiScriptCacheTestState {
+  std::vector<uint8_t> cache;
+  NodeApiDeleteProbe loadProbe;
+  int storeCalls{};
+  bool storeArgumentsCorrect{true};
+};
+
+void V8_NODE_API_CDECL deleteLoadedCache(void* delete_data, void* data) {
+  auto* state = static_cast<NodeApiScriptCacheTestState*>(delete_data);
+  deleteNodeApiProbe(&state->loadProbe, data);
+  delete[] static_cast<uint8_t*>(data);
+}
+
+void V8_NODE_API_CDECL loadScriptCache(
+    void* user_data,
+    const char*,
+    uint64_t,
+    const char*,
+    uint64_t,
+    const char*,
+    const uint8_t** out_buffer,
+    size_t* out_buffer_size,
+    v8_node_api_data_delete_cb* out_delete_buffer,
+    void** out_delete_data) {
+  auto* state = static_cast<NodeApiScriptCacheTestState*>(user_data);
+  if (state->cache.empty()) {
+    *out_buffer = nullptr;
+    *out_buffer_size = 0;
+    *out_delete_buffer = nullptr;
+    *out_delete_data = nullptr;
+    return;
+  }
+  auto* copy = new uint8_t[state->cache.size()];
+  std::copy(state->cache.begin(), state->cache.end(), copy);
+  state->loadProbe.expectedData = copy;
+  *out_buffer = copy;
+  *out_buffer_size = state->cache.size();
+  *out_delete_buffer = deleteLoadedCache;
+  *out_delete_data = state;
+}
+
+void V8_NODE_API_CDECL storeScriptCache(
+    void* user_data,
+    const char*,
+    uint64_t,
+    const char*,
+    uint64_t,
+    const char*,
+    const uint8_t* buffer,
+    size_t buffer_size,
+    v8_node_api_data_delete_cb delete_buffer,
+    void* delete_data) {
+  auto* state = static_cast<NodeApiScriptCacheTestState*>(user_data);
+  ++state->storeCalls;
+  state->storeArgumentsCorrect =
+      state->storeArgumentsCorrect && delete_data != buffer;
+  state->cache.assign(buffer, buffer + buffer_size);
+  delete_buffer(delete_data, const_cast<uint8_t*>(buffer));
+}
+
+napi_status V8_NODE_API_CDECL configureScriptCache(
+    void* user_data,
+    v8_node_api_config config) {
+  return v8_node_api_config_set_script_cache(
+      config,
+      loadScriptCache,
+      storeScriptCache,
+      user_data,
+      nullptr,
+      nullptr);
+}
+
+napi_status V8_NODE_API_CDECL configureNodeApiOwnership(
+    void* user_data,
+    v8_node_api_config config) {
+  auto* state = static_cast<NodeApiConfigureTestState*>(user_data);
+  if (state->poison) {
+    EXPECT_EQ(
+        v8_node_api_config_set_inspector_runtime_name_utf8(
+            config, nullptr, 1),
+        napi_invalid_arg);
+  }
+  napi_status status = v8_node_api_config_set_task_runner(
+      config,
+      ignorePostedTask,
+      state->runnerData,
+      deleteNodeApiProbe,
+      state->runnerProbe);
+  EXPECT_EQ(status, state->poison ? napi_invalid_arg : napi_ok);
+  status = v8_node_api_config_set_script_cache(
+      config,
+      emptyScriptCacheLoad,
+      discardScriptCacheStore,
+      state->cacheData,
+      deleteNodeApiProbe,
+      state->cacheProbe);
+  EXPECT_EQ(status, state->poison ? napi_invalid_arg : napi_ok);
+  return state->result;
+}
+
+}  // namespace
+
+TEST(NodeApiConfig, PullConfigurationAndCleanup) {
+  int runnerData{};
+  int cacheData{};
+  NodeApiDeleteProbe successRunnerProbe{&runnerData};
+  NodeApiDeleteProbe successCacheProbe{&cacheData};
+  NodeApiConfigureTestState success{
+      &successRunnerProbe,
+      &runnerData,
+      &successCacheProbe,
+      &cacheData,
+      napi_ok,
+      false};
+  v8_node_api_runtime runtime{};
+  ASSERT_EQ(
+      v8_node_api_runtime_create(
+          V8_NODE_API_ABI_VERSION,
+          configureNodeApiOwnership,
+          &success,
+          &runtime),
+      napi_ok);
+  ASSERT_NE(runtime, nullptr);
+  EXPECT_EQ(successRunnerProbe.calls, 0);
+  EXPECT_EQ(successCacheProbe.calls, 0);
+  ASSERT_EQ(v8_node_api_runtime_destroy(runtime), napi_ok);
+  EXPECT_EQ(successRunnerProbe.calls, 1);
+  EXPECT_EQ(successCacheProbe.calls, 1);
+  EXPECT_TRUE(successRunnerProbe.argumentsCorrect);
+  EXPECT_TRUE(successCacheProbe.argumentsCorrect);
+
+  NodeApiDeleteProbe failureRunnerProbe{&runnerData};
+  NodeApiDeleteProbe failureCacheProbe{&cacheData};
+  NodeApiConfigureTestState failure{
+      &failureRunnerProbe,
+      &runnerData,
+      &failureCacheProbe,
+      &cacheData,
+      napi_generic_failure,
+      false};
+  runtime = reinterpret_cast<v8_node_api_runtime>(1);
+  EXPECT_EQ(
+      v8_node_api_runtime_create(
+          V8_NODE_API_ABI_VERSION,
+          configureNodeApiOwnership,
+          &failure,
+          &runtime),
+      napi_generic_failure);
+  EXPECT_EQ(runtime, nullptr);
+  EXPECT_EQ(failureRunnerProbe.calls, 1);
+  EXPECT_EQ(failureCacheProbe.calls, 1);
+  EXPECT_TRUE(failureRunnerProbe.argumentsCorrect);
+  EXPECT_TRUE(failureCacheProbe.argumentsCorrect);
+
+  NodeApiDeleteProbe poisonRunnerProbe{&runnerData};
+  NodeApiDeleteProbe poisonCacheProbe{&cacheData};
+  NodeApiConfigureTestState poison{
+      &poisonRunnerProbe,
+      &runnerData,
+      &poisonCacheProbe,
+      &cacheData,
+      napi_ok,
+      true};
+  runtime = reinterpret_cast<v8_node_api_runtime>(1);
+  EXPECT_EQ(
+      v8_node_api_runtime_create(
+          V8_NODE_API_ABI_VERSION,
+          configureNodeApiOwnership,
+          &poison,
+          &runtime),
+      napi_invalid_arg);
+  EXPECT_EQ(runtime, nullptr);
+  EXPECT_EQ(poisonRunnerProbe.calls, 1);
+  EXPECT_EQ(poisonCacheProbe.calls, 1);
+  EXPECT_TRUE(poisonRunnerProbe.argumentsCorrect);
+  EXPECT_TRUE(poisonCacheProbe.argumentsCorrect);
+}
+
+TEST(NodeApiConfig, NullConfigureUsesDefaults) {
+  v8_node_api_runtime runtime{};
+  ASSERT_EQ(
+      v8_node_api_runtime_create(
+          V8_NODE_API_ABI_VERSION, nullptr, nullptr, &runtime),
+      napi_ok);
+  ASSERT_NE(runtime, nullptr);
+  ASSERT_EQ(v8_node_api_runtime_destroy(runtime), napi_ok);
+}
+
+TEST(NodeApiPreparedScript, DeleterArguments) {
+  NodeApiScriptCacheTestState cacheState;
+  v8_node_api_runtime runtime{};
+  ASSERT_EQ(
+      v8_node_api_runtime_create(
+          V8_NODE_API_ABI_VERSION,
+          configureScriptCache,
+          &cacheState,
+          &runtime),
+      napi_ok);
+  napi_env env{};
+  ASSERT_EQ(v8_node_api_runtime_get_env(runtime, &env), napi_ok);
+  v8_node_api_env_scope envScope{};
+  ASSERT_EQ(v8_node_api_env_scope_open(env, &envScope), napi_ok);
+
+  uint8_t scriptData[] = "40 + 2";
+  NodeApiDeleteProbe probe{scriptData};
+  v8_node_api_prepared_script script{};
+  ASSERT_EQ(
+      v8_node_api_prepared_script_create_utf8(
+          env,
+          scriptData,
+          sizeof(scriptData) - 1,
+          deleteNodeApiProbe,
+          &probe,
+          "deleter-order.js",
+          V8_NODE_API_AUTO_LENGTH,
+          &script),
+      napi_ok);
+  EXPECT_EQ(probe.calls, 1);
+  EXPECT_TRUE(probe.argumentsCorrect);
+  ASSERT_EQ(v8_node_api_prepared_script_destroy(script, env), napi_ok);
+
+  probe.calls = 0;
+  script = nullptr;
+  ASSERT_EQ(
+      v8_node_api_prepared_script_create_utf8(
+          env,
+          scriptData,
+          sizeof(scriptData) - 1,
+          deleteNodeApiProbe,
+          &probe,
+          "deleter-order.js",
+          V8_NODE_API_AUTO_LENGTH,
+          &script),
+      napi_ok);
+  EXPECT_EQ(probe.calls, 1);
+  EXPECT_TRUE(probe.argumentsCorrect);
+  EXPECT_GE(cacheState.storeCalls, 1);
+  EXPECT_TRUE(cacheState.storeArgumentsCorrect);
+  EXPECT_EQ(cacheState.loadProbe.calls, 1);
+  EXPECT_TRUE(cacheState.loadProbe.argumentsCorrect);
+  ASSERT_EQ(v8_node_api_prepared_script_destroy(script, env), napi_ok);
+  ASSERT_EQ(v8_node_api_env_scope_close(envScope, env), napi_ok);
+  ASSERT_EQ(v8_node_api_runtime_destroy(runtime), napi_ok);
+}
+
+TEST(NodeApiPreparedScript, PendingExceptionReleasesInput) {
+  v8_node_api_runtime runtime{};
+  ASSERT_EQ(
+      v8_node_api_runtime_create(
+          V8_NODE_API_ABI_VERSION, nullptr, nullptr, &runtime),
+      napi_ok);
+  napi_env env{};
+  ASSERT_EQ(v8_node_api_runtime_get_env(runtime, &env), napi_ok);
+  v8_node_api_env_scope envScope{};
+  ASSERT_EQ(v8_node_api_env_scope_open(env, &envScope), napi_ok);
+  ASSERT_EQ(napi_throw_error(env, nullptr, "pending"), napi_ok);
+
+  uint8_t scriptData[] = "40 + 2";
+  NodeApiDeleteProbe probe{scriptData};
+  v8_node_api_prepared_script script =
+      reinterpret_cast<v8_node_api_prepared_script>(1);
+  EXPECT_EQ(
+      v8_node_api_prepared_script_create_utf8(
+          env,
+          scriptData,
+          sizeof(scriptData) - 1,
+          deleteNodeApiProbe,
+          &probe,
+          "pending-exception.js",
+          V8_NODE_API_AUTO_LENGTH,
+          &script),
+      napi_pending_exception);
+  EXPECT_EQ(script, nullptr);
+  EXPECT_EQ(probe.calls, 1);
+  EXPECT_TRUE(probe.argumentsCorrect);
+
+  napi_value exception{};
+  ASSERT_EQ(napi_get_and_clear_last_exception(env, &exception), napi_ok);
+  ASSERT_EQ(v8_node_api_env_scope_close(envScope, env), napi_ok);
+  ASSERT_EQ(v8_node_api_runtime_destroy(runtime), napi_ok);
 }
 
 namespace {

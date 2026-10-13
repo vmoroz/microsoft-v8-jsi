@@ -6,7 +6,7 @@
  * jsi_runtime that was created via v8_jsi_abi_runtime_create. This is the seam that
  * preserves the dual-API contract now: a consumer can hold one V8
  * isolate exposed simultaneously through JSI (jsi_runtime / JsiAbiRuntime)
- * and Node-API (napi_env). Internally jsr_create_runtime is now a thin
+ * and Node-API (napi_env). Internally v8_node_api_runtime_create is now a thin
  * wrapper that calls v8_jsi_abi_runtime_create + v8_attach_node_api.
  *
  * Lifetime: the jsi_runtime is the primary owner. Releasing the jsi_runtime
@@ -33,7 +33,7 @@
 #define V8_NODE_API_ATTACH_H
 
 #include "jsi_abi/jsi_abi.h"
-#include "node-api/js_runtime_api.h"
+#include "node-api/v8_node_api.h"
 
 #ifdef __cplusplus
 extern "C" {

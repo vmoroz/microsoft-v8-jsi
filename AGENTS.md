@@ -94,7 +94,7 @@ Recent baseline: 116 JSI tests + 52 Node-API tests, x64 Release and Debug
   wrapper) used by both the ABI and the Node-API surfaces
 - `IsolateData.h` — V8 isolate data management
 - `V8Instrumentation.{cpp,h}` — performance/heap instrumentation (backs the
-  Node-API `jsr_instrumentation_*` surface)
+  Node-API `v8_node_api_env_*` instrumentation surface)
 - `MurmurHash.{cpp,h}` — hashing
 - `v8jsi.cpp` — DLL exports / test entry points
 - `jsitests_main.cpp` — JSI test main + runtime factories
@@ -125,9 +125,8 @@ The binary-stable C ABI for JSI (see "ABI architecture" below).
 - `ScriptStore.h` — prepared-script storage interface
 
 ### Node-API (`src/node-api/`)
-- `js_runtime_api.h` — the `jsr_*` JSI runtime API
-- `v8_api.h` — V8-specific Node-API config extensions (ships beside
-  `js_runtime_api.h` in `include\node-api`)
+- `v8_node_api.h` — V8-specific Node-API runtime hosting and configuration
+  extensions (ships with `v8_node_api_stela.h` in `include\node-api`)
 - `v8_api_abi.cpp` — Node-API → JSI-ABI bridge
 - standard Node-API headers (`js_native_api*.h`, `util-inl.h`, `env-inl.h`) are
   vendored from Node.js
@@ -138,8 +137,8 @@ The binary-stable C ABI for JSI (see "ABI architecture" below).
 
 ## ABI architecture
 
-> The JSI ABI surface (`src/jsi_abi/*.h`, `src/node-api/js_runtime_api.h`,
-> `src/node-api/v8_api.h`) is **experimental and not yet ABI-stable** — each header
+> The JSI ABI and Node-API hosting surfaces (`src/jsi_abi/*.h`,
+> `src/node-api/v8_node_api.h`) are **experimental and not yet ABI-stable** — each header
 > carries a banner saying so. Nothing depends on it as a stable contract yet,
 > which is why it can still be reshaped freely.
 

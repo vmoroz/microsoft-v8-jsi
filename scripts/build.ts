@@ -538,7 +538,7 @@ function reportExports(platform: string, configuration: string): void {
     names.filter((n: string) => n.startsWith(prefix)).length;
 
   console.log(`napi_*:     ${count("napi_")}`);
-  console.log(`jsr_*:      ${count("jsr_")}`);
+  console.log(`v8_node_api_*: ${count("v8_node_api_")}`);
   console.log(`node_api_*: ${count("node_api_")}`);
   console.log(`v8_*:       ${count("v8_")}`);
   console.log(`total:      ${names.length}`);
@@ -716,13 +716,12 @@ function packNuGet(outputPath: string, platforms: string[], configurations: stri
   // file's <ClCompile> include.
   copyFile("V8JsiRuntime.cpp", path.join(srcDir, "public"), jsiPublicDir);
 
-  // Node-API headers. v8_api.h ships beside js_runtime_api.h, which it
-  // includes by bare name.
+  // V8's Node-API hosting header and its generated annotations.
   for (const file of [
     "js_native_api_types.h",
     "js_native_api.h",
-    "js_runtime_api.h",
-    "v8_api.h",
+    "v8_node_api.h",
+    "v8_node_api_stela.h",
   ]) {
     copyFile(file, path.join(srcDir, "node-api"), nodeApiDir, true);
   }

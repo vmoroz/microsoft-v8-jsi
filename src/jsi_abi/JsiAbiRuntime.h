@@ -61,10 +61,10 @@ std::unique_ptr<facebook::jsi::Runtime> makeJsiAbiRuntime(
 /// Wrap an existing jsi_runtime. The returned wrapper holds its own ref
 /// (add_ref is called on entry), so the caller's ref is independent.
 ///
-/// Used when a runtime created via jsr_create_runtime (the Node-API entry
+/// Used when a runtime created via v8_node_api_runtime_create (the Node-API entry
 /// point) also needs to be driven through facebook::jsi::Runtime — the same
 /// V8 isolate exposed through both surfaces. Retrieve the jsi_runtime with
-/// jsr_runtime_get_jsi_runtime, then pass it here.
+/// v8_node_api_runtime_get_jsi_runtime, then pass it here.
 std::unique_ptr<facebook::jsi::Runtime> wrapJsiRuntime(jsi_runtime *abiRuntime);
 
 /// Retrieve the underlying jsi_runtime pointer from a facebook::jsi::Runtime

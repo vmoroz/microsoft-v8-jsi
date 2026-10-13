@@ -32,6 +32,15 @@
       "includeDirs": ["src"],
       "status": "jsi_status",
       "stelaHeader": false
+    },
+    {
+      "name": "v8_node_api",
+      "prefix": "v8_node_api",
+      "macroPrefix": "V8_NODE_API",
+      "headers": ["src/node-api/v8_node_api.h"],
+      "includeDirs": ["src"],
+      "status": "napi_status",
+      "stelaHeader": "src/node-api/v8_node_api_stela.h"
     }
   ]
 }

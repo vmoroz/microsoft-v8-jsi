@@ -464,7 +464,8 @@ struct jsi_runtime_api {
   /*----------------------------------------------------------------------
    * Lifecycle
    *
-   * The runtime is reference-counted. v8_jsi_abi_runtime_create / jsr_create_runtime
+   * The runtime is reference-counted. v8_jsi_abi_runtime_create /
+   * v8_node_api_runtime_create
    * hand back a runtime with refcount 1. Each add_ref increments; each
    * release decrements and destroys the runtime when the count reaches 0.
    *----------------------------------------------------------------------*/

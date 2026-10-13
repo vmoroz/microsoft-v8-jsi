@@ -500,8 +500,9 @@ struct JsiRuntimeState : public jsi_runtime {
   std::list<HostFunctionContext *> hostFunctionContexts;
 
   // unhandled-promise tracking. Migrated from the legacy V8Runtime so the
-  // Node-API path (jsr_has_unhandled_promise_rejection /
-  // jsr_get_and_clear_last_unhandled_promise_rejection) keeps working.
+  // Node-API path (v8_node_api_env_has_unhandled_promise_rejection /
+  // v8_node_api_env_get_and_clear_last_unhandled_promise_rejection) keeps
+  // working.
   // The PromiseRejectCallback finds the runtime via context embedder slot 0.
   bool ignore_unhandled_promises{false};
   std::unique_ptr<v8rt::UnhandledPromiseRejection> last_unhandled_promise;
@@ -920,7 +921,7 @@ JsiRuntimeState *JsiRuntimeState::create(const jsi_config_s *config) {
 
   // install the unhandled-promise-rejection tracker unless the consumer
   // explicitly opted out. Mirrors legacy V8Runtime behavior — Node-API's
-  // jsr_has_unhandled_promise_rejection depends on this.
+  // v8_node_api_env_has_unhandled_promise_rejection depends on this.
   if (!state->ignore_unhandled_promises) {
     isolate->SetPromiseRejectCallback(JsiRuntimeState::PromiseRejectCallback);
   }

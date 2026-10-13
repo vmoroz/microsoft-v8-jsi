@@ -57,8 +57,8 @@ const HEADERS: readonly Header[] = [
   { root: "src", include: "jsi_abi/jsi_abi.h" },
   { root: "src", include: "jsi_abi/jsi_abi_stela.h" },
   { root: "src", include: "jsi_abi/v8_jsi_abi.h" },
-  { root: "src/node-api", include: "js_runtime_api.h" },
-  { root: "src/node-api", include: "v8_api.h" },
+  { root: "src", include: "node-api/v8_node_api.h" },
+  { root: "src/node-api", include: "v8_node_api_stela.h" },
 ];
 
 const CLANG_WARNINGS = ["-Wall", "-Wextra", "-Wpedantic", "-Wdocumentation", "-Werror"];
@@ -252,7 +252,11 @@ describe("Stela layout tests compile", () => {
 
   for (const library of config.libraries) {
     test(`${library.name} layout`, () => {
-      assert.equal(setupError, undefined, setupError);
+      assert.equal(
+        setupError,
+        undefined,
+        setupError ?? "layout test setup failed",
+      );
       const list = results.get(library.name) ?? [];
       assert.ok(list.length > 0, "no compile jobs ran");
       const failures = report(list);

@@ -133,6 +133,9 @@ if (!(Test-Path -Path "$OutputPath\build\native\include\node-api-jsi\ApiLoaders"
 if (!(Test-Path -Path "$OutputPath\build\native\include\jsi")) {
     New-Item -ItemType "directory" -Path "$OutputPath\build\native\include\jsi" | Out-Null
 }
+if (!(Test-Path -Path "$OutputPath\build\native\include\jsi_abi")) {
+    New-Item -ItemType "directory" -Path "$OutputPath\build\native\include\jsi_abi" | Out-Null
+}
 if (!(Test-Path -Path "$OutputPath\build\native\jsi\jsi")) {
     New-Item -ItemType "directory" -Path "$OutputPath\build\native\jsi\jsi" | Out-Null
 }
@@ -182,8 +185,10 @@ if (!$FakeBuild) {
 # Headers
 Copy-Item "$jsigitpath\node-api\js_native_api_types.h" -Destination "$OutputPath\build\native\include\node-api\"
 Copy-Item "$jsigitpath\node-api\js_native_api.h" -Destination "$OutputPath\build\native\include\node-api\"
-Copy-Item "$jsigitpath\node-api\js_runtime_api.h" -Destination "$OutputPath\build\native\include\node-api\"
-Copy-Item "$jsigitpath\node-api\v8_api.h" -Destination "$OutputPath\build\native\include\node-api\"
+Copy-Item "$jsigitpath\node-api\v8_node_api.h" -Destination "$OutputPath\build\native\include\node-api\"
+Copy-Item "$jsigitpath\node-api\v8_node_api_stela.h" -Destination "$OutputPath\build\native\include\node-api\"
+Copy-Item "$jsigitpath\jsi_abi\jsi_abi.h" -Destination "$OutputPath\build\native\include\jsi_abi\"
+Copy-Item "$jsigitpath\jsi_abi\jsi_abi_stela.h" -Destination "$OutputPath\build\native\include\jsi_abi\"
 
 Copy-Item "$jsigitpath\node-api-jsi\ApiLoaders\JSRuntimeApi.cpp" -Destination "$OutputPath\build\native\include\node-api-jsi\ApiLoaders\"
 Copy-Item "$jsigitpath\node-api-jsi\ApiLoaders\JSRuntimeApi.h" -Destination "$OutputPath\build\native\include\node-api-jsi\ApiLoaders\"
