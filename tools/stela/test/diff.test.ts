@@ -482,6 +482,14 @@ test("CLI: baseline writes the configured baselines, and diff compares against t
   assert.match(runCli(dir, "baseline").out, /unchanged: api\/alpha\.model\.json/);
   assert.match(runCli(dir, "baseline", "beta").err, /library "beta" has no entry in "diff.baselines"/);
 
+  // --out writes any library to <dir>/<library>.model.json.
+  const shipped = runCli(dir, "baseline", "--out", "ship", "beta");
+  assert.equal(shipped.code, 0, shipped.err);
+  assert.match(shipped.out, /wrote: {5}ship\/beta\.model\.json/);
+  assert.deepEqual((JSON.parse(readFileSync(path.join(dir, "ship", "beta.model.json"), "utf8")) as Model).libraries.map((l) => l.name), ["beta"]);
+  assert.match(runCli(dir, "baseline", "--out", "ship").out, /wrote: {5}ship\/alpha\.model\.json\nunchanged: ship\/beta\.model\.json/);
+  assert.match(runCli(dir, "baseline", "--out", "ship", "gamma").err, /unknown library "gamma"/);
+
   // Libraries without a baseline aren't compared.
   writeJson(modelFile, serializeModel(model(library("alpha", [macro("ALPHA_ABI_VERSION", "1"), fn("alpha_run")]), library("beta", []))));
   const clean = runCli(dir, "diff");

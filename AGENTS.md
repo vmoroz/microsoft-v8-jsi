@@ -218,3 +218,17 @@ needs the library's `*_ABI_VERSION` raised.
 `node tools/stela/src/stela.ts vendor --check` verifies the generated
 `<lib>_stela.h` files, and `stela.ts extract` writes the merged API model to
 `out/stela/stela.model.json` (see `tools/stela/README.md`).
+
+Every shipped binary that implements a C ABI embeds a Stela manifest (PE
+resource `STELA` 1) describing the API it was built against; the
+`binaries` entries in `stela.config.json` list each binary's libraries. The
+gyp `v8jsi_stela_gen` action extracts and writes it for v8jsi.dll and
+v8jsisb.dll, so the v8jsi build needs the VS "C++ Clang Compiler for Windows"
+component, as the sandbox build already does; `scripts/sbox-build.ts` writes
+the v8host.dll and sbox.exe manifests before ninja links. `stela show
+<binary>` prints a binary's API, `stela verify <binary>` checks its exports
+against the manifest, and `stela check <binary> --config stela.config.json`
+diffs it against the current headers. `build.ts --test` runs verify and
+check on the engine DLL, `sbox-build.ts --check` on v8host.dll and sbox.exe,
+and `build.ts --pack` ships each public header's model as
+`build\native\stela\<library>.model.json`.

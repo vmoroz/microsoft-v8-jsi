@@ -77,6 +77,37 @@ test("extraction keys: includeDirs, owns, defines, and targets", () => {
   bad({}, { targets: "x86_64-pc-windows-msvc" });
 });
 
+test("binaries: defaults, and the libraries they implement", () => {
+  const libraries = [lib(), { name: "jsi_abi", prefix: "jsi", macroPrefix: "JSI_ABI", headers: ["j.h"] }];
+  const config = parse(libraries, {
+    binaries: [
+      { name: "v8host.dll", libraries: ["jsi_abi", "v8host"] },
+      { name: "sbox.exe", libraries: ["v8host"], exports: "none", otherExports: false },
+    ],
+  });
+  assert.deepEqual(config.binaries, [
+    { name: "v8host.dll", libraries: ["v8host", "jsi_abi"], exports: "all", otherExports: true },
+    { name: "sbox.exe", libraries: ["v8host"], exports: "none", otherExports: false },
+  ]);
+  assert.deepEqual(parse([lib()]).binaries, []);
+
+  const bad = (binaries: unknown) => assert.throws(() => parse(libraries, { binaries }), StelaError);
+  bad({});
+  bad([{ name: "v8host.dll" }]);
+  bad([{ name: "v8host.dll", libraries: [] }]);
+  bad([{ name: "v8host.dll", libraries: ["nope"] }]);
+  bad([{ name: "v8host.dll", libraries: ["v8host", "v8host"] }]);
+  bad([{ name: "v8host.so", libraries: ["v8host"] }]);
+  bad([{ name: "../v8host.dll", libraries: ["v8host"] }]);
+  bad([{ name: "v8host.dll", libraries: ["v8host"], exports: "some" }]);
+  bad([{ name: "v8host.dll", libraries: ["v8host"], otherExports: "no" }]);
+  bad([{ name: "v8host.dll", libraries: ["v8host"], typo: 1 }]);
+  bad([
+    { name: "v8host.dll", libraries: ["v8host"] },
+    { name: "V8Host.DLL", libraries: ["v8host"] },
+  ]);
+});
+
 test("invalid configs are rejected", () => {
   const bad = (libraries: unknown[], top: Record<string, unknown> = {}) =>
     assert.throws(() => parse(libraries, top), StelaError);

@@ -243,7 +243,14 @@ shared_library("v8host") {
   ]
   configs -= [ "//build/config/compiler:no_exceptions" ]
   configs += [ "//build/config/compiler:exceptions" ]
-  ldflags = [ "/DEPENDENTLOADFLAG:0xA00" ]
+
+  # The embedded Stela manifest (resource STELA 1), compiled into the out dir by
+  # scripts/sbox-build.ts before ninja runs, which also forces the relink when it
+  # changes; `stela verify` checks the exports.
+  ldflags = [
+    "/DEPENDENTLOADFLAG:0xA00",
+    "v8host.dll.stela.res",
+  ]
 }
 
 action("v8host_layering_tests") {

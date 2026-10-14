@@ -28,6 +28,17 @@ import {
 
 const nodejsDir = path.join(repoRoot, "deps", "nodejs");
 const srcDir = path.join(repoRoot, "src");
+const stelaCli = path.join(repoRoot, "tools", "stela", "src", "stela.ts");
+const stelaConfig = path.join(repoRoot, "stela.config.json");
+
+// Libraries whose headers ship in the package; each ships its Stela model
+// (build/native/stela/<library>.model.json), extracted from the same headers.
+const shippedStelaLibraries = ["jsi_abi", "v8_jsi_abi", "v8_node_api", "sbox"];
+
+// Run the Stela CLI; `run` joins a shell command line, so quote every path.
+function runStela(stelaArgs: string[]): void {
+  run(`"${process.execPath}"`, [stelaCli, ...stelaArgs].map((a) => `"${a}"`), { cwd: repoRoot });
+}
 
 // BinSkim rules accepted as residuals on the engine binaries (full rationale in the
 // per-RID suppressions in .ado/guardian/sdl/.gdnsuppress -- keep in sync). The
@@ -318,7 +329,8 @@ Usage: node scripts/build.ts [options]
 Boolean flags (all support --no- prefix):
   --help              Show this help message
   --build             Build v8jsi.dll (default: true)
-  --test              Run v8jsi_test.exe
+  --test              Run v8jsi_test.exe + node_api_tests.exe, and check the
+                      DLL's embedded Stela manifest (stela verify + check)
   --pack              Create NuGet package
   --smoke             Run the real-consumer smoke (tests/run-smoke.ps1) against
                       the packed .nupkg (x64/x86/arm64; Release + Debug)
@@ -421,6 +433,13 @@ async function runBuild(
 function runTests(platform: string, configuration: string): void {
   const engineName = args["build-v8jsisb"] ? "v8jsisb" : "v8jsi";
   console.log(`\n=== Testing ${engineName} (${platform} ${configuration}) ===\n`);
+
+  // The embedded Stela manifest gate is a static check, so it runs for
+  // cross-platform builds too: the DLL's exports match its manifest, and the
+  // manifest matches the current headers.
+  const engine = path.join(buildOutputDir(configuration), `${engineName}.dll`);
+  runStela(["verify", engine]);
+  runStela(["check", engine, "--config", stelaConfig]);
 
   if (isCrossPlatformBuild(platform)) {
     console.log(
@@ -756,14 +775,22 @@ function packNuGet(outputPath: string, platforms: string[], configurations: stri
   // a JSI surface): a broker host compiles against these to spawn + lock down
   // v8host.exe. Staged RID-independently under build/native/include/sbox.
   //   sbox.h        — broker + target C ABI (self-contained: <cstddef>/<cstdint>)
+  //   sbox_stela.h  — the Stela annotation macros sbox.h includes
   //   sbox_harden.h — header-only DLL-search hardening + WinVerifyTrust helpers
   // msg_channel.h is intentionally NOT shipped — it is internal to sbox.dll (the
   // broker uses the channel via sbox_broker_post_message in sbox.h).
   const sboxIncludeDir = path.join(includeDir, "sbox");
   const sboxHeaderSrc = path.join(repoRoot, "deps", "chromium", "sandbox_dll");
-  for (const file of ["sbox.h", "sbox_harden.h"]) {
+  for (const file of ["sbox.h", "sbox_stela.h", "sbox_harden.h"]) {
     copyFile(file, sboxHeaderSrc, sboxIncludeDir);
   }
+
+  // Stela models of the shipped C ABI headers, extracted from the same source
+  // tree so they describe exactly the headers above. Each binary's embedded
+  // manifest names its libraries' model by SHA-256 (`stela show`).
+  const stelaModel = path.join(outputPath, "stela", "stela.model.json");
+  runStela(["extract", "--config", stelaConfig, "--out", stelaModel]);
+  runStela(["baseline", "--config", stelaConfig, "--model", stelaModel, "--out", path.join(pkgStagingPath, "build", "native", "stela"), ...shippedStelaLibraries]);
 
   // Root assets (LICENSE, NOTICE.txt, README.md, _._ placeholder)
   for (const file of ["LICENSE", "NOTICE.txt", "README.md", "_._"]) {

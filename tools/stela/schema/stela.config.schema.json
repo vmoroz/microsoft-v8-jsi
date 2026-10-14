@@ -19,9 +19,37 @@
       "items": {"$ref": "#/$defs/library"}
     },
     "lint": {"$ref": "#/$defs/lint"},
-    "diff": {"$ref": "#/$defs/diff"}
+    "diff": {"$ref": "#/$defs/diff"},
+    "binaries": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/binary"},
+      "description": "The binaries that implement libraries and embed their manifest (`stela gen embed`, design §12)."
+    }
   },
   "$defs": {
+    "binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "libraries"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*\\.(?:[dD][lL][lL]|[eE][xX][eE])$", "description": "The binary's file name."},
+        "libraries": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/lowerSnake"},
+          "description": "The libraries the binary implements."
+        },
+        "exports": {
+          "enum": ["all", "none"],
+          "description": "all (default): the binary exports every function of its libraries. none: it exports none of them and implements them only through function tables."
+        },
+        "otherExports": {
+          "type": "boolean",
+          "description": "Whether the binary may export names outside its libraries (default true). `stela verify` rejects any other export when false."
+        }
+      }
+    },
     "lowerSnake": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"},
     "upperSnake": {"type": "string", "pattern": "^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$"},
     "paths": {

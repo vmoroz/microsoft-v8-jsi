@@ -44,8 +44,14 @@ executable("sbox") {
     "wintrust.lib",  # WinVerifyTrust (sbox_harden.h)
   ]
 
-  # Resolve statically-imported DLLs only from System32 + the app dir.
-  ldflags = [ "/DEPENDENTLOADFLAG:0xA00" ]
+  # Resolve statically-imported DLLs only from System32 + the app dir. The
+  # .res is the embedded Stela manifest (resource STELA 1), compiled into the
+  # out dir by scripts/sbox-build.ts before ninja runs, which also forces the
+  # relink when it changes.
+  ldflags = [
+    "/DEPENDENTLOADFLAG:0xA00",
+    "sbox.exe.stela.res",
+  ]
 
   # Copy the engine payload (v8host.dll) beside sbox.exe so the worker loads it.
   data_deps = [ "//v8host" ]

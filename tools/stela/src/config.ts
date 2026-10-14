@@ -42,6 +42,18 @@ export interface DiffConfig {
   readonly experimental: readonly string[];
 }
 
+/** A binary that implements libraries and embeds their manifest (design §12). */
+export interface BinaryConfig {
+  /** The file name, such as `v8jsi.dll`. */
+  readonly name: string;
+  /** The libraries it implements, in config library order. */
+  readonly libraries: readonly string[];
+  /** `all`: it exports every function of its libraries; `none`: it exports nothing of them. */
+  readonly exports: "all" | "none";
+  /** Whether it may export names outside its libraries. */
+  readonly otherExports: boolean;
+}
+
 export interface StelaConfig {
   /** Absolute path of the config file. */
   readonly file: string;
@@ -52,9 +64,12 @@ export interface StelaConfig {
   readonly libraries: readonly LibraryConfig[];
   readonly lint: LintConfig;
   readonly diff: DiffConfig;
+  readonly binaries: readonly BinaryConfig[];
 }
 
-const TOP_LEVEL_KEYS = new Set(["$schema", "schema", "targets", "libraries", "lint", "diff"]);
+const TOP_LEVEL_KEYS = new Set(["$schema", "schema", "targets", "libraries", "lint", "diff", "binaries"]);
+const BINARY_KEYS = new Set(["name", "libraries", "exports", "otherExports"]);
+const BINARY_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:dll|exe)$/i;
 const LIBRARY_KEYS = new Set([
   "name",
   "prefix",
@@ -157,6 +172,41 @@ function diffConfig(
     path.resolve(root, p),
   );
   return { baselines, experimental };
+}
+
+function binariesConfig(value: unknown, where: string, libraries: readonly LibraryConfig[]): BinaryConfig[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new StelaError(`${where} must be an array`);
+  const names = new Set<string>();
+  return value.map((raw: unknown, index: number) => {
+    const at = `${where}[${index}]`;
+    if (!isObject(raw)) throw new StelaError(`${at} must be an object`);
+    for (const key of Object.keys(raw)) {
+      if (!BINARY_KEYS.has(key)) throw new StelaError(`${at}: unknown key "${key}"`);
+    }
+    const name = raw.name;
+    if (typeof name !== "string" || !BINARY_NAME_RE.test(name)) {
+      throw new StelaError(`${at}: "name" must be a .dll or .exe file name`);
+    }
+    if (names.has(name.toLowerCase())) throw new StelaError(`${at}: duplicate binary "${name}"`);
+    names.add(name.toLowerCase());
+    const listed = stringList(raw.libraries, `${at}: "libraries"`);
+    if (listed.length === 0) throw new StelaError(`${at}: "libraries" must not be empty`);
+    for (const lib of listed) {
+      if (!libraries.some((l) => l.name === lib)) throw new StelaError(`${at}: unknown library "${lib}"`);
+    }
+    if (new Set(listed).size !== listed.length) throw new StelaError(`${at}: "libraries" lists a library twice`);
+    const exports = raw.exports ?? "all";
+    if (exports !== "all" && exports !== "none") throw new StelaError(`${at}: "exports" must be "all" or "none"`);
+    const otherExports = raw.otherExports ?? true;
+    if (typeof otherExports !== "boolean") throw new StelaError(`${at}: "otherExports" must be a boolean`);
+    return {
+      name,
+      libraries: libraries.filter((l) => listed.includes(l.name)).map((l) => l.name),
+      exports,
+      otherExports,
+    };
+  });
 }
 
 export function parseConfig(json: unknown, file: string): StelaConfig {
@@ -285,6 +335,7 @@ export function parseConfig(json: unknown, file: string): StelaConfig {
     libraries,
     lint: lintConfig(json.lint, `${file}: "lint"`),
     diff: diffConfig(json.diff, `${file}: "diff"`, root, libraries),
+    binaries: binariesConfig(json.binaries, `${file}: "binaries"`, libraries),
   };
 }
 

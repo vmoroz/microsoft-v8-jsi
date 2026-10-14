@@ -133,8 +133,8 @@ Boolean flags (all support --no- prefix):
   --help          Show this help message
   --gen           Run 'gn gen' (writes args.gn) before building (default: true)
   --build         Run 'ninja' on the target (default: true)
-  --check         Enforce export-allowlist + Hybrid-CRT + BinSkim gates on the
-                  produced binaries (sbox.exe, v8host.dll)
+  --check         Enforce export-allowlist + Stela-manifest + Hybrid-CRT +
+                  BinSkim gates on the produced binaries (sbox.exe, v8host.dll)
   --clean         Delete the out dir before generating
 
 String arguments:
@@ -505,15 +505,10 @@ function generateSourceLink(outDir: string): void {
   });
 }
 
-// Compile src/version_info.rc -> <outDir>/version_info_<name>.res for sbox.dll
-// and v8host.exe, which link the prebuilt .res via ldflags. GN's own rc tool
-// (rc.py) needs the hermetic rc binary + hermetic clang, neither of which the
-// pruned VS-clang sandbox tree carries — so we use the Windows SDK rc.exe
-// directly, recovered from the toolchain env block that gn gen writes
-// (environment.<cpu>: NUL-separated KEY=VALUE, holds INCLUDE for verrsrc.h and
-// the SDK bin dir with rc.exe). VER_BINARY selects each binary's strings.
-function compileVersionResources(outDir: string, targetCpu: TargetCpu): void {
-  console.log("\n=== version resources (sbox.dll / v8host.exe) ===\n");
+// The toolchain env block that gn gen writes (environment.<cpu>: NUL-separated
+// KEY=VALUE, holds INCLUDE for verrsrc.h and the SDK bin dir with rc.exe), and
+// the Windows SDK rc.exe on its PATH.
+function toolchainRc(outDir: string, targetCpu: TargetCpu): { env: NodeJS.ProcessEnv; rcExe: string } {
   const envFile = path.join(outDir, `environment.${targetCpu}`);
   if (!fs.existsSync(envFile)) {
     floor(`toolchain env block not found at ${envFile} (run 'gn gen' first).`);
@@ -525,17 +520,21 @@ function compileVersionResources(outDir: string, targetCpu: TargetCpu): void {
     if (eq > 0) env[entry.slice(0, eq)] = entry.slice(eq + 1);
   }
   const pathVar = env.PATH ?? env.Path ?? "";
-  let rcExe = "";
   for (const dir of pathVar.split(";")) {
     const cand = dir && path.join(dir, "rc.exe");
-    if (cand && fs.existsSync(cand)) {
-      rcExe = cand;
-      break;
-    }
+    if (cand && fs.existsSync(cand)) return { env, rcExe: cand };
   }
-  if (!rcExe) {
-    floor("rc.exe not found in the toolchain PATH (Windows SDK bin).");
-  }
+  return floor("rc.exe not found in the toolchain PATH (Windows SDK bin).");
+}
+
+// Compile src/version_info.rc -> <outDir>/version_info_<name>.res for sbox.dll
+// and v8host.exe, which link the prebuilt .res via ldflags. GN's own rc tool
+// (rc.py) needs the hermetic rc binary + hermetic clang, neither of which the
+// pruned VS-clang sandbox tree carries — so we use the Windows SDK rc.exe
+// directly (see toolchainRc). VER_BINARY selects each binary's strings.
+function compileVersionResources(outDir: string, targetCpu: TargetCpu): void {
+  console.log("\n=== version resources (sbox.dll / v8host.exe) ===\n");
+  const { env, rcExe } = toolchainRc(outDir, targetCpu);
 
   const rcSource = path.join(repoRoot, "src", "version_info.rc");
   for (const b of [
@@ -549,6 +548,64 @@ function compileVersionResources(outDir: string, targetCpu: TargetCpu): void {
       ["/nologo", `/dVER_BINARY=${b.verBinary}`, `/fo${res}`, rcSource],
       { env, stdio: "inherit" },
     );
+  }
+}
+
+// =============================================================================
+// Embedded Stela manifests
+// =============================================================================
+
+const stelaCli = path.join(repoRoot, "tools", "stela", "src", "stela.ts");
+const stelaConfig = path.join(repoRoot, "stela.config.json");
+const stelaBinaries = ["v8host.dll", "sbox.exe"];
+const stelaTargets: Record<TargetCpu, string> = {
+  x64: "x86_64-pc-windows-msvc",
+  x86: "i686-pc-windows-msvc",
+  arm64: "aarch64-pc-windows-msvc",
+};
+
+function stela(args: string[]): void {
+  execFileSync(process.execPath, [stelaCli, ...args], { cwd: repoRoot, stdio: "inherit" });
+}
+
+// Extract the API model once, write each binary's manifest (`stela gen embed`),
+// and compile it to <outDir>/<binary>.stela.res, which the binary's BUILD.gn
+// links via ldflags. GN can't list a .res it doesn't generate as a link input,
+// so when the .res changes the stale binary is deleted, and ninja relinks it.
+function embedStelaManifests(outDir: string, targetCpu: TargetCpu): void {
+  console.log("\n=== Stela manifests (v8host.dll / sbox.exe) ===\n");
+  const { env, rcExe } = toolchainRc(outDir, targetCpu);
+  const stelaDir = path.join(outDir, "stela");
+  const model = path.join(stelaDir, "stela.model.json");
+  stela(["extract", "--config", stelaConfig, "--out", model]);
+  for (const binary of stelaBinaries) {
+    stela(["gen", "embed", "--config", stelaConfig, "--model", model, "--binary", binary, "--target", stelaTargets[targetCpu], "--out", stelaDir]);
+    const res = path.join(outDir, `${binary}.stela.res`);
+    const fresh = path.join(stelaDir, `${binary}.stela.res`);
+    execFileSync(rcExe, ["/nologo", `/fo${fresh}`, path.join(stelaDir, `${binary}.stela.rc`)], { env, stdio: "inherit" });
+    const bytes = fs.readFileSync(fresh);
+    if (fs.existsSync(res) && fs.readFileSync(res).equals(bytes)) {
+      console.log(`  unchanged: ${path.basename(res)}`);
+      continue;
+    }
+    fs.writeFileSync(res, bytes);
+    fs.rmSync(path.join(outDir, binary), { force: true });
+    console.log(`  wrote:     ${path.basename(res)} (${binary} relinks)`);
+  }
+}
+
+// Gate: each binary's exports match its manifest (`stela verify`), and the
+// manifest matches the current headers (`stela check`). Returns true on pass.
+function checkStelaManifests(outDir: string): boolean {
+  console.log("\n=== Stela manifests (verify + check) ===\n");
+  const files = stelaBinaries.map((b) => path.join(outDir, b));
+  try {
+    stela(["verify", ...files]);
+    for (const file of files) stela(["check", file, "--config", stelaConfig]);
+    return true;
+  } catch {
+    console.error("\nStela manifest gate FAILED: rebuild so the binaries embed the current headers' manifest.");
+    return false;
   }
 }
 
@@ -754,16 +811,18 @@ async function runSandboxBinSkim(
 async function runSandboxGates(outDir: string, toolsPath: string): Promise<void> {
   console.log(`\n=== Sandbox hygiene gates (${outDir}) ===`);
   const exportsOk = checkSandboxExports(outDir);
+  const stelaOk = checkStelaManifests(outDir);
   const crtOk = checkSandboxCrt(outDir);
   const sizeOk = checkSandboxSize(outDir);
   const binskimOk = await runSandboxBinSkim(outDir, toolsPath);
 
   console.log("\n=== Sandbox gate summary ===");
   console.log(`  export allowlist: ${exportsOk ? "PASS" : "FAIL"}`);
+  console.log(`  stela manifests:  ${stelaOk ? "PASS" : "FAIL"}`);
   console.log(`  hybrid CRT:       ${crtOk ? "PASS" : "FAIL"}`);
   console.log(`  size budget:      ${sizeOk ? "PASS" : "FAIL"}`);
   console.log(`  binskim:          ${binskimOk ? "PASS" : "FAIL"}`);
-  if (!exportsOk || !crtOk || !sizeOk || !binskimOk) {
+  if (!exportsOk || !stelaOk || !crtOk || !sizeOk || !binskimOk) {
     process.exit(1);
   }
 }
@@ -824,6 +883,9 @@ async function main(): Promise<void> {
       // Compile the VERSIONINFO .res (sbox.dll / v8host.exe link it) after gn
       // gen has written the toolchain env block, before ninja links.
       compileVersionResources(outDir, targetCpu);
+      // Write and compile each binary's Stela manifest .res (their BUILD.gn
+      // links it), before ninja links.
+      embedStelaManifests(outDir, targetCpu);
       // Emit the SourceLink map into the out dir; sbox.dll / v8host.exe link it
       // via /SOURCELINK: (their BUILD.gn ldflags), before ninja links.
       generateSourceLink(outDir);

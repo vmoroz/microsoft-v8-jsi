@@ -54,5 +54,11 @@
       "status": "napi_status",
       "stelaHeader": "src/node-api/v8_node_api_stela.h"
     }
+  ],
+  "binaries": [
+    { "name": "v8jsi.dll", "libraries": ["jsi_abi", "v8_jsi_abi", "v8_node_api"] },
+    { "name": "v8jsisb.dll", "libraries": ["jsi_abi", "v8_jsi_abi", "v8_node_api"] },
+    { "name": "v8host.dll", "libraries": ["sbox", "v8host"], "otherExports": false },
+    { "name": "sbox.exe", "libraries": ["sbox"], "exports": "none", "otherExports": false }
   ]
 }

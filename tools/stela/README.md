@@ -1,13 +1,13 @@
 # Stela
 
-Stela checks C ABI headers. It currently provides the annotation vocabulary,
-the native extractor, `stela vendor`, the merged `stela.model/1`, the
-header-test and layout-test generators, C ABI convention lint, and ABI diff
-against committed baselines. Later stages add more generators and manifests
-embedded in binaries. It incubates here with no
+Stela checks C ABI headers. It provides the annotation vocabulary, the native
+extractor, `stela vendor`, the merged `stela.model/1`, the header-test and
+layout-test generators, C ABI convention lint, ABI diff against committed
+baselines, and API manifests embedded in the binaries that implement the
+headers. It incubates here with no
 dependency on v8-jsi code, so it can move to its own repository unchanged.
 
-Status: stage S5, diff.
+Status: stage S6, embedded metadata.
 
 ## Requirements
 
@@ -72,6 +72,13 @@ node tools\stela\src\stela.ts gen layout-tests --out out\stela\tests
 node tools\stela\src\stela.ts diff              # compare the model with the baselines
 node tools\stela\src\stela.ts diff --base old.model.json --head new.model.json
 node tools\stela\src\stela.ts baseline          # refresh every configured baseline
+node tools\stela\src\stela.ts baseline --out pkg\stela sbox   # write pkg\stela\sbox.model.json
+node tools\stela\src\stela.ts gen embed --binary v8host.dll --target x86_64-pc-windows-msvc --out out\stela
+node tools\stela\src\stela.ts show v8host.dll   # print the API a binary's manifest describes
+node tools\stela\src\stela.ts verify v8host.dll sbox.exe   # exports against manifests
+node tools\stela\src\stela.ts check v8host.dll --config stela.config.json
+node tools\stela\src\stela.ts check v8host.dll --headers include\sbox.h include\v8host_client.h
+node tools\stela\src\stela.ts diff --base old\v8host.dll --head v8host.dll
 ```
 
 Options: `--config <file>` (default `stela.config.json` in the current
@@ -79,13 +86,15 @@ directory), `--template <file>` (`vendor`; default `include/stela.h`),
 `--out <file>` (`extract`; default `out/stela/<config name>.model.json` next to
 the configuration), `--model <file>` (`lint`, `gen`, and `baseline`; default
 the `extract` output), `--base` and `--head <file>` (`diff`; default the
-configured baselines and the `extract` output), and `--format text|json`
-(`lint` and `diff`). Paths in the configuration are relative to the
-configuration file. Every command writes a file only when its content changes.
+configured baselines and the `extract` output; either may be a binary), and
+`--format text|json` (`lint`, `diff`, and `check`). Paths in the configuration
+are relative to the configuration file. Every command writes a file only when
+its content changes.
 
 Exit codes: 0 success; 1 check failures (lint errors, ABI breaks, out-of-date
-files, or a declaration that differs between targets); 2 usage, configuration,
-or tool errors. `lint --report-only` reports errors but exits 0.
+files, a declaration that differs between targets, or exports that don't match
+a manifest); 2 usage, configuration, or tool errors, including a binary with
+no or a corrupt manifest. `lint --report-only` reports errors but exits 0.
 
 ## Lint
 
@@ -149,6 +158,53 @@ writes each baseline from the current model, one library per file, as
 In v8-jsi the baselines are `api/<library>.model.json`, and
 `scripts/header-check.ts` fails on any break. A deliberate break refreshes the
 affected baseline in the same change.
+
+`baseline --out <dir>` writes `<dir>/<library>.model.json` instead, for any
+configured library (default: all of them); v8-jsi uses it to ship each public
+header's model in the NuGet package.
+
+## Embedded manifests (`stela.embedded/1`)
+
+A binary that implements a C ABI carries the API it was built against: a
+gzipped `stela.embedded/1` JSON document in the PE resource `STELA` 1.
+[`schema/stela.embedded.schema.json`](schema/stela.embedded.schema.json)
+describes the format. A manifest names the binary, its targets, and the
+producer (Stela and libclang versions). Per library, it has the library's
+configuration, the `modelSha256` of its `stela.model/1` (all targets, so the
+hash equals the shipped or baseline `<library>.model.json`), its evaluated
+`*_ABI_VERSION` macros, the functions the binary exports, and the
+declarations narrowed to the binary's targets.
+
+`stela gen embed --binary <name> --target <triple>... --out <dir>` writes
+`<name>.stela.gz` and `<name>.stela.rc`, which compiles it with `rc.exe`; the
+binary links the `.res`. The binary's entry in the configuration's `binaries`
+lists its libraries. `--extract` extracts just those libraries instead of
+reading `--model`. The gzip has a fixed header (no time stamp or name), so the
+same headers give the same bytes. Unchanged outputs aren't rewritten, so
+their times don't move; `--stamp <file>` also writes `<file>` on every run,
+for a build system that would otherwise rerun the command until its outputs
+are newer than its inputs (the v8jsi gyp action declares only the stamp).
+
+Reading never loads the binary: Stela parses the PE file with bounds checks,
+caps the resource and the inflated manifest, and validates the document
+against the schema before using it. The commands that read manifests:
+
+- `stela show <binary>` prints the API as declarations; `--json` prints the
+  manifest.
+- `stela verify <binary>...` checks the export table. Every function a
+  manifest lists as exported must be exported. An export not listed is a
+  failure if `otherExports` is `false` or if it starts with a library's
+  `<prefix>_`; other exports (C++ symbols, other APIs) are allowed when
+  `otherExports` is `true`.
+- `stela check <binary> --config <file>` extracts the binary's libraries for
+  its targets and diffs them (base) against the manifest (head), so a binary
+  built from older or different headers shows as breaks or additions.
+  `--headers <header>...` uses those headers instead of a configuration; each
+  header is matched to a library by its include spelling, then by its file
+  name.
+- `stela diff` accepts a binary for `--base` or `--head`. The model on the
+  other side is cut to the binary's libraries and targets first; two binaries
+  compare the libraries and targets they share, and fail if they share none.
 
 ## The model (`stela.model/1`)
 
@@ -224,6 +280,11 @@ C99 floor; layout tests need C11 for `_Static_assert`. v8-jsi runs both in
   (`macroConstants`).
 - `diff.baselines` maps library names to baseline model files, and
   `diff.experimental` lists headers whose breaks `diff` reports as notes.
+- `binaries` lists the binaries that embed a manifest: `name` (a `.dll` or
+  `.exe` file name), `libraries`, `exports` (`all`, the default, or `none`
+  for a binary that implements no functions, such as an executable), and
+  `otherExports` (default `true`; `false` makes `verify` reject any export
+  the manifest doesn't list).
 - [`schema/stela.config.schema.json`](schema/stela.config.schema.json)
   describes the format.
 
@@ -246,7 +307,10 @@ version) and compiles them alone and together, in both include orders:
 - extractor mode (`-DSTELA_EXTRACT`), where every annotation must reach the
   AST, and default mode, where none may.
 
-Without Visual Studio the compile-matrix and extractor tests are skipped.
+Without Visual Studio the compile-matrix, extractor, and embedded-manifest
+binary tests are skipped. The binary tests build small DLLs and executables
+with MSVC, embed manifests in them, and run `show`, `verify`, `check`, and
+`diff` against them.
 
 ## License
 
