@@ -47,6 +47,11 @@
           "type": "array",
           "items": {"type": "string", "minLength": 1}
         },
+        "stelaHeader": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The generated <lib>_stela.h, relative to the configuration's directory, with / separators. Absent for a library that uses another library's."
+        },
         "targets": {
           "$ref": "#/$defs/targets",
           "description": "Present only when the library covers fewer targets than the model, in the model's order."

@@ -86,12 +86,21 @@ test("identical targets merge into one declaration with per-target facts", () =>
     "headers",
     "includeDirs",
     "defines",
+    "stelaHeader",
     "declarations",
   ]);
   assert.equal(library.status, "demo_status");
   assert.deepEqual(library.headers, ["include/demo.h"]);
   // An entry header's own directory is an include directory when none holds it.
   assert.deepEqual(library.includeDirs, ["include"]);
+  assert.equal(library.stelaHeader, "include/demo_stela.h");
+  // A stela header elsewhere adds its directory; an extension library records none.
+  const elsewhere = buildModel(config({ stelaHeader: "abi/demo_stela.h" }), raws({ [X64]: all, [X86]: all, [ARM64]: all }));
+  assert.equal(elsewhere.model.libraries[0].stelaHeader, "abi/demo_stela.h");
+  assert.deepEqual(elsewhere.model.libraries[0].includeDirs, ["include", "abi"]);
+  const extension = buildModel(config({ stelaHeader: false }), raws({ [X64]: all, [X86]: all, [ARM64]: all }));
+  assert.equal("stelaHeader" in extension.model.libraries[0], false);
+  assert.deepEqual(extension.model.libraries[0].includeDirs, ["include"]);
   const [version, point] = library.declarations;
   assert.equal(version.targets, undefined);
   assert.deepEqual(Object.keys(version.perTarget!), [X64, X86, ARM64]);

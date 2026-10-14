@@ -91,6 +91,8 @@ export interface ModelLibrary {
   headers: string[];
   includeDirs: string[];
   defines: string[];
+  /** The generated `<lib>_stela.h`; absent for a library that uses another's. */
+  stelaHeader?: string;
   /** Present only when the library covers some of the model's targets. */
   targets?: string[];
   declarations: Declaration[];
@@ -327,15 +329,17 @@ export function relativePath(root: string, file: string): string {
 
 /**
  * The include directories a consumer needs: the configured ones, plus the
- * directory of each entry header that none of them contains.
+ * directory of each entry header, and of the stela header, that none of them
+ * contains.
  */
 export function effectiveIncludeDirs(root: string, library: LibraryConfig): string[] {
   const dirs = library.includeDirs.map((d) => relativePath(root, d));
-  for (const header of library.headers) {
+  const headers = library.stelaHeader === false ? library.headers : [...library.headers, library.stelaHeader];
+  for (const header of headers) {
     const relative = relativePath(root, header);
     if (!dirs.some((d) => relative.startsWith(`${d}/`))) {
       const dir = path.posix.dirname(relative);
-      if (dir === ".") throw new StelaError(`${header}: an entry header needs a directory below the root`);
+      if (dir === ".") throw new StelaError(`${header}: a library header needs a directory below the root`);
       dirs.push(dir);
     }
   }
@@ -455,6 +459,7 @@ export function mergeLibrary(
       headers,
       includeDirs: effectiveIncludeDirs(root, library),
       defines: [...library.defines],
+      ...(library.stelaHeader === false ? {} : { stelaHeader: relativePath(root, library.stelaHeader) }),
       declarations,
     },
     mismatches,

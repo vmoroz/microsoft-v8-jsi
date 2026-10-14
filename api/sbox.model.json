@@ -14,6 +14,7 @@
       "headers": ["deps/chromium/sandbox_dll/sbox.h"],
       "includeDirs": ["deps/chromium/sandbox_dll"],
       "defines": [],
+      "stelaHeader": "deps/chromium/sandbox_dll/sbox_stela.h",
       "declarations": [
         {
           "kind": "macro",

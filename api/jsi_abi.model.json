@@ -14,6 +14,7 @@
       "headers": ["src/jsi_abi/jsi_abi.h"],
       "includeDirs": ["src"],
       "defines": [],
+      "stelaHeader": "src/jsi_abi/jsi_abi_stela.h",
       "declarations": [
         {
           "kind": "macro",

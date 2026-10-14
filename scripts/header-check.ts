@@ -1,9 +1,10 @@
 // Public C ABI header gate (C ABI conventions §2 and §14; Stela design §13).
 // It extracts every library in stela.config.json once, for every target, then:
 //
-// - compiles Stela's generated header tests: each entry header on its own,
-//   included twice, as C and as C++, with clang and MSVC, warnings as errors,
-//   for every target (x64, x86, arm64);
+// - compiles Stela's generated header tests: each entry header, and each
+//   generated <lib>_stela.h, on its own, included twice, as C and as C++,
+//   with clang and MSVC, warnings as errors, for every target (x64, x86,
+//   arm64);
 // - compiles Stela's generated layout tests: static asserts of each record's
 //   size, alignment, and field offsets and each enumerator's value;
 // - requires `stela lint` to report no findings at all;
@@ -17,10 +18,6 @@
 // only <stddef.h>, <stdint.h>, <stdbool.h>, and its own library's headers;
 // <wchar.h>, <windows.h>, and C++ headers fail. MSVC runs with the vcvars
 // environment of each target architecture.
-//
-// The generated <lib>_stela.h files aren't compiled on their own here: every
-// entry header includes its library's, `stela vendor --check` keeps them
-// current, and Stela's own tests compile the template across its matrix.
 
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -112,9 +109,11 @@ describe("public C ABI headers", () => {
     if (failures) assert.fail(failures);
   }
 
-  // Header tests (Stela design §11): `<library>/<header stem>.header.{c,cpp}`.
+  // Header tests (Stela design §11): `<library>/<header stem>.header.{c,cpp}`,
+  // for each entry header and the library's generated stela header.
   for (const library of config.libraries) {
-    for (const header of library.headers) {
+    const headers = library.stelaHeader === false ? library.headers : [...library.headers, library.stelaHeader];
+    for (const header of headers) {
       const stem = path.basename(header).replace(/\.[^.]*$/, "");
       for (const ext of ["c", "cpp"]) {
         const file = `${library.name}/${stem}.header.${ext}`;

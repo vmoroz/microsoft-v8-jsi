@@ -174,9 +174,11 @@ the format.
 
 `stela gen <generator> --out <dir>` writes one directory per library:
 
-- `header-tests`: `<header>.header.c` and `.cpp` per entry header. Each
-  defines the library's defines and includes its header alone, twice, to check
-  the include guard.
+- `header-tests`: `<header>.header.c` and `.cpp` per entry header, and per
+  generated `<lib>_stela.h`. Each defines the library's defines and includes
+  its header alone, twice, to check the include guard. The stela-header tests
+  prove the file stands alone, without the `<stdint.h>` and similar includes
+  an entry header puts before it.
 - `layout-tests`: `layout.c` and `layout.cpp`. Static asserts of each record's
   size, alignment, and field offsets (except bit-fields and anonymous members),
   each object typedef's size and alignment, and each enumerator's value. Layout

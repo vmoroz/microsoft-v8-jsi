@@ -66,11 +66,15 @@ function stem(header: string): string {
   return path.posix.basename(header).replace(/\.[^.]*$/, "");
 }
 
-/** One C and one C++ file per entry header; each includes only that header. */
+/**
+ * One C and one C++ file per entry header, and per generated stela header;
+ * each includes only that header.
+ */
 export function generateHeaderTests(model: Model): GeneratedFile[] {
   const files: GeneratedFile[] = [];
   for (const library of model.libraries) {
-    for (const header of library.headers) {
+    const headers = library.stelaHeader === undefined ? library.headers : [...library.headers, library.stelaHeader];
+    for (const header of headers) {
       const include = includeSpelling(library, header);
       const text = [
         banner("header-tests", [
