@@ -33,7 +33,7 @@ const stelaConfig = path.join(repoRoot, "stela.config.json");
 
 // Libraries whose headers ship in the package; each ships its Stela model
 // (build/native/stela/<library>.model.json), extracted from the same headers.
-const shippedStelaLibraries = ["jsi_abi", "v8_jsi_abi", "v8_node_api", "sbox"];
+const shippedStelaLibraries = ["jsi_abi", "v8_jsi_abi", "v8_node_api", "sbox", "v8host"];
 
 // Run the Stela CLI; `run` joins a shell command line, so quote every path.
 function runStela(stelaArgs: string[]): void {
@@ -247,8 +247,9 @@ function sandboxOutDir(platform: string): string {
 // Everything is optional: a mainline (non-sandbox) build won't have produced
 // them, and the CI aggregator pre-stages them from the `sandbox-binaries`
 // artifact. v8jsisb.dll comes from the vcbuild out dir (engineOutDir, alongside
-// v8jsi.dll); sbox.dll / v8host.exe / sbox.dll.lib from the gn out dir.
-// test_app.exe (the test harness) is deliberately excluded.
+// v8jsi.dll); sbox.exe (the sandbox container) and v8host.dll (the engine
+// payload a consuming app loads) + v8host.dll.lib from the gn out dir. The gn
+// test binaries are deliberately excluded.
 function stageSandboxBinaries(
   platform: string,
   engineOutDir: string,
@@ -286,13 +287,13 @@ function stageSandboxBinaries(
       path.join(ridDir, "mkv8snapshot.exe.pdb"),
     );
   }
-  // The Chromium-sandbox binaries (gn output) + sbox's import lib.
+  // The Chromium-sandbox binaries (gn output) + v8host's import lib.
   for (const f of [
-    "sbox.dll",
-    "sbox.dll.pdb",
-    "sbox.dll.lib",
-    "v8host.exe",
-    "v8host.exe.pdb",
+    "sbox.exe",
+    "sbox.exe.pdb",
+    "v8host.dll",
+    "v8host.dll.pdb",
+    "v8host.dll.lib",
   ]) {
     copyFile(f, sbxOut, ridDir, /*optional*/ true);
   }
@@ -367,7 +368,7 @@ Examples:
   node scripts/build.ts --no-build --pack        # Package only
   node scripts/build.ts --clean-all              # Clean everything
 
-The Chromium sandbox binaries (sbox.dll / v8host.exe / test_app.exe) are built
+The Chromium sandbox binaries (sbox.exe / v8host.dll and their tests) are built
 by a separate gn/ninja toolchain — see: node scripts/sbox-build.ts --help
 `);
 }
@@ -673,11 +674,11 @@ function packNuGet(outputPath: string, platforms: string[], configurations: stri
 
       // Sandbox binaries: the jitless sandbox engine v8jsisb.dll (vcbuild
       // output, same out dir as v8jsi.dll) plus the Chromium-sandbox binaries
-      // sbox.dll / v8host.exe + sbox.dll.lib (gn output, per-arch out dir). All
-      // optional: a non-sandbox build won't have produced them, and the CI
+      // sbox.exe / v8host.dll + v8host.dll.lib (gn output, per-arch out dir).
+      // All optional: a non-sandbox build won't have produced them, and the CI
       // aggregator pre-stages them from the `sandbox-binaries` artifact, so a
       // missing local file just means "already staged / not built here".
-      // test_app.exe is the TEST harness and is deliberately NOT staged.
+      // The gn test binaries are deliberately NOT staged.
       stageSandboxBinaries(platform, outDir, ridDir);
     }
   }
@@ -771,18 +772,23 @@ function packNuGet(outputPath: string, platforms: string[], configurations: stri
     );
   }
 
-  // sbox public C-ABI headers. sbox.dll has its own small C ABI (it is NOT
-  // a JSI surface): a broker host compiles against these to spawn + lock down
-  // v8host.exe. Staged RID-independently under build/native/include/sbox.
-  //   sbox.h        — broker + target C ABI (self-contained: <cstddef>/<cstdint>)
+  // Sandbox public C-ABI headers, staged RID-independently under
+  // build/native/include/sbox and build/native/include/v8host.
+  //   sbox.h        — the sbox.exe plugin ABI (self-contained: <stddef.h>/<stdint.h>)
   //   sbox_stela.h  — the Stela annotation macros sbox.h includes
   //   sbox_harden.h — header-only DLL-search hardening + WinVerifyTrust helpers
-  // msg_channel.h is intentionally NOT shipped — it is internal to sbox.dll (the
-  // broker uses the channel via sbox_broker_post_message in sbox.h).
+  //   v8host_client.h — the client ABI an app compiles against to load
+  //                     v8host.dll and run sandboxed JavaScript
+  //   v8host_stela.h  — the Stela annotation macros v8host_client.h includes
+  // msg_channel.h and the sbox_*internal headers are NOT shipped — they're
+  // internal to the sandbox binaries.
   const sboxIncludeDir = path.join(includeDir, "sbox");
   const sboxHeaderSrc = path.join(repoRoot, "deps", "chromium", "sandbox_dll");
   for (const file of ["sbox.h", "sbox_stela.h", "sbox_harden.h"]) {
     copyFile(file, sboxHeaderSrc, sboxIncludeDir);
+  }
+  for (const file of ["v8host_client.h", "v8host_stela.h"]) {
+    copyFile(file, path.join(srcDir, "public"), path.join(includeDir, "v8host"));
   }
 
   // Stela models of the shipped C ABI headers, extracted from the same source

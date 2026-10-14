@@ -229,6 +229,9 @@ the v8host.dll and sbox.exe manifests before ninja links. `stela show
 <binary>` prints a binary's API, `stela verify <binary>` checks its exports
 against the manifest, and `stela check <binary> --config stela.config.json`
 diffs it against the current headers. `build.ts --test` runs verify and
-check on the engine DLL, `sbox-build.ts --check` on v8host.dll and sbox.exe,
-and `build.ts --pack` ships each public header's model as
-`build\native\stela\<library>.model.json`.
+check on the engine DLL, and `sbox-build.ts --check` on v8host.dll and
+sbox.exe (whose `otherExports: false` makes verify the exact export gate; there
+is no separate allowlist). `build.ts --pack` ships each public header's model as
+`build\native\stela\<library>.model.json`, including `v8host` for
+`include\v8host\v8host_client.h`, the client header apps compile against to
+load v8host.dll.

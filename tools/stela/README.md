@@ -12,9 +12,10 @@ Status: stage S6, embedded metadata.
 ## Requirements
 
 - Node.js 24 or later. Stela runs TypeScript directly; there is no build step.
-- For the compile-matrix tests: Visual Studio with the C++ tools and the
-  "C++ Clang Compiler for Windows" component
-  (`Microsoft.VisualStudio.Component.VC.Llvm.Clang`).
+- Visual Studio with the C++ tools and the "C++ Clang Compiler for Windows"
+  component (`Microsoft.VisualStudio.Component.VC.Llvm.Clang`). `extract` (and
+  so `gen embed`, `check`, and the v8-jsi builds that embed manifests) needs
+  its libclang; the compile-matrix tests need its clang.
 
 ## Extractor
 

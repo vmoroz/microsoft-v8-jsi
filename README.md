@@ -71,6 +71,11 @@ Setup*, the new build also needs:
 
 1. **Python 3.x** on PATH (required by the Node.js `configure` step).
 1. **Node.js v24+** on PATH (required by [`scripts/build.ts`](scripts/build.ts)).
+1. The Visual Studio **C++ Clang Compiler for Windows** component
+   (`Microsoft.VisualStudio.Component.VC.Llvm.Clang`). The build uses its
+   libclang to embed the API manifest in `v8jsi.dll` (see
+   [`tools/stela/README.md`](tools/stela/README.md)), and the sandbox build
+   ([`scripts/sbox-build.ts`](scripts/sbox-build.ts)) compiles with its clang.
 
 ###### Developer task runner: `dev.ps1`
 

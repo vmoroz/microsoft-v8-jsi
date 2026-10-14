@@ -45,12 +45,18 @@ executable("sbox") {
   ]
 
   # Resolve statically-imported DLLs only from System32 + the app dir. The
-  # .res is the embedded Stela manifest (resource STELA 1), compiled into the
-  # out dir by scripts/sbox-build.ts before ninja runs, which also forces the
-  # relink when it changes.
+  # out-dir inputs are written by scripts/sbox-build.ts before ninja runs, which
+  # also forces the relink when one changes (GN doesn't track them):
+  #   version_info_sbox.res — the Microsoft.JavaScript.V8 VERSIONINFO
+  #     (src/version_info.rc, VER_BINARY=4), compiled with the SDK rc.exe;
+  #   sbox.exe.stela.res — the embedded Stela manifest (resource STELA 1);
+  #   source_link_gen_gyp.json — the SourceLink map, injected as the PDB
+  #     "sourcelink" stream (lld-link has no /SOURCELINK).
   ldflags = [
     "/DEPENDENTLOADFLAG:0xA00",
+    "version_info_sbox.res",
     "sbox.exe.stela.res",
+    "/pdbstream:sourcelink=source_link_gen_gyp.json",
   ]
 
   # Copy the engine payload (v8host.dll) beside sbox.exe so the worker loads it.

@@ -11,8 +11,9 @@
 //      (via vswhere; requires the "C++ Clang Compiler for Windows" component),
 //      and the vendored gn (deps/gn/gn.exe, Git LFS),
 //   2. runs `gn gen` (writing args.gn) then `ninja` into a single out dir, and
-//   3. enforces the same hygiene gates as v8jsi.dll (export allowlist + Hybrid
-//      CRT + BinSkim) over the produced binaries.
+//   3. enforces the same hygiene gates as v8jsi.dll (exact exports via the
+//      embedded Stela manifests + Hybrid CRT + BinSkim) over the produced
+//      binaries, plus a size budget.
 //
 // Why the VS toolchain: the sandbox sources compile with a stock stable clang
 // (plugins off, rust off), so we use the clang+ninja that Visual Studio already
@@ -30,7 +31,6 @@ import {
   deleteDir,
   run,
   vswhereExe,
-  dumpbinExportNames,
   crtDependencyLines,
   ensureBinSkimExe,
   analyzeBinSkim,
@@ -89,8 +89,6 @@ const clangComponentId = "Microsoft.VisualStudio.Component.VC.Llvm.Clang";
 //                      ThinLTO is not recognized by BinSkim's check. Clearing
 //                      it would require switching the sandbox link to MSVC
 //                      link.exe -- a large toolchain change, tracked separately.
-//   BA2027           - PDBs lack SourceLink (a debugging-ergonomics item, not a
-//                      runtime mitigation; orthogonal to this build).
 //   BA2025           - CET Shadow Stack. Chromium enables /CETCOMPAT on the x64
 //                      link (so x64 clears this), but not for the x86 target, and
 //                      32-bit CET shadow stack is rarely deployed. Accepted on x86
@@ -100,7 +98,6 @@ const clangComponentId = "Microsoft.VisualStudio.Component.VC.Llvm.Clang";
 const acceptedSandboxBinSkimRules = new Set([
   "BA2004",
   "BA2025",
-  "BA2027",
   "BA6004",
   "BA6006",
 ]);
@@ -133,8 +130,9 @@ Boolean flags (all support --no- prefix):
   --help          Show this help message
   --gen           Run 'gn gen' (writes args.gn) before building (default: true)
   --build         Run 'ninja' on the target (default: true)
-  --check         Enforce export-allowlist + Stela-manifest + Hybrid-CRT +
-                  BinSkim gates on the produced binaries (sbox.exe, v8host.dll)
+  --check         Enforce the Stela-manifest (exact exports) + Hybrid-CRT +
+                  size-budget + BinSkim gates on the produced binaries
+                  (sbox.exe, v8host.dll)
   --clean         Delete the out dir before generating
 
 String arguments:
@@ -481,7 +479,7 @@ function ninjaBuild(ninja: string, outDir: string, target: string): void {
 }
 
 // Generate src/version_info_gen.h (the version numbers src/version_info.rc
-// #includes for sbox.dll / v8host.exe). The gyp engine build regenerates the
+// #includes for sbox.exe / v8host.dll). The gyp engine build regenerates the
 // same header via its v8jsi_version_gen action; both keep it fresh from
 // config.json.v8jsi_version. The header is git-ignored.
 function generateVersionInfo(): void {
@@ -490,19 +488,44 @@ function generateVersionInfo(): void {
   execSync(`node "${script}"`, { stdio: "inherit", cwd: repoRoot });
 }
 
-// Emit <outDir>/source_link_gen_gyp.json — the SourceLink map that sbox.dll /
-// v8host.exe link via /SOURCELINK: (their BUILD.gn ldflags). Same generator and
-// map the gyp engine build uses; written into the out dir so the ldflags can
-// reference it by name (relative to the linker's out-dir cwd, like the .res
-// files). Embeds GitHub source indexing in the sbox PDBs (clears BinSkim BA2027).
+// Emit the SourceLink map that sbox.exe / v8host.dll inject as their PDB
+// "sourcelink" stream (/pdbstream: in their BUILD.gn ldflags; lld-link has no
+// /SOURCELINK). Same generator and map the gyp engine build uses. It names the
+// commit, so it changes with each one; installLinkInput relinks both binaries
+// then. Embeds GitHub source indexing in the sandbox PDBs (clears BinSkim BA2027).
 function generateSourceLink(outDir: string): void {
   const script = path.join(repoRoot, "src", "generate_source_link.ts");
-  const out = path.join(outDir, "source_link_gen_gyp.json");
+  const fresh = path.join(linkInputsDir(outDir), "source_link_gen_gyp.json");
   console.log("\n=== source link (source_link_gen_gyp.json) ===\n");
-  execSync(`node "${script}" --output "${out}"`, {
+  execSync(`node "${script}" --output "${fresh}"`, {
     stdio: "inherit",
     cwd: repoRoot,
   });
+  installLinkInput(outDir, fresh, ["sbox.exe", "v8host.dll"]);
+}
+
+// The out-dir files sbox.exe / v8host.dll link through ldflags (the version and
+// Stela .res files, the SourceLink map) are generated outside GN's graph, so GN
+// can't list them as link inputs and ninja won't relink when one changes. Each is
+// produced under <outDir>\link-inputs (or stela\), copied into the out dir only
+// when its bytes differ, and then the binaries that link it are deleted so ninja
+// relinks them. An unchanged input leaves the binaries alone.
+function linkInputsDir(outDir: string): string {
+  const dir = path.join(outDir, "link-inputs");
+  ensureDir(dir);
+  return dir;
+}
+
+function installLinkInput(outDir: string, fresh: string, binaries: string[]): void {
+  const dest = path.join(outDir, path.basename(fresh));
+  const bytes = fs.readFileSync(fresh);
+  if (fs.existsSync(dest) && fs.readFileSync(dest).equals(bytes)) {
+    console.log(`  unchanged: ${path.basename(dest)}`);
+    return;
+  }
+  fs.writeFileSync(dest, bytes);
+  for (const binary of binaries) fs.rmSync(path.join(outDir, binary), { force: true });
+  console.log(`  wrote:     ${path.basename(dest)} (${binaries.join(", ")} relinks)`);
 }
 
 // The toolchain env block that gn gen writes (environment.<cpu>: NUL-separated
@@ -527,27 +550,28 @@ function toolchainRc(outDir: string, targetCpu: TargetCpu): { env: NodeJS.Proces
   return floor("rc.exe not found in the toolchain PATH (Windows SDK bin).");
 }
 
-// Compile src/version_info.rc -> <outDir>/version_info_<name>.res for sbox.dll
-// and v8host.exe, which link the prebuilt .res via ldflags. GN's own rc tool
+// Compile src/version_info.rc -> version_info_<name>.res for sbox.exe and
+// v8host.dll, which link the prebuilt .res via ldflags. GN's own rc tool
 // (rc.py) needs the hermetic rc binary + hermetic clang, neither of which the
 // pruned VS-clang sandbox tree carries — so we use the Windows SDK rc.exe
 // directly (see toolchainRc). VER_BINARY selects each binary's strings.
 function compileVersionResources(outDir: string, targetCpu: TargetCpu): void {
-  console.log("\n=== version resources (sbox.dll / v8host.exe) ===\n");
+  console.log("\n=== version resources (sbox.exe / v8host.dll) ===\n");
   const { env, rcExe } = toolchainRc(outDir, targetCpu);
 
   const rcSource = path.join(repoRoot, "src", "version_info.rc");
   for (const b of [
-    { name: "sbox", verBinary: 4 },
-    { name: "v8host", verBinary: 5 },
+    { name: "sbox", binary: "sbox.exe", verBinary: 4 },
+    { name: "v8host", binary: "v8host.dll", verBinary: 5 },
   ]) {
-    const res = path.join(outDir, `version_info_${b.name}.res`);
-    console.log(`  rc ${b.name} (VER_BINARY=${b.verBinary}) -> ${path.basename(res)}`);
+    const fresh = path.join(linkInputsDir(outDir), `version_info_${b.name}.res`);
+    console.log(`  rc ${b.name} (VER_BINARY=${b.verBinary}) -> ${path.basename(fresh)}`);
     execFileSync(
       rcExe,
-      ["/nologo", `/dVER_BINARY=${b.verBinary}`, `/fo${res}`, rcSource],
+      ["/nologo", `/dVER_BINARY=${b.verBinary}`, `/fo${fresh}`, rcSource],
       { env, stdio: "inherit" },
     );
+    installLinkInput(outDir, fresh, [b.binary]);
   }
 }
 
@@ -569,9 +593,8 @@ function stela(args: string[]): void {
 }
 
 // Extract the API model once, write each binary's manifest (`stela gen embed`),
-// and compile it to <outDir>/<binary>.stela.res, which the binary's BUILD.gn
-// links via ldflags. GN can't list a .res it doesn't generate as a link input,
-// so when the .res changes the stale binary is deleted, and ninja relinks it.
+// and compile it to <binary>.stela.res, which the binary's BUILD.gn links via
+// ldflags (installed by installLinkInput, which relinks it when it changes).
 function embedStelaManifests(outDir: string, targetCpu: TargetCpu): void {
   console.log("\n=== Stela manifests (v8host.dll / sbox.exe) ===\n");
   const { env, rcExe } = toolchainRc(outDir, targetCpu);
@@ -580,17 +603,9 @@ function embedStelaManifests(outDir: string, targetCpu: TargetCpu): void {
   stela(["extract", "--config", stelaConfig, "--out", model]);
   for (const binary of stelaBinaries) {
     stela(["gen", "embed", "--config", stelaConfig, "--model", model, "--binary", binary, "--target", stelaTargets[targetCpu], "--out", stelaDir]);
-    const res = path.join(outDir, `${binary}.stela.res`);
     const fresh = path.join(stelaDir, `${binary}.stela.res`);
     execFileSync(rcExe, ["/nologo", `/fo${fresh}`, path.join(stelaDir, `${binary}.stela.rc`)], { env, stdio: "inherit" });
-    const bytes = fs.readFileSync(fresh);
-    if (fs.existsSync(res) && fs.readFileSync(res).equals(bytes)) {
-      console.log(`  unchanged: ${path.basename(res)}`);
-      continue;
-    }
-    fs.writeFileSync(res, bytes);
-    fs.rmSync(path.join(outDir, binary), { force: true });
-    console.log(`  wrote:     ${path.basename(res)} (${binary} relinks)`);
+    installLinkInput(outDir, fresh, [binary]);
   }
 }
 
@@ -613,109 +628,31 @@ function checkStelaManifests(outDir: string): boolean {
 // Sandbox binary hygiene gates
 // =============================================================================
 //
-// The same hygiene bar as v8jsi.dll: an export allowlist, the Hybrid CRT
-// contract, and BinSkim. Parameterized over a binary table so further binaries
-// can be added with one entry.
+// The same hygiene bar as v8jsi.dll: exact exports (the Stela manifest gate
+// above: `stela verify` with otherExports false in stela.config.json), the
+// Hybrid CRT contract, BinSkim, and a size budget. Parameterized over a binary
+// table so further binaries can be added with one entry.
 
 interface SandboxBinary {
   file: string;
-  // Exact export set. An empty array means the binary must export nothing.
-  allowedExports: string[];
   // Optional size ceiling (bytes). Footprint budget — guards against silent
   // bloat. Only binaries with a budget are size-checked; omit to skip.
   maxBytes?: number;
 }
 
-// The sandbox binaries and their allowed export surfaces.
+// The sandbox binaries. Their export surfaces live in stela.config.json:
 //   sbox.exe    — the single-image container: exports NOTHING. SBOX_STATIC makes
 //                 the statically-linked sbox_* core resolve at link time rather
 //                 than through the EXE's export table.
-//   v8host.dll  — the engine payload: exports the single plugin-ABI entry plus
-//                 the 28 approved Contract C client entry points (7 session /
-//                 run functions and 21 configuration builder setters).
+//   v8host.dll  — the engine payload: exports the sbox plugin-ABI entry plus
+//                 the v8host client API (src/public/v8host_client.h).
 const sandboxBinaries: SandboxBinary[] = [
   // sbox.exe budget: <= 2 MiB (measured ~1.76 MiB; floor at the Hybrid CRT).
-  { file: "sbox.exe", allowedExports: [], maxBytes: 2 * 1024 * 1024 },
+  { file: "sbox.exe", maxBytes: 2 * 1024 * 1024 },
   // v8host.dll budget: <= 640 KiB (measured 581,632 bytes): plugin + engine
   // glue + coordinator router + client; the engine DLL is loaded at runtime.
-  {
-    file: "v8host.dll",
-    allowedExports: [
-      "sbox_plugin_main",
-      "v8host_config_add_capability_utf16",
-      "v8host_config_add_capability_utf8",
-      "v8host_config_add_file_rule_utf16",
-      "v8host_config_add_file_rule_utf8",
-      "v8host_config_set_broker_mode",
-      "v8host_config_set_delayed_integrity_level",
-      "v8host_config_set_initial_token_level",
-      "v8host_config_set_integrity_level",
-      "v8host_config_set_lockdown_token_level",
-      "v8host_config_set_low_privilege_app_container",
-      "v8host_config_set_profile_name_utf16",
-      "v8host_config_set_profile_name_utf8",
-      "v8host_config_set_prohibit_dynamic_code",
-      "v8host_config_set_tier",
-      "v8host_config_set_use_app_container",
-      "v8host_initialize",
-      "v8host_run_cancel",
-      "v8host_run_config_set_engine_dll_utf16",
-      "v8host_run_config_set_engine_dll_utf8",
-      "v8host_run_config_set_payload",
-      "v8host_run_config_set_startup_snapshot_path_utf16",
-      "v8host_run_config_set_startup_snapshot_path_utf8",
-      "v8host_run_config_set_tier",
-      "v8host_run_post_message",
-      "v8host_session_close",
-      "v8host_session_open",
-      "v8host_session_set_callbacks",
-      "v8host_session_start_run",
-    ],
-    maxBytes: 640 * 1024,
-  },
+  { file: "v8host.dll", maxBytes: 640 * 1024 },
 ];
-
-// Gate 1: exact export allowlist. Returns true if all binaries pass.
-function checkSandboxExports(outDir: string): boolean {
-  console.log("\n=== Sandbox export allowlist ===\n");
-  let ok = true;
-  for (const bin of sandboxBinaries) {
-    const filePath = path.join(outDir, bin.file);
-    if (!fs.existsSync(filePath)) {
-      console.error(`  MISSING: ${filePath}`);
-      ok = false;
-      continue;
-    }
-    const names = dumpbinExportNames(filePath);
-    const expected = new Set(bin.allowedExports);
-    const actual = new Set(names);
-    const stray = names.filter((n) => !expected.has(n));
-    const missing = bin.allowedExports.filter((n) => !actual.has(n));
-    const allowed =
-      bin.allowedExports.length === 0
-        ? "(none)"
-        : bin.allowedExports.join(", ");
-    if (stray.length === 0 && missing.length === 0) {
-      console.log(
-        `  OK   ${bin.file}: exact ${names.length}-symbol export set [${allowed}]`,
-      );
-    } else {
-      ok = false;
-      console.error(
-        `  FAIL ${bin.file}: export set differs (expected: [${allowed}]); ` +
-          `unexpected: [${stray.join(", ")}]; missing: [${missing.join(", ")}]`,
-      );
-    }
-  }
-  if (!ok) {
-    console.error(
-      "\nSandbox export allowlist FAILED. If a C++ symbol leaked from the " +
-        "statically linked base/sandbox libraries, drop its __declspec(dllexport) " +
-        "at the source so the export table is exactly the intended C ABI.",
-    );
-  }
-  return ok;
-}
 
 // Gate 2: Hybrid CRT. No sandbox binary may import vcruntime140 / msvcp140;
 // only the UCRT may be shared. Returns true if all binaries pass.
@@ -804,25 +741,22 @@ async function runSandboxBinSkim(
   );
 }
 
-// Orchestrate all three sandbox gates and exit non-zero if any fail. BinSkim
-// needs its package feed reachable to install (set BINSKIM_NUGET_SOURCE to point
-// at an available source); a reachable run that finds unaccepted issues fails
-// the gate.
+// Orchestrate the sandbox gates and exit non-zero if any fail. BinSkim needs its
+// package feed reachable to install (set BINSKIM_NUGET_SOURCE to point at an
+// available source); a reachable run that finds unaccepted issues fails the gate.
 async function runSandboxGates(outDir: string, toolsPath: string): Promise<void> {
   console.log(`\n=== Sandbox hygiene gates (${outDir}) ===`);
-  const exportsOk = checkSandboxExports(outDir);
   const stelaOk = checkStelaManifests(outDir);
   const crtOk = checkSandboxCrt(outDir);
   const sizeOk = checkSandboxSize(outDir);
   const binskimOk = await runSandboxBinSkim(outDir, toolsPath);
 
   console.log("\n=== Sandbox gate summary ===");
-  console.log(`  export allowlist: ${exportsOk ? "PASS" : "FAIL"}`);
   console.log(`  stela manifests:  ${stelaOk ? "PASS" : "FAIL"}`);
   console.log(`  hybrid CRT:       ${crtOk ? "PASS" : "FAIL"}`);
   console.log(`  size budget:      ${sizeOk ? "PASS" : "FAIL"}`);
   console.log(`  binskim:          ${binskimOk ? "PASS" : "FAIL"}`);
-  if (!exportsOk || !stelaOk || !crtOk || !sizeOk || !binskimOk) {
+  if (!stelaOk || !crtOk || !sizeOk || !binskimOk) {
     process.exit(1);
   }
 }
@@ -880,14 +814,11 @@ async function main(): Promise<void> {
       gnGen(outDir, junction, tc.clangMajor, targetCpu);
     }
     if (args.build) {
-      // Compile the VERSIONINFO .res (sbox.dll / v8host.exe link it) after gn
-      // gen has written the toolchain env block, before ninja links.
+      // Write each out-dir link input (the VERSIONINFO and Stela manifest .res
+      // files, the SourceLink map) after gn gen has written the toolchain env
+      // block, before ninja links; a changed input forces its binaries' relink.
       compileVersionResources(outDir, targetCpu);
-      // Write and compile each binary's Stela manifest .res (their BUILD.gn
-      // links it), before ninja links.
       embedStelaManifests(outDir, targetCpu);
-      // Emit the SourceLink map into the out dir; sbox.dll / v8host.exe link it
-      // via /SOURCELINK: (their BUILD.gn ldflags), before ninja links.
       generateSourceLink(outDir);
       ninjaBuild(tc.ninja, outDir, args.target ?? "generic");
     }

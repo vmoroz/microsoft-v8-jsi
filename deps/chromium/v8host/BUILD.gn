@@ -244,12 +244,16 @@ shared_library("v8host") {
   configs -= [ "//build/config/compiler:no_exceptions" ]
   configs += [ "//build/config/compiler:exceptions" ]
 
-  # The embedded Stela manifest (resource STELA 1), compiled into the out dir by
-  # scripts/sbox-build.ts before ninja runs, which also forces the relink when it
-  # changes; `stela verify` checks the exports.
+  # Out-dir inputs written by scripts/sbox-build.ts before ninja runs, which
+  # also forces the relink when one changes (GN doesn't track them): the
+  # VERSIONINFO (src/version_info.rc, VER_BINARY=5), the embedded Stela
+  # manifest (resource STELA 1; `stela verify` checks the exports), and the
+  # SourceLink map, injected as the PDB "sourcelink" stream.
   ldflags = [
     "/DEPENDENTLOADFLAG:0xA00",
+    "version_info_v8host.res",
     "v8host.dll.stela.res",
+    "/pdbstream:sourcelink=source_link_gen_gyp.json",
   ]
 }
 

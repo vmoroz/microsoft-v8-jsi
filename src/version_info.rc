@@ -31,13 +31,13 @@
 #define VER_ORIGINALFILENAME "mkv8snapshot.exe"
 #define VER_FILETYPE         0x1L
 #elif VER_BINARY == 4
-#define VER_FILEDESCRIPTION  "V8-JSI sandbox runtime"
-#define VER_ORIGINALFILENAME "sbox.dll"
-#define VER_FILETYPE         0x2L
-#elif VER_BINARY == 5
-#define VER_FILEDESCRIPTION  "V8-JSI sandbox host"
-#define VER_ORIGINALFILENAME "v8host.exe"
+#define VER_FILEDESCRIPTION  "V8-JSI sandbox container"
+#define VER_ORIGINALFILENAME "sbox.exe"
 #define VER_FILETYPE         0x1L
+#elif VER_BINARY == 5
+#define VER_FILEDESCRIPTION  "V8-JSI sandbox engine host"
+#define VER_ORIGINALFILENAME "v8host.dll"
+#define VER_FILETYPE         0x2L
 #else
 #define VER_FILEDESCRIPTION  "Microsoft.JavaScript.V8"
 #define VER_ORIGINALFILENAME "v8jsi.dll"
