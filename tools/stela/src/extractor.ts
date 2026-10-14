@@ -1,10 +1,12 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
+  rmSync,
   statSync,
 } from "node:fs";
 import path from "node:path";
@@ -107,29 +109,53 @@ async function buildExtractorImpl(arch: MsvcArch): Promise<Extractor> {
   const directory = path.join(outputRoot, `${arch}-${buildKey(arch, libclangDll)}`);
   const exe = path.join(directory, "stela-extract.exe");
   if (!existsSync(exe)) {
-    mkdirSync(directory, { recursive: true });
-    const env = await tools.msvcEnv(arch);
-    const compiler = resolveOnPath("cl.exe", env);
-    const { stdout, stderr } = await execFileAsync(
-      compiler,
-      [
-        "/nologo",
-        "/std:c17",
-        "/W4",
-        "/WX",
-        "/TC",
-        `/external:I${thirdParty}`,
-        "/external:W0",
-        `/I${thirdParty}`,
-        sourceFile,
-        `/Fe:${exe}`,
-        "/link",
-        libclangLib,
-      ],
-      { cwd: directory, env, maxBuffer: 64 * 1024 * 1024 },
-    );
-    if (!existsSync(exe)) {
-      throw new Error(`cl.exe did not create ${exe}\n${stdout}${stderr}`);
+    // Concurrent processes (node --test runs files in parallel) may build the
+    // same key: each compiles privately, then publishes the exe into the cache.
+    const scratch = path.join(outputRoot, `.build-${arch}-${process.pid}-${randomUUID()}`);
+    const built = path.join(scratch, "stela-extract.exe");
+    mkdirSync(scratch, { recursive: true });
+    try {
+      const env = await tools.msvcEnv(arch);
+      const compiler = resolveOnPath("cl.exe", env);
+      let output: string;
+      try {
+        const { stdout, stderr } = await execFileAsync(
+          compiler,
+          [
+            "/nologo",
+            "/std:c17",
+            "/W4",
+            "/WX",
+            "/TC",
+            `/external:I${thirdParty}`,
+            "/external:W0",
+            `/I${thirdParty}`,
+            sourceFile,
+            `/Fe:${built}`,
+            "/link",
+            libclangLib,
+          ],
+          { cwd: scratch, env, maxBuffer: 64 * 1024 * 1024 },
+        );
+        output = `${stdout}${stderr}`;
+      } catch (error) {
+        const { stdout = "", stderr = "" } = error as { stdout?: string; stderr?: string };
+        throw new Error(`building stela-extract.exe failed\n${stdout}${stderr}`, { cause: error });
+      }
+      if (!existsSync(built)) {
+        throw new Error(`cl.exe did not create ${built}\n${output}`);
+      }
+      mkdirSync(directory, { recursive: true });
+      if (!existsSync(exe)) {
+        try {
+          renameSync(built, exe);
+        } catch (error) {
+          // Another process published (and may be running) the same build.
+          if (!existsSync(exe)) throw error;
+        }
+      }
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
     }
   }
   return { exe, libclangBin };
