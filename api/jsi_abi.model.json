@@ -4866,7 +4866,7 @@
         },
         {
           "kind": "macro",
-          "name": "JSI_VALUE_INIT",
+          "name": "JSI_ABI_VALUE_INIT",
           "location": {"file": "src/jsi_abi/jsi_abi.h", "line": 273, "column": 9},
           "doc": null,
           "annotations": [],
@@ -4875,7 +4875,7 @@
         },
         {
           "kind": "macro",
-          "name": "JSI_GROWABLE_BUFFER_INIT",
+          "name": "JSI_ABI_GROWABLE_BUFFER_INIT",
           "location": {"file": "src/jsi_abi/jsi_abi.h", "line": 305, "column": 9},
           "doc": null,
           "annotations": [],
@@ -4884,7 +4884,7 @@
         },
         {
           "kind": "macro",
-          "name": "JSI_BUFFER_INIT",
+          "name": "JSI_ABI_BUFFER_INIT",
           "location": {"file": "src/jsi_abi/jsi_abi.h", "line": 317, "column": 9},
           "doc": null,
           "annotations": [],
@@ -4893,7 +4893,7 @@
         },
         {
           "kind": "macro",
-          "name": "JSI_MUTABLE_BUFFER_INIT",
+          "name": "JSI_ABI_MUTABLE_BUFFER_INIT",
           "location": {"file": "src/jsi_abi/jsi_abi.h", "line": 329, "column": 9},
           "doc": null,
           "annotations": [],
@@ -4902,7 +4902,7 @@
         },
         {
           "kind": "macro",
-          "name": "JSI_HOST_FUNCTION_INIT",
+          "name": "JSI_ABI_HOST_FUNCTION_INIT",
           "location": {"file": "src/jsi_abi/jsi_abi.h", "line": 373, "column": 9},
           "doc": null,
           "annotations": [],
@@ -4911,7 +4911,7 @@
         },
         {
           "kind": "macro",
-          "name": "JSI_PROPNAMEID_LIST_INIT",
+          "name": "JSI_ABI_PROPNAMEID_LIST_INIT",
           "location": {"file": "src/jsi_abi/jsi_abi.h", "line": 385, "column": 9},
           "doc": null,
           "annotations": [],
@@ -4920,7 +4920,7 @@
         },
         {
           "kind": "macro",
-          "name": "JSI_HOST_OBJECT_INIT",
+          "name": "JSI_ABI_HOST_OBJECT_INIT",
           "location": {"file": "src/jsi_abi/jsi_abi.h", "line": 409, "column": 9},
           "doc": null,
           "annotations": [],
@@ -4929,7 +4929,7 @@
         },
         {
           "kind": "macro",
-          "name": "JSI_NATIVE_STATE_INIT",
+          "name": "JSI_ABI_NATIVE_STATE_INIT",
           "location": {"file": "src/jsi_abi/jsi_abi.h", "line": 419, "column": 9},
           "doc": null,
           "annotations": [],

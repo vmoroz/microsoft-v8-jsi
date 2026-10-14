@@ -270,7 +270,7 @@ struct jsi_value {
     jsi_pointer *pointer;
   } data; ///< The inline value payload.
 };
-#define JSI_VALUE_INIT {jsi_valuekind_undefined, {false}}
+#define JSI_ABI_VALUE_INIT {jsi_valuekind_undefined, {false}}
 /*==========================================================================
  * Buffer Types (from Hermes ABI)
  *
@@ -302,7 +302,7 @@ struct jsi_growable_buffer {
   size_t size; ///< The capacity in bytes.
   size_t used; ///< The bytes written so far.
 };
-#define JSI_GROWABLE_BUFFER_INIT {NULL, NULL, 0, 0}
+#define JSI_ABI_GROWABLE_BUFFER_INIT {NULL, NULL, 0, 0}
 
 /// Operations for a retained read-only buffer.
 struct jsi_buffer_api {
@@ -314,7 +314,7 @@ struct jsi_buffer {
   const uint8_t *data; ///< The buffer data.
   size_t size; ///< The buffer size in bytes.
 };
-#define JSI_BUFFER_INIT {NULL, NULL, 0}
+#define JSI_ABI_BUFFER_INIT {NULL, NULL, 0}
 
 /// Operations for a retained writable buffer.
 struct jsi_mutable_buffer_api {
@@ -326,7 +326,7 @@ struct jsi_mutable_buffer {
   uint8_t *data; ///< The buffer data.
   size_t size; ///< The buffer size in bytes.
 };
-#define JSI_MUTABLE_BUFFER_INIT {NULL, NULL, 0}
+#define JSI_ABI_MUTABLE_BUFFER_INIT {NULL, NULL, 0}
 
 /*==========================================================================
  * PreparedJavaScript
@@ -370,7 +370,7 @@ struct jsi_host_function_api {
 struct jsi_host_function {
   const jsi_host_function_api *api;
 };
-#define JSI_HOST_FUNCTION_INIT {NULL}
+#define JSI_ABI_HOST_FUNCTION_INIT {NULL}
 
 /// PropNameID list: returned by host object get_own_keys.
 struct jsi_propnameid_list_api {
@@ -382,7 +382,7 @@ struct jsi_propnameid_list {
   JSI_ABI_NULLABLE const jsi_propnameid *props; ///< The property-name identifiers.
   size_t size; ///< The number of property-name identifiers.
 };
-#define JSI_PROPNAMEID_LIST_INIT {NULL, NULL, 0}
+#define JSI_ABI_PROPNAMEID_LIST_INIT {NULL, NULL, 0}
 
 /// Host object: JS object backed by native callbacks.
 struct jsi_host_object_api {
@@ -406,7 +406,7 @@ struct jsi_host_object_api {
 struct jsi_host_object {
   const jsi_host_object_api *api;
 };
-#define JSI_HOST_OBJECT_INIT {NULL}
+#define JSI_ABI_HOST_OBJECT_INIT {NULL}
 
 /// Native state: attached to JS objects, released on GC.
 struct jsi_native_state_api {
@@ -416,7 +416,7 @@ struct jsi_native_state_api {
 struct jsi_native_state {
   const jsi_native_state_api *api;
 };
-#define JSI_NATIVE_STATE_INIT {NULL}
+#define JSI_ABI_NATIVE_STATE_INIT {NULL}
 
 /*==========================================================================
  * Interface Query (for optional extensions — like JSI C++ ICast)
