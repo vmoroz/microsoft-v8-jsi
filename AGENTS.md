@@ -52,6 +52,15 @@ Set-Location 'e:\GitHub\microsoft\v8-jsi\deps\nodejs'; .\vcbuild.bat clean
 on success and the output binaries get fresh timestamps. These are more reliable
 signals than a shell pipeline's exit code, which can be misleading.
 
+**The sandbox variant shares the output folder.** `node build.ts
+--build-v8jsisb` builds `v8jsisb.dll` (jitless, V8 sandbox) into the same
+`deps/nodejs/out/<config>` as `v8jsi.dll`. The first build after switching
+between the two variants can leave V8's embedded builtins stale: it reports
+success, but every runtime then crashes with 0xc0000005. After a switch, build
+again until the build is nearly a no-op, then test. To run the sandbox with a
+fresh engine, copy `v8jsisb.dll` and its PDB into
+`deps/chromium/out/sandbox-x64` yourself; no script does it.
+
 **Key build files:**
 - `src/v8jsi.gyp` — main GYP target for v8jsi
 - `deps/nodejs/node.gyp` — includes `v8jsi.gyp` when `build_v8jsi=1`
@@ -82,8 +91,8 @@ ABI-backed; `/0` goes through the public `makeV8Runtime`, `/1` through
 (V8-specific). Swap `Release`→`Debug` to exercise the Debug build (which compiles
 in V8's DCHECKs).
 
-Recent baseline: 116 JSI tests + 52 Node-API tests, x64 Release and Debug
-(the exact counts shift as tests are added or removed).
+Recent baseline: 127 JSI tests (2 disabled) + 52 Node-API tests, x64 Release
+and Debug (the exact counts shift as tests are added or removed).
 
 ## Source layout
 
@@ -123,6 +132,17 @@ The binary-stable C ABI for JSI (see "ABI architecture" below).
 - `V8JsiRuntime.h` + `V8JsiRuntime.cpp` — the legacy public `makeV8Runtime` API
   (the `.cpp` is consumer-compiled source)
 - `ScriptStore.h` — prepared-script storage interface
+- `v8host_client.h` + `v8host_stela.h` — the C client API apps use to load
+  `v8host.dll` and run JS in the sandbox (ships in `include\v8host`)
+
+### Sandbox (`deps/chromium/`)
+- `sandbox_dll/sbox.h` + `sbox_stela.h` — the plugin ABI between `sbox.exe`
+  and `v8host.dll`
+- `v8host/` — `v8host.dll`: the client, coordinator, and engine personas (see
+  `deps/chromium/v8host/README.md`)
+- Built by `node scripts/sbox-build.ts --target-cpu x64 --target generic` into
+  `deps/chromium/out/sandbox-x64`; `--check` runs the export, CRT, size, and
+  BinSkim gates
 
 ### Node-API (`src/node-api/`)
 - `v8_node_api.h` — V8-specific Node-API runtime hosting and configuration
@@ -137,8 +157,9 @@ The binary-stable C ABI for JSI (see "ABI architecture" below).
 
 ## ABI architecture
 
-> The JSI ABI and Node-API hosting surfaces (`src/jsi_abi/*.h`,
-> `src/node-api/v8_node_api.h`) are **experimental and not yet ABI-stable** — each header
+> The JSI ABI, Node-API hosting, and sandbox surfaces (`src/jsi_abi/*.h`,
+> `src/node-api/v8_node_api.h`, `src/public/v8host_client.h`,
+> `deps/chromium/sandbox_dll/sbox.h`) are **experimental and not yet ABI-stable** — each header
 > carries a banner saying so. Nothing depends on it as a stable contract yet,
 > which is why it can still be reshaped freely.
 
@@ -198,9 +219,10 @@ tree. ICU adds ~30 MB; a full build is ~67 MB, and `--without-intl` (the default
 narrow build) is ~33 MB.
 
 ## Scripts and tooling
-The `scripts/` folder holds the TypeScript build/sync tooling (`build.ts`,
-`sync.ts`, AI-merge, plus tests via `npm test`, type-checking via
-`npm run typecheck`, and lint/format via `npm run fix`). Run TypeScript with
+The `scripts/` folder holds the TypeScript build tooling (`build.ts`,
+`sbox-build.ts`, `header-check.ts`, and their helpers). In `scripts/`, `npm run typecheck`
+type-checks it and `npm run header-check` runs the header gate below; Stela's
+own tests are `npm test` in `tools/stela/`. Run TypeScript with
 `node <script>.ts` directly.
 
 The public C ABI headers have a compile gate: `node --test

@@ -181,9 +181,9 @@ JSI_ABI_ENUM(int32_t, jsi_status){
  * The runtime factory allocates a jsi_config and invokes this callback so the
  * consumer can populate it via the engine's typed setters. The config handle is
  * valid ONLY for the duration of the call. Return jsi_status_ok to proceed, or
- * a failure status to abort creation (the factory then frees the config
- * and the create call returns NULL). May be NULL at the create site, meaning
- * "all defaults".
+ * a failure status to abort creation (the factory then frees the config, and
+ * the create call returns that status with *out_runtime set to NULL). May be
+ * NULL at the create site, meaning "all defaults".
  */
 typedef jsi_status(JSI_ABI_CDECL *jsi_configure_runtime_cb)(
     JSI_ABI_NULLABLE void *user_data,

@@ -4718,7 +4718,7 @@
           "kind": "typedef",
           "name": "jsi_configure_runtime_cb",
           "location": {"file": "src/jsi_abi/jsi_abi.h", "line": 188, "column": 35},
-          "doc": "The runtime factory allocates a jsi_config and invokes this callback so the\nconsumer can populate it via the engine's typed setters. The config handle is\nvalid ONLY for the duration of the call. Return jsi_status_ok to proceed, or\na failure status to abort creation (the factory then frees the config\nand the create call returns NULL). May be NULL at the create site, meaning\n\"all defaults\".",
+          "doc": "The runtime factory allocates a jsi_config and invokes this callback so the\nconsumer can populate it via the engine's typed setters. The config handle is\nvalid ONLY for the duration of the call. Return jsi_status_ok to proceed, or\na failure status to abort creation (the factory then frees the config, and\nthe create call returns that status with *out_runtime set to NULL). May be\nNULL at the create site, meaning \"all defaults\".",
           "annotations": [],
           "type": {
             "pointer": {
