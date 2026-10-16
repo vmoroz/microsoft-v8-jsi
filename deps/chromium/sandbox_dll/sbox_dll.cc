@@ -1030,6 +1030,10 @@ SBOX_CORE_API int sbox_broker_close(SboxSession* session) {
   return 0;
 }
 
+SBOX_CORE_API uint32_t sbox_broker_get_process_id(SboxSession* session) {
+  return session && session->proc ? ::GetProcessId(session->proc) : 0;
+}
+
 SBOX_CORE_API int sbox_broker_wait(SboxSession* session) {
   if (!session)
     return -1;

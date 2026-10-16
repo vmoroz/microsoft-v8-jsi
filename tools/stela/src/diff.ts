@@ -85,6 +85,7 @@ interface LibraryContext {
   readonly experimental: ReadonlySet<string>;
   /** Typedefs of both models, by name, to recognize callback types. */
   readonly typedefs: ReadonlyMap<string, Declaration>;
+  readonly declarations: readonly [readonly Declaration[], readonly Declaration[]];
   readonly findings: DiffFinding[];
 }
 
@@ -475,7 +476,10 @@ function diffTypedef(context: LibraryContext, pair: Pair, targets: readonly stri
     compareParameters(context, pair, "callback", [base.name, head.name], [before.params, after.params], "");
   }
   diffCanonical(context, pair, targets);
-  diffLayout(context, pair, targets);
+  const recordBase = resolveRecord(base.type, context.declarations[0]);
+  const recordHead = resolveRecord(head.type, context.declarations[1]);
+  const grows = recordBase !== undefined && recordHead !== undefined && isEndGrowth(context, recordBase, recordHead);
+  diffLayout(context, pair, targets, { size: grows, align: grows });
   perTarget(pair, targets, (f) => f?.callingConvention, (from, to, where) =>
     report(context, "break", "calling_convention_changed", pair, `calling convention${where} changed from ${show(from)} to ${show(to)}`),
   );
@@ -499,6 +503,35 @@ function isFunctionTable(context: LibraryContext, declaration: Declaration): boo
   return true;
 }
 
+/** Resolve only by-value record aliases, never pointers or arrays. */
+function resolveRecord(type: TypeNode | undefined, declarations: readonly Declaration[]): Declaration | undefined {
+  const seen = new Set<string>();
+  let name = prop<string>(type, "name");
+  while (name !== undefined && !seen.has(name)) {
+    seen.add(name);
+    const record = declarations.find((d) => (d.kind === "struct" || d.kind === "union") && d.name === name);
+    if (record !== undefined) return record;
+    name = prop<string>(declarations.find((d) => d.kind === "typedef" && d.name === name)?.type, "name");
+  }
+  return undefined;
+}
+
+function isGrowableRecord(context: LibraryContext, declaration: Declaration): boolean {
+  return declaration.kind === "struct" &&
+    (declaration.fields?.[0]?.name === "struct_size" || isFunctionTable(context, declaration));
+}
+
+/** Only an appended tail can explain a growable record's larger layout. */
+function isEndGrowth(context: LibraryContext, base: Declaration, head: Declaration): boolean {
+  const before = base.fields ?? [];
+  const after = head.fields ?? [];
+  return !base.incomplete && !head.incomplete && base.kind === head.kind && base.tagless === head.tagless &&
+    isGrowableRecord(context, base) && after.length > before.length && before.every((b, i) => {
+      const a = after[i];
+      return b.name === a.name && typeKey(b.type) === typeKey(a.type) && b.bitWidth === a.bitWidth;
+    });
+}
+
 function diffRecord(context: LibraryContext, pair: Pair, targets: readonly string[]): void {
   const { base, head } = pair as Required<Pair>;
   if (base.incomplete !== head.incomplete) {
@@ -514,7 +547,7 @@ function diffRecord(context: LibraryContext, pair: Pair, targets: readonly strin
   const before = base.fields ?? [];
   const after = head.fields ?? [];
   const table = isFunctionTable(context, base);
-  const growable = base.kind === "struct" && (before[0]?.name === "struct_size" || table);
+  const growable = isGrowableRecord(context, base);
   const common = Math.min(before.length, after.length);
   let structural = false;
   for (let i = 0; i < common; i++) {
@@ -565,7 +598,7 @@ function diffRecord(context: LibraryContext, pair: Pair, targets: readonly strin
   }
   if (structural) return;
 
-  const grows = appended.length > 0;
+  const grows = isEndGrowth(context, base, head);
   diffLayout(context, pair, targets, { size: grows, align: grows });
   for (let i = 0; i < common; i++) {
     const name = after[i].name;
@@ -795,7 +828,9 @@ export function diffModels(base: Model, head: Model, options: DiffOptions = {}):
       groups.push([libraryFinding("break", "library_removed", baseLib, "was removed", libExperimental)]);
       continue;
     }
-    const context: LibraryContext = { library: baseLib.name, experimental, typedefs, findings: [] };
+    const context: LibraryContext = {
+      library: baseLib.name, experimental, typedefs, declarations: [baseLib.declarations, headLib.declarations], findings: [],
+    };
     diffLibrary(context, [base, head], [baseLib, headLib]);
     groups.push(context.findings);
   }

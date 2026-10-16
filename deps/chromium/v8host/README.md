@@ -5,7 +5,7 @@
 `--plugin v8host.dll`. The container owns `main()` and drives the plugin-ABI
 lifecycle — `configure` (broker) → `warmup` pre-lockdown → `lower_token` → `run`
 post-lockdown → `shutdown`. The plugin side is the single `sbox_plugin_main`
-entry (see [`sbox.h`](../sandbox_dll/sbox.h), `SBOX_ABI_VERSION` 7), which returns
+entry (see [`sbox.h`](../sandbox_dll/sbox.h), `SBOX_ABI_VERSION` 8), which returns
 the `sbox_plugin_api` vtable of those functions. The DLL also exports the
 `v8host_*` client API for hosts that drive `sbox.exe` (see
 [`v8host_client.h`](../../../src/public/v8host_client.h), `V8HOST_ABI_VERSION`

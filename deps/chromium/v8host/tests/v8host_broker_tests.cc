@@ -600,7 +600,8 @@ bool StartBridgeOverflow(std::string *detail) {
 }
 struct RouterFixture {
   router::Connection conn;
-  sbox_broker_api api = {sizeof(api), &Spawn, &Post, &Close, &Wait};
+  sbox_broker_api api = {sizeof(api), &Spawn, &Post, &Close, &Wait,
+                         nullptr, nullptr, nullptr, nullptr};
   std::unique_ptr<router::Router> service;
   router::Worker *worker = nullptr;
   struct Handle {
@@ -958,8 +959,8 @@ bool PopWorkerExit(router::Connection& conn, uint32_t session_id = 1) {
   return PopFrame(conn, &h) && h.type == protocol::MessageType::WORKER_EXIT &&
       h.session_id == session_id && h.run_id == 0 && h.request_id == 0 && conn.out_queue.empty();
 }
-bool LifecycleAbi7(std::string* detail) {
-  bool ok = SBOX_ABI_VERSION == 7u;
+bool LifecycleAbi8(std::string* detail) {
+  bool ok = SBOX_ABI_VERSION == 8u;
   for (const auto* dll : {L"v8host.dll", L"v8host_abi4_plugin.dll"}) {
     HMODULE module = ::LoadLibraryExW((ExecutableDirectory() + L"\\" + dll).c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
@@ -968,18 +969,22 @@ bool LifecycleAbi7(std::string* detail) {
     auto entry = reinterpret_cast<sbox_plugin_main_fn>(::GetProcAddress(module, SBOX_PLUGIN_ENTRY));
     const bool old = std::wstring(dll) == L"v8host_abi4_plugin.dll";
     const sbox_plugin_api* plugin = nullptr;
-    ok = entry && entry(old ? 4u : 7u, &plugin) == sbox_status_ok && plugin &&
-        plugin->abi_version == (old ? 4u : 7u) && plugin->configure && plugin->broker_run &&
+    ok = entry && entry(old ? 4u : 8u, &plugin) == sbox_status_ok && plugin &&
+        plugin->abi_version == (old ? 4u : 8u) && plugin->configure && plugin->broker_run &&
         plugin->warmup && plugin->run && plugin->shutdown && ok;
-    plugin = nullptr;
-    ok = entry && entry(old ? 7u : 4u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
+    plugin = reinterpret_cast<const sbox_plugin_api*>(1);
+    ok = entry && entry(old ? 8u : 4u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
+    if (!old) {
+      plugin = reinterpret_cast<const sbox_plugin_api*>(1);
+      ok = entry && entry(7u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
+    }
     ::FreeLibrary(module);
   }
   DWORD code = 0;
   const std::wstring command = L"\"" + ExecutableDirectory() +
       L"\\sbox.exe\" --broker --plugin v8host_abi4_plugin.dll";
   ok = v8host::test::RunProcess(command, &code) && code == 3 && ok;
-  if (!ok) *detail = "matching ABI/4-7 rejection";
+  if (!ok) *detail = "matching ABI/4-8 and old7 rejection";
   return ok;
 }
 bool CoreLifecycleCase(const wchar_t* args, std::string* detail) {
@@ -4344,6 +4349,15 @@ bool RunBrokerApiMode(const wchar_t* mode, DWORD* exit_code) {
   return ok;
 }
 
+bool BrokerApiProcessId(std::string* detail) {
+  DWORD code = 0xFFFFFFFF;
+  if (!RunBrokerApiMode(L"process-id", &code) || code != 0) {
+    *detail = "broker process ID checks failed, exit=" + std::to_string(code);
+    return false;
+  }
+  return true;
+}
+
 bool BrokerApiOwnership(std::string* detail) {
   DWORD code = 0xFFFFFFFF;
   if (!RunBrokerApiMode(L"ownership", &code)) {
@@ -5964,7 +5978,7 @@ int main(int argc, char** argv) {
       {"router", "worker-mailbox-pump-bound", MailboxPumpBound},
       {"cancel", "cancels-first", CancelsFirst},
       {"cancel", "completes-first", CompletesFirst},
-      {"run", "lifecycle-abi7", LifecycleAbi7},
+      {"run", "lifecycle-abi8", LifecycleAbi8},
       {"run", "exit-fact-origin", ExitFactOrigin},
       {"run", "exit-fact-final-drain", ExitFinalDrain},
       {"run", "smoke-lifecycle-two", SmokeLifecycleTwo},
@@ -6040,6 +6054,7 @@ int main(int argc, char** argv) {
       {"lifetime", "dedicated-owner-disconnect", DedicatedOwnerExit},
       {"lifetime", "connect-disconnect-races", DisconnectRaces},
       {"lifetime", "broker-api-ownership", BrokerApiOwnership},
+      {"lifetime", "broker-api-process-id", BrokerApiProcessId},
       {"lifetime", "broker-api-leaked-cleanup", BrokerApiLeakedCleanup},
       {"lifetime", "host-rejects-bad-plugin-abi", HostRejectsBadPluginAbi},
   };

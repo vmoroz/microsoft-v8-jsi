@@ -25,6 +25,7 @@ extern "C" __declspec(dllexport) sbox_status SBOX_CDECL sbox_plugin_main(
     uint32_t host_abi_version, const sbox_plugin_api** out_plugin) {
   if (!out_plugin)
     return sbox_status_invalid_arg;
+  *out_plugin = nullptr;
   if (host_abi_version != SBOX_ABI_VERSION)
     return sbox_status_version_mismatch;
   *out_plugin = &kPlugin;

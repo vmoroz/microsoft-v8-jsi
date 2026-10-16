@@ -66,7 +66,7 @@
 #endif
 #endif
 
-#define SBOX_ABI_VERSION 7u
+#define SBOX_ABI_VERSION 8u
 
 #ifdef __cplusplus
 extern "C" {
@@ -249,9 +249,14 @@ typedef struct sbox_broker_api {
       SBOX_NULLABLE sbox_char16* buffer,
       size_t buffer_length,
       size_t* out_length);
+  /// The worker's process ID, valid while the worker handle is live and before
+  /// wait, even after the worker exits. After wait the OS may reuse the ID.
+  /// Failure zeroes a non-NULL output.
+  sbox_status(SBOX_CDECL* get_process_id)(sbox_broker_worker worker,
+                                          uint32_t* out_process_id);
 } sbox_broker_api;
 #define SBOX_BROKER_API_INIT \
-  {sizeof(sbox_broker_api), NULL, NULL, NULL, NULL, NULL, NULL, NULL}
+  {sizeof(sbox_broker_api), NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL}
 
 /**
  * sbox.exe -> plugin, BROKER role: services configure() uses to describe the

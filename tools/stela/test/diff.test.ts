@@ -201,6 +201,61 @@ test("a field appended to a struct_size struct or a function table is an additio
   );
 });
 
+/** Typedef layout facts omit the record's field-specific facts, as extraction does. */
+function recordTypedef(record: Declaration, name = record.name): Declaration {
+  return decl("typedef", name, {
+    type: named(record.name),
+    perTarget: Object.fromEntries(Object.entries(record.perTarget ?? {}).map(([target, f]) =>
+      [target, { size: f.size, align: f.align, canonicalType: named(record.name) }],
+    )),
+  });
+}
+
+test("a field appended to a typedef'd struct_size struct or function table is an addition", () => {
+  for (const fields of [
+    [field("struct_size", named("uint32_t")), field("flags", named("uint32_t"))],
+    [field("run", fnPointer()), field("stop", fnPointer())],
+    [field("struct_size", named("uint32_t")), field("run", fnPointer())],
+  ]) {
+    const before = struct("alpha_api", fields);
+    const after = struct("alpha_api", [...fields, field("extra", fnPointer())]);
+    const alias = (record: Declaration) => recordTypedef(record, "alpha_alias");
+    const chain = (record: Declaration) => ({ ...recordTypedef(record, "alpha_chain"), type: named("alpha_alias") });
+    const declarations = (record: Declaration) => [record, recordTypedef(record), alias(record), chain(record)];
+    assert.deepEqual(
+      kinds(changes(declarations(before), declarations(after))),
+      ["addition field_added"],
+    );
+  }
+});
+
+test("a typedef of a non-growable struct still breaks when it grows", () => {
+  const before = struct("alpha_point", [field("x", builtin("int"))]);
+  const after = struct("alpha_point", [...before.fields!, field("y", builtin("int"))]);
+  const findings = changes([before, recordTypedef(before)], [after, recordTypedef(after)]);
+  assert.ok(findings.some((f) => f.declaration === "struct alpha_point" && f.class === "break" && f.change === "field_added"));
+  assert.ok(findings.some((f) => f.declaration === "typedef alpha_point" && f.class === "break" && f.change === "layout_changed"));
+});
+
+test("typedef record shrink, non-end changes, and unexplained growth remain breaks", () => {
+  const fields = [field("run", fnPointer()), field("stop", fnPointer())];
+  const before = struct("alpha_api", fields);
+  const resized = structuredClone(before);
+  resized.perTarget![X64].size! += 8;
+  for (const after of [
+    struct("alpha_api", fields.slice(0, 1)),
+    struct("alpha_api", [fields[1], fields[0]]),
+    struct("alpha_api", [fields[0], field("pause", fnPointer()), fields[1]]),
+    resized,
+  ]) {
+    const findings = changes([before, recordTypedef(before)], [after, recordTypedef(after)]);
+    assert.ok(findings.some((f) => f.class === "break"));
+    if (after.perTarget![X64].size !== before.perTarget![X64].size) {
+      assert.ok(findings.some((f) => f.declaration === "typedef alpha_api" && f.class === "break" && f.change === "layout_changed"));
+    }
+  }
+});
+
 test("a field appended to any other struct is a break", () => {
   const fields = [field("x", builtin("int"))];
   const findings = changes([struct("alpha_point", fields)], [struct("alpha_point", [...fields, field("y", builtin("int"))])]);

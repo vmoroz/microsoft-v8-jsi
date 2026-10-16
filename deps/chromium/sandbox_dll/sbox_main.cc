@@ -835,6 +835,17 @@ sbox_status SBOX_CDECL BrokerGetPluginFinalPath(sbox_broker broker,
                         out_length);
 }
 
+sbox_status SBOX_CDECL BrokerGetProcessId(sbox_broker_worker worker,
+                                          uint32_t* out_process_id) {
+  if (!out_process_id)
+    return sbox_status_invalid_arg;
+  *out_process_id = 0;
+  if (!worker || !worker->session)
+    return sbox_status_invalid_arg;
+  *out_process_id = sbox_broker_get_process_id(worker->session);
+  return *out_process_id ? sbox_status_ok : sbox_status_failed;
+}
+
 sbox_broker_api MakeBrokerApi() {
   sbox_broker_api api = SBOX_BROKER_API_INIT;
   api.configure_and_spawn = &BrokerConfigureAndSpawn;
@@ -844,6 +855,7 @@ sbox_broker_api MakeBrokerApi() {
   api.get_endpoint_name = &BrokerGetEndpointName;
   api.get_container_final_path = &BrokerGetContainerFinalPath;
   api.get_plugin_final_path = &BrokerGetPluginFinalPath;
+  api.get_process_id = &BrokerGetProcessId;
   return api;
 }
 

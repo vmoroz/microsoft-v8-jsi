@@ -488,15 +488,73 @@ class BrokerService {
 };
 
 #if defined(SBOX_DEV_ALLOW_UNSIGNED)
-// Dev-only exercise of the host-provided sbox_broker_api ownership contract,
-// selected by the V8HOST_BROKER_API_TEST environment variable and compiled out
-// of release builds. First it proves argument rejection (no spawn). Then
-// "ownership" runs a clean spawn / post / idempotent-close / single-wait cycle
-// and returns ok (exit 0). "leak" spawns and intentionally abandons a worker so
-// the generic host's post-run cleanup must close/wait it and report the breach.
+// Dev-only PID checks for live and naturally exited workers, retained until wait.
+sbox_status RunBrokerApiProcessIdTest(sbox_broker broker,
+                                      const sbox_broker_api* api) {
+  uint32_t pid = 123;
+  if (api->get_process_id(nullptr, &pid) != sbox_status_invalid_arg || pid ||
+      api->get_process_id(nullptr, nullptr) != sbox_status_invalid_arg)
+    return sbox_status_failed;
+  for (bool exited : {false, true}) {
+    // A missing engine makes warmup exit without a host close or termination.
+    ::SetLastError(ERROR_SUCCESS);
+    const DWORD saved_length = ::GetEnvironmentVariableW(L"V8HOST_ENGINE_DLL", nullptr, 0);
+    const DWORD saved_error = ::GetLastError();
+    if (!saved_length && saved_error != ERROR_SUCCESS &&
+        saved_error != ERROR_ENVVAR_NOT_FOUND)
+      return sbox_status_failed;
+    const bool had_engine = saved_length || saved_error != ERROR_ENVVAR_NOT_FOUND;
+    std::vector<wchar_t> saved_engine(saved_length ? saved_length : 1, L'\0');
+    if (saved_length && ::GetEnvironmentVariableW(L"V8HOST_ENGINE_DLL",
+            saved_engine.data(), saved_length) != saved_length - 1)
+      return sbox_status_failed;
+    if (exited && !::SetEnvironmentVariableW(
+            L"V8HOST_ENGINE_DLL", L"missing-pid-test-engine.dll"))
+      return sbox_status_failed;
+    sbox_broker_worker worker = nullptr;
+    const auto spawned = api->configure_and_spawn(broker, nullptr, 0, nullptr, nullptr, &worker);
+    const bool restored = !exited || ::SetEnvironmentVariableW(
+        L"V8HOST_ENGINE_DLL", had_engine ? saved_engine.data() : nullptr);
+    if (spawned != sbox_status_ok || !worker)
+      return sbox_status_failed;
+    pid = 123;
+    bool ok = restored && api->get_process_id(worker, nullptr) == sbox_status_invalid_arg &&
+        api->get_process_id(worker, &pid) == sbox_status_ok && pid &&
+        pid != ::GetCurrentProcessId();
+    HANDLE process = ok ? ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
+    wchar_t image[MAX_PATH] = {};
+    DWORD image_size = MAX_PATH;
+    ok = process && ::GetProcessId(process) == pid &&
+        ::QueryFullProcessImageNameW(process, 0, image, &image_size) &&
+        std::wstring(image).ends_with(L"\\sbox.exe") && ok;
+    if (ok)
+      ok = ::WaitForSingleObject(process, exited ? 10000 : 0) ==
+          (exited ? WAIT_OBJECT_0 : WAIT_TIMEOUT);
+    uint32_t retained = 0;
+    ok = api->get_process_id(worker, &retained) == sbox_status_ok && retained == pid && ok;
+    if (process) ::CloseHandle(process);
+    const auto closed = api->close(worker);
+    int32_t exit_code = 0;
+    const auto waited = api->wait(worker, &exit_code);
+    // wait invalidates worker, even when a preceding assertion failed.
+    if (!ok || closed != sbox_status_ok || waited != sbox_status_ok ||
+        (exited && exit_code == 0))
+      return sbox_status_failed;
+  }
+  return sbox_status_ok;
+}
+
+// Dev-only sbox_broker_api tests selected by V8HOST_BROKER_API_TEST;
+// compiled out of release builds. "process-id" checks worker PID lifetime.
+// Other modes first prove argument rejection (no spawn). "ownership" runs a
+// clean spawn / post / idempotent-close / single-wait cycle and returns ok
+// (exit 0). "leak" abandons a worker so the generic host's post-run cleanup
+// must close/wait it and report the breach.
 sbox_status RunBrokerApiOwnershipTest(sbox_broker broker,
                                       const sbox_broker_api* api,
                                       const wchar_t* mode) {
+  if (std::wcscmp(mode, L"process-id") == 0)
+    return RunBrokerApiProcessIdTest(broker, api);
   sbox_broker_worker worker = nullptr;
   int32_t exit_code = 0;
   const std::vector<uint8_t> oversize(64 * 1024 + 1, 0);
@@ -563,13 +621,14 @@ sbox_status V8HostBrokerRun(sbox_broker broker,
   if (::GetEnvironmentVariableW(L"V8HOST_BROKER_API_TEST", test_mode, 16) > 0 &&
       broker && api && api->struct_size >= sizeof(*api) &&
       api->configure_and_spawn && api->post_message && api->close &&
-      api->wait && api->get_endpoint_name)
+      api->wait && api->get_endpoint_name && api->get_process_id)
     return RunBrokerApiOwnershipTest(broker, api, test_mode);
 #endif
   if (!broker || !api || api->struct_size < sizeof(*api) ||
       !api->configure_and_spawn || !api->post_message || !api->close ||
       !api->wait || !api->get_endpoint_name ||
       !api->get_container_final_path || !api->get_plugin_final_path ||
+      !api->get_process_id ||
       !start || start->struct_size < sizeof(*start) ||
       !start->container_sha256 || !start->plugin_sha256 ||
       (start->mode != sbox_broker_mode_shared &&

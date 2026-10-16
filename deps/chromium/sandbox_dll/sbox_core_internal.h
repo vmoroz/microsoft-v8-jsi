@@ -167,6 +167,8 @@ SBOX_CORE_API int sbox_broker_post_message(SboxSession* session, int kind,
 // running an event loop on the channel can wait on sbox_target_close_event and
 // exit cleanly when this fires. Idempotent (the close event is manual-reset).
 SBOX_CORE_API int sbox_broker_close(SboxSession* session);
+// Returns zero on failure; the session must not have been waited on.
+SBOX_CORE_API uint32_t sbox_broker_get_process_id(SboxSession* session);
 SBOX_CORE_API int sbox_broker_wait(SboxSession* session);  // -> target exit code
 
 // Target message API. Post is fire-and-forget; inbound messages are delivered by
