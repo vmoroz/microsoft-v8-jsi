@@ -131,7 +131,7 @@ protocol::FrameHeader ControlHeader(uint32_t request, uint32_t session = 1, uint
   h.version_major = protocol::kWireVersionMajor;
   h.version_minor = protocol::kWireVersionMinor;
   h.conn_id = 1;
-  h.session_id = session;
+  h.target_id = session;
   h.run_id = run;
   h.request_id = request;
   return h;
@@ -442,7 +442,7 @@ struct WireHarness {
     std::vector<uint8_t> bytes;
     protocol::FrameHeader h;
     bool ok = Receive(&bytes, &h) && h.type == type && h.conn_id == hello.conn_id && h.request_id == request &&
-        h.session_id == session && h.run_id == run;
+        h.target_id == session && h.run_id == run;
     if (!ok)
       std::printf("wire expected type=%u request=%u run=%u; received type=%u request=%u run=%u bytes=%zu\n",
           static_cast<unsigned>(type), request, run, static_cast<unsigned>(h.type), h.request_id, h.run_id, bytes.size());
@@ -601,7 +601,13 @@ bool StartBridgeOverflow(std::string *detail) {
 struct RouterFixture {
   router::Connection conn;
   sbox_broker_api api = {sizeof(api), &Spawn, &Post, &Close, &Wait,
-                         nullptr, nullptr, nullptr, nullptr};
+                         nullptr, nullptr, nullptr, &GetProcessId};
+  static sbox_status SBOX_CDECL GetProcessId(sbox_broker_worker handle, uint32_t* pid) {
+    auto& f = *reinterpret_cast<Handle*>(handle)->fixture;
+    ++f.pid_reads;
+    *pid = f.zero_pid ? 0 : 1234;
+    return f.fail_pid ? sbox_status_failed : sbox_status_ok;
+  }
   std::unique_ptr<router::Router> service;
   router::Worker *worker = nullptr;
   struct Handle {
@@ -613,6 +619,8 @@ struct RouterFixture {
   std::vector<std::unique_ptr<Handle>> handles;
   std::vector<v8host::RunEnvelope> posts;
   std::atomic<unsigned> spawns{0}, closes{0}, waits{0}, post_after_close{0}, close_before_removal{0};
+  unsigned pid_reads = 0;
+  bool fail_pid = false, zero_pid = false;
   bool early = false, before_publication = false, fail_post = false, fail_spawn = false, stop_during_spawn = false;
   HANDLE wait_entered = nullptr, wait_release = nullptr;
   RouterFixture() {
@@ -957,7 +965,7 @@ bool TimeoutPendingRead(std::string *detail) {
 bool PopWorkerExit(router::Connection& conn, uint32_t session_id = 1) {
   protocol::FrameHeader h;
   return PopFrame(conn, &h) && h.type == protocol::MessageType::WORKER_EXIT &&
-      h.session_id == session_id && h.run_id == 0 && h.request_id == 0 && conn.out_queue.empty();
+      h.target_id == session_id && h.run_id == 0 && h.request_id == 0 && conn.out_queue.empty();
 }
 bool LifecycleAbi8(std::string* detail) {
   bool ok = SBOX_ABI_VERSION == 8u;
@@ -1169,12 +1177,108 @@ bool RelayHoldNextRun(std::string *detail) {
   }
   return true;
 }
+bool ExplicitRequestsFailClosed(std::string *detail) {
+  RouterFixture future;
+  if (!future.Create()) return false;
+  DrainLocal(future.conn);
+  const size_t sessions = future.conn.sessions.size();
+  const uint32_t highest = future.conn.highest_session_id;
+  for (unsigned i = 0; i < 7; ++i) {
+    auto h = ControlHeader(10 + i);
+    h.flags = protocol::kFlagMustUnderstand;
+    // Exercise both existing IDs and fresh IDs above the admission high-water mark.
+    if (i >= 4) h.target_id = i == 4 ? 2 : i == 5 ? 100 : 101;
+    const bool create = i < 2 || i >= 4;
+    std::vector<uint8_t> frame;
+    if (i == 0 || i == 4 || i == 6) {
+      protocol::CreateWorkerPayload config;
+      config.session = LogicalConfig();
+      if (!router::ValidateSessionConfig(config.session, BrokerMode::kDedicated) ||
+          !protocol::ValidateCreateWorkerPayload(config)) {
+        *detail = "ExplicitRequestsFailClosed: invalid valid-request fixture";
+        return false;
+      }
+      if (i == 6) config.max_runtimes = 0;  // structurally valid, invalid trailer value
+      frame = protocol::BuildCreateWorkerFrame(h, config);
+    }
+    if (i == 1 || i == 5)
+      frame = protocol::BuildCreateRuntimeFrame(h, protocol::CreateRuntimePayload{1, 0, 1, -1});
+    if (i == 2) frame = protocol::BuildCloseWorkerFrame(h);
+    if (i == 3) frame = protocol::BuildCloseRuntimeFrame(h);
+    auto unchanged = [&] {
+      return future.conn.sessions.size() == sessions &&
+          future.conn.highest_session_id == highest && future.spawns == 0;
+    };
+    if (!LocalRoute(*future.service, future.conn, frame) || future.conn.out_queue.size() != 1 || !unchanged()) {
+      *detail = "ExplicitRequestsFailClosed: admission or state mutation";
+      return false;
+    }
+    const auto reply = future.conn.out_queue.front().bytes;
+    DrainLocal(future.conn);
+    if (!LocalRoute(*future.service, future.conn, frame) || future.conn.out_queue.size() != 1 ||
+        future.conn.out_queue.front().bytes != reply || !unchanged()) {
+      *detail = "ExplicitRequestsFailClosed: cached replay or state mutation";
+      return false;
+    }
+    protocol::FrameHeader answer;
+    protocol::StatusCode code;
+    if (!PopFrame(future.conn, &answer, create ? &code : nullptr) ||
+        (create ? answer.type != protocol::MessageType::ERROR || code != protocol::StatusCode::ERROR_BAD_STATE
+                : answer.type != protocol::MessageType::ACK)) {
+      *detail = "ExplicitRequestsFailClosed: wrong response";
+      return false;
+    }
+    if (!create) {
+      auto malformed = frame;
+      malformed[20] = 1;
+      if (LocalRoute(*future.service, future.conn, malformed)) return false;
+      malformed = frame;
+      malformed[28] = 1;
+      malformed.push_back(0);
+      if (LocalRoute(*future.service, future.conn, malformed)) return false;
+    }
+    frame[10] = 0;
+    if (LocalRoute(*future.service, future.conn, frame)) return false;
+  }
+  return true;
+}
+
 bool ReadinessProvenance(std::string *detail) {
+  for (bool zero : {false, true}) {
+    RouterFixture failed;
+    failed.early = true;
+    failed.fail_pid = !zero;
+    failed.zero_pid = zero;
+    if (!failed.Create() || !failed.Start(1)) return false;
+    for (const auto& queued : failed.conn.out_queue) {
+      protocol::FrameHeader h;
+      if (protocol::DecodeAndValidateFrame(queued.bytes.data(), queued.bytes.size(), &h) != protocol::DecodeStatus::kOk ||
+          h.type == protocol::MessageType::STARTUP_READY) return false;
+    }
+    failed.service->Close(failed.conn);
+    if (failed.pid_reads != 1 || failed.closes != 1 || failed.waits != 1)
+      return false;
+  }
+  if (!ExplicitRequestsFailClosed(detail)) return false;
   RouterFixture f;
   f.early = true;
   if (!f.Create() || !f.Start(1) || !f.before_publication || f.spawns != 1 || !f.worker->startup ||
       !f.worker->security || f.worker->engine_image || f.posts.size() != 1)
     return false;
+  bool saw_pid = false;
+  for (const auto& queued : f.conn.out_queue) {
+    const auto& bytes = queued.bytes;
+    protocol::FrameHeader h; const uint8_t* payload = nullptr; size_t size = 0;
+    if (protocol::DecodeAndValidateFrame(bytes.data(), bytes.size(), &h, &payload, &size) != protocol::DecodeStatus::kOk)
+      return false;
+    if (h.type == protocol::MessageType::STARTUP_READY) {
+      protocol::StartupReadyPayload ready;
+      if (!protocol::DecodeStartupReadyPayload(payload, size, &ready) || ready.process_id != 1234)
+        return false;
+      saw_pid = true;
+    }
+  }
+  if (!saw_pid || f.worker->process_id != 1234 || f.pid_reads != 1) return false;
   DrainLocal(f.conn);
   f.Phase(1); f.Phase(2);
   if (!f.conn.out_queue.empty() || f.posts.size() != 1)
@@ -1652,7 +1756,7 @@ bool RunPressureContainment(std::string *detail) {
       return false;
     if (reply.type == protocol::MessageType::RUN_ERROR) {
       protocol::ErrorPayload payload;
-      quota = protocol::DecodeErrorPayload(body, size, &payload) && reply.session_id == 1 && reply.run_id == 2 &&
+      quota = protocol::DecodeErrorPayload(body, size, &payload) && reply.target_id == 1 && reply.run_id == 2 &&
           !reply.request_id && payload.status_code == protocol::StatusCode::ERROR_QUOTA;
     }
   }
@@ -2059,7 +2163,7 @@ bool RelayConnectionBoundary(std::string *detail) {
       f.conn.CompleteOutput(frame.size());
       if (protocol::DecodeAndValidateFrame(frame.data(), frame.size(), &h, &body, &size) != protocol::DecodeStatus::kOk ||
           h.type != protocol::MessageType::ERROR || h.conn_id != f.conn.conn_id ||
-          h.session_id != 17 || h.run_id != 1 || h.request_id != 0 ||
+          h.target_id != 17 || h.run_id != 1 || h.request_id != 0 ||
           !protocol::DecodeErrorPayload(body, size, &error) || error.status_code != protocol::StatusCode::ERROR_QUOTA ||
           f.conn.in_relay_bytes != protocol::kMaxQueuedRelayBytesPerConnection - 100) {
         *detail = "aggregate rejection must enqueue addressed ERROR_QUOTA without input credit"; return false;
@@ -2114,7 +2218,7 @@ bool InboundErrorDrain(std::string *detail) {
         passed &= PressureTransfer(pipe.client, false, frame.data(), static_cast<DWORD>(frame.size()), &count) &&
             protocol::DecodeAndValidateFrame(frame.data(), count, &h, &body, &size) == protocol::DecodeStatus::kOk;
         if (n == 0) passed &= h.type == protocol::MessageType::ACK;
-        else passed &= h.type == protocol::MessageType::ERROR && h.conn_id == 1 && h.session_id == 17 &&
+        else passed &= h.type == protocol::MessageType::ERROR && h.conn_id == 1 && h.target_id == 17 &&
             h.run_id == 1 && h.request_id == 0 && protocol::DecodeErrorPayload(body, size, &error) &&
             error.status_code == protocol::StatusCode::ERROR_QUOTA;
       }
@@ -3069,7 +3173,7 @@ bool UnknownTypeIgnored(std::string *detail) {
   router::Connection conn;
   OpenLocal(conn);
   router::Router service(BrokerMode::kDedicated);
-  for (uint16_t type : {0x000b, 0x0104, 0x0202, 0xffff}) {
+  for (uint16_t type : {0x000f, 0x0106, 0x0202, 0xffff}) {
     auto header = ControlHeader(0, 0);
     header.type = static_cast<protocol::MessageType>(type);
     header.payload_length = 3;
@@ -3114,7 +3218,7 @@ bool UnknownMustUnderstand(std::string *detail) {
   size_t size;
   protocol::ErrorPayload error;
   if (!h.Receive(&bytes, &header) || header.type != protocol::MessageType::ERROR ||
-      header.conn_id != unknown.conn_id || header.session_id != unknown.session_id || header.run_id != unknown.run_id ||
+      header.conn_id != unknown.conn_id || header.target_id != unknown.target_id || header.run_id != unknown.run_id ||
       header.request_id != unknown.request_id || header.flags != unknown.flags ||
       header.version_major != unknown.version_major || header.version_minor != unknown.version_minor ||
       protocol::DecodeAndValidateFrame(bytes.data(), bytes.size(), &header, &payload, &size) !=
@@ -3150,7 +3254,7 @@ bool HelloVersionReject(std::string *detail) {
   if (!h.Receive(&bytes, &header) || header.type != protocol::MessageType::ERROR ||
       header.request_id != hello.request_id || header.conn_id == 0 || header.conn_id == UINT32_MAX ||
       header.version_major != protocol::kWireVersionMajor || header.version_minor != protocol::kWireVersionMinor ||
-      header.session_id != 0 || header.run_id != 0 ||
+      header.target_id != 0 || header.run_id != 0 ||
       protocol::DecodeAndValidateFrame(bytes.data(), bytes.size(), &header, &payload, &size) !=
           protocol::DecodeStatus::kOk ||
       !protocol::DecodeErrorPayload(payload, size, &error) || error.status_code != protocol::StatusCode::ERROR_VERSION) {
@@ -3202,7 +3306,7 @@ bool HeaderDirectionReject(std::string *detail) {
         ++header.conn_id;
         break;
       case 1:
-        header.session_id = 0;
+        header.target_id = 0;
         break;
       case 2:
         header.run_id = 1;
@@ -3242,7 +3346,7 @@ bool HeaderDirectionReject(std::string *detail) {
       bytes.resize(protocol::kMaxFrameSize + 1, 0);
     }
     if (test == 13) {
-      header.session_id = UINT32_MAX;
+      header.target_id = UINT32_MAX;
       bytes = protocol::BuildCreateSessionFrame(header, LogicalConfig());
     }
     if (test == 14) {
@@ -3347,7 +3451,7 @@ bool SessionQuota32(std::string *detail) {
   size_t size;
   protocol::ErrorPayload error;
   if (!h.Receive(&bytes, &header) || header.type != protocol::MessageType::ERROR || header.request_id != 33 ||
-      header.session_id != 33 ||
+      header.target_id != 33 ||
       protocol::DecodeAndValidateFrame(bytes.data(), bytes.size(), &header, &payload, &size) !=
           protocol::DecodeStatus::kOk ||
       !protocol::DecodeErrorPayload(payload, size, &error) || error.status_code != protocol::StatusCode::ERROR_QUOTA ||
@@ -5156,7 +5260,7 @@ bool SameConnectionWorkerExitBody(std::string* detail) {
     std::vector<uint8_t> bytes; protocol::FrameHeader header; int32_t received_kind;
     const uint8_t* body; size_t size;
     return h.Receive(&bytes, &header) && header.type == protocol::MessageType::RELAY_FROM_WORKER &&
-        header.conn_id == h.hello.conn_id && header.session_id == session && header.run_id == run && !header.request_id &&
+        header.conn_id == h.hello.conn_id && header.target_id == session && header.run_id == run && !header.request_id &&
         protocol::DecodeRelayPayload(bytes.data() + protocol::kFrameHeaderSize,
             bytes.size() - protocol::kFrameHeaderSize, &received_kind, &body, &size) && received_kind == kind &&
         std::vector<uint8_t>(body, body + size) == expected;
@@ -5177,7 +5281,7 @@ bool SameConnectionWorkerExitBody(std::string* detail) {
     std::vector<uint8_t> bytes; protocol::FrameHeader header; protocol::ResultPayload result;
     const bool ok = text(h, session, run, "finish") && h.Receive(&bytes, &header) &&
         header.type == protocol::MessageType::RESULT && header.conn_id == h.hello.conn_id &&
-        header.session_id == session && header.run_id == run && !header.request_id &&
+        header.target_id == session && header.run_id == run && !header.request_id &&
         protocol::DecodeResultPayload(bytes.data() + protocol::kFrameHeaderSize,
             bytes.size() - protocol::kFrameHeaderSize, &result) && result.disposition == protocol::ResultDisposition::kCompleted;
     if (ok) std::printf("[terminal] wire conn=%u session=%u run=%u COMPLETED count=1\n", h.hello.conn_id, session, run);
@@ -5228,7 +5332,7 @@ bool SameConnectionWorkerExitBody(std::string* detail) {
       !siblings.Send(protocol::BuildStartRunFrame(siblings.Header(12, 1, 5), Script("host.complete();")))) return false;
   std::vector<uint8_t> bytes; protocol::FrameHeader header; protocol::ErrorPayload error;
   if (!siblings.Receive(&bytes, &header) || header.type != protocol::MessageType::ERROR ||
-      header.conn_id != siblings.hello.conn_id || header.session_id != 1 || header.run_id != 5 || header.request_id != 12 ||
+      header.conn_id != siblings.hello.conn_id || header.target_id != 1 || header.run_id != 5 || header.request_id != 12 ||
       !protocol::DecodeErrorPayload(bytes.data() + protocol::kFrameHeaderSize, bytes.size() - protocol::kFrameHeaderSize, &error) ||
       error.status_code != protocol::StatusCode::ERROR_BAD_STATE ||
       !siblings.Send(protocol::BuildCloseSessionFrame(siblings.Header(13, 1))) ||
@@ -5259,7 +5363,7 @@ bool ProcessToken(WireHarness& h, uint32_t session, uint32_t run, const std::str
   std::vector<uint8_t> bytes; protocol::FrameHeader header; int32_t kind;
   const uint8_t* body; size_t size;
   return h.Receive(&bytes, &header) && header.type == protocol::MessageType::RELAY_FROM_WORKER &&
-      header.conn_id == h.hello.conn_id && header.session_id == session && header.run_id == run && !header.request_id &&
+      header.conn_id == h.hello.conn_id && header.target_id == session && header.run_id == run && !header.request_id &&
       header.version_major == h.hello.selected_major && header.version_minor == h.hello.selected_minor &&
       protocol::DecodeRelayPayload(bytes.data() + protocol::kFrameHeaderSize,
           bytes.size() - protocol::kFrameHeaderSize, &kind, &body, &size) && kind == sbox_msg_kind_string &&
@@ -5371,7 +5475,7 @@ bool RealInboundAggregateBody(std::string* detail) {
       if (variant == 2) {
         std::vector<uint8_t> bytes; protocol::FrameHeader error_header; protocol::ErrorPayload error;
         if (!pressured.Receive(&bytes, &error_header) || error_header.type != protocol::MessageType::ERROR ||
-            error_header.conn_id != pressured.hello.conn_id || error_header.session_id != 6 || error_header.run_id != 3 ||
+            error_header.conn_id != pressured.hello.conn_id || error_header.target_id != 6 || error_header.run_id != 3 ||
             error_header.request_id != 0 || error_header.version_major != pressured.hello.selected_major ||
             error_header.version_minor != pressured.hello.selected_minor ||
             !protocol::DecodeErrorPayload(bytes.data() + protocol::kFrameHeaderSize,

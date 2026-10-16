@@ -346,6 +346,7 @@ v8host_status MapStatus(protocol::StatusCode status) {
     case protocol::StatusCode::ERROR_PROFILE_ALREADY_BOUND:
       return v8host_status_profile_already_bound;
     case protocol::StatusCode::ERROR_UNSUPPORTED_MESSAGE:
+    case protocol::StatusCode::ERROR_RUNTIME_FAILED:
     case protocol::StatusCode::ERROR_STALE_REQUEST:
       return v8host_status_protocol_error;
   }
@@ -433,7 +434,7 @@ class ClientConnection final
     header.version_minor = protocol::kWireVersionMinor;
     header.flags = protocol::kFlagMustUnderstand;
     header.conn_id = conn_id();
-    header.session_id = pending.session_id;
+    header.target_id = pending.session_id;
     header.run_id = pending.run_id;
     header.request_id = id;
 #ifdef V8HOST_CLIENT_TESTING
@@ -512,7 +513,7 @@ class ClientConnection final
       return;
     }
 
-    v8host_session_s* session = AcquireSession(header.session_id);
+    v8host_session_s* session = AcquireSession(header.target_id);
     if (session == nullptr) {
       ObserveInboundStatusForTesting(v8host_status_invalid_state);
       return;
@@ -602,13 +603,13 @@ class ClientConnection final
   void RouteRelayQuota(const protocol::FrameHeader& header,
                        const uint8_t* payload, size_t payload_len) {
     protocol::ErrorPayload error;
-    if (!header.session_id || !header.run_id ||
+    if (!header.target_id || !header.run_id ||
         !protocol::DecodeErrorPayload(payload, payload_len, &error) ||
         error.status_code != protocol::StatusCode::ERROR_QUOTA) {
       OnDisconnect(TransportDisconnect::kProtocolError);
       return;
     }
-    v8host_session_s* session = AcquireSession(header.session_id);
+    v8host_session_s* session = AcquireSession(header.target_id);
     if (!session) {
       OnDisconnect(TransportDisconnect::kProtocolError);
       return;
@@ -632,7 +633,7 @@ class ClientConnection final
       if (it != pending_.end()) {
         pending = it->second;
         correlation_valid =
-            header.session_id == pending.session_id &&
+            header.target_id == pending.session_id &&
             header.run_id == pending.run_id;
         if (correlation_valid) {
           pending_.erase(it);
@@ -647,7 +648,7 @@ class ClientConnection final
         const auto consumed = consumed_request_map_.find(header.request_id);
         consumed_duplicate =
             consumed != consumed_request_map_.end() &&
-            header.session_id == consumed->second.session_id &&
+            header.target_id == consumed->second.session_id &&
             header.run_id == consumed->second.run_id;
       }
     }
@@ -708,11 +709,15 @@ class ClientConnection final
             Dispatcher::Instance().PostSessionState(
                 session->dispatch_id, v8host_session_state_ready, v8host_status_ok));
         return;
-      case protocol::MessageType::STARTUP_READY:
+      case protocol::MessageType::STARTUP_READY: {
+        protocol::StartupReadyPayload ready;
+        if (!protocol::DecodeStartupReadyPayload(payload, payload_len, &ready))
+          break;
         Dispatcher::Instance().PostSessionState(
             session->dispatch_id,
             v8host_session_state_worker_startup_ready, v8host_status_ok);
         return;
+      }
       case protocol::MessageType::SECURITY_READY:
         Dispatcher::Instance().PostSessionState(
             session->dispatch_id,
@@ -850,7 +855,7 @@ protocol::FrameHeader MakeHeader(ClientConnection* conn,
   header.version_minor = protocol::kWireVersionMinor;
   header.flags = control ? protocol::kFlagMustUnderstand : 0;
   header.conn_id = conn->conn_id();
-  header.session_id = session_id;
+  header.target_id = session_id;
   header.run_id = run_id;
   header.request_id = request_id;
   return header;

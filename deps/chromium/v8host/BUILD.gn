@@ -42,7 +42,10 @@ static_library("payload_identity") {
     "common/v8host_payload_identity.cc",
     "common/v8host_payload_identity.h",
   ]
-  public_deps = [ ":file_identity" ]
+  public_deps = [
+    ":file_identity",
+    ":protocol",
+  ]
   public_configs = [ ":v8host_common_config" ]
   libs = [ "bcrypt.lib" ]
 }
@@ -323,7 +326,10 @@ executable("v8host_protocol_tests") {
     "tests/v8host_test_support.cc",
     "tests/v8host_test_support.h",
   ]
-  deps = [ ":protocol" ]
+  deps = [
+    ":protocol",
+    ":payload_identity",
+  ]
 }
 
 # Deterministic, in-process conformance tests for the neutral run-envelope codec

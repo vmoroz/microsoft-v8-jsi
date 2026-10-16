@@ -189,7 +189,7 @@ RendezvousStatus BrokerConnection::Handshake(uint32_t request_id,
   request_header.version_major = protocol::kWireVersionMajor;
   request_header.version_minor = protocol::kWireVersionMinor;
   request_header.conn_id = 0;
-  request_header.session_id = 0;
+  request_header.target_id = 0;
   request_header.run_id = 0;
   request_header.request_id = request_id;
   std::vector<uint8_t> frame = protocol::BuildHelloFrame(request_header);
@@ -227,7 +227,7 @@ RendezvousStatus BrokerConnection::Handshake(uint32_t request_id,
   if (ack_header.request_id != request_id || ack_header.conn_id == 0 ||
       ack_header.version_major != protocol::kWireVersionMajor ||
       ack_header.version_minor > protocol::kWireVersionMinor ||
-      ack_header.session_id != 0 || ack_header.run_id != 0 ||
+      ack_header.target_id != 0 || ack_header.run_id != 0 ||
       ack_payload.endpoint_mode != static_cast<uint32_t>(state_->mode)) {
     return RendezvousStatus::kProtocolFailed;
   }

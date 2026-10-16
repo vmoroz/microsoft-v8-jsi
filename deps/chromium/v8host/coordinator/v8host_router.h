@@ -130,6 +130,7 @@ struct Worker {
   uint32_t retry_run_id = 0, pending_cancel_id = 0;
   v8host::RunEnvelopeType retry_type = v8host::RunEnvelopeType::kStart;
   uint32_t engine_busy_run_id = 0;
+  uint32_t process_id = 0;
   bool startup = false, security = false;
   static void SBOX_CDECL OnMessage(void *, sbox_msg_kind, const void *, size_t);
   static DWORD WINAPI Reap(void *);

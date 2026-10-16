@@ -163,7 +163,7 @@ void EncodeHeader(const FrameHeader& header, std::vector<uint8_t>& out) {
   writer.PutU16(static_cast<uint16_t>(header.type));
   writer.PutU16(header.flags);
   writer.PutU32(header.conn_id);
-  writer.PutU32(header.session_id);
+  writer.PutU32(header.target_id);
   writer.PutU32(header.run_id);
   writer.PutU32(header.request_id);
   writer.PutU32(header.payload_length);
@@ -191,7 +191,7 @@ DecodeStatus DecodeAndValidateFrame(const uint8_t* data,
   header.type = static_cast<MessageType>(ReadU16LE(data + 8));
   header.flags = ReadU16LE(data + 10);
   header.conn_id = ReadU32LE(data + 12);
-  header.session_id = ReadU32LE(data + 16);
+  header.target_id = ReadU32LE(data + 16);
   header.run_id = ReadU32LE(data + 20);
   header.request_id = ReadU32LE(data + 24);
   header.payload_length = ReadU32LE(data + 28);
@@ -209,7 +209,7 @@ DecodeStatus DecodeAndValidateFrame(const uint8_t* data,
   if (total != static_cast<uint64_t>(size))
     return DecodeStatus::kLengthMismatch;
 
-  // 6. Reject reserved flag bits for version 1.
+  // 6. Reject reserved flag bits for version 2.
   const uint16_t reserved = static_cast<uint16_t>(~kFlagsMask);
   if ((header.flags & reserved) != 0)
     return DecodeStatus::kReservedFlags;

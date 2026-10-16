@@ -37,7 +37,7 @@ namespace v8host::protocol {
 // Frame magic: the bytes 'V','8','H','W' read little-endian.
 inline constexpr uint32_t kWireMagic = 0x57483856u;
 
-inline constexpr uint16_t kWireVersionMajor = 1;
+inline constexpr uint16_t kWireVersionMajor = 2;
 inline constexpr uint16_t kWireVersionMinor = 0;
 
 // Fixed 32-byte header; payload follows inline. The max payload equals the
@@ -48,7 +48,7 @@ inline constexpr uint32_t kMaxFramePayload = 65528;
 inline constexpr uint32_t kMaxFrameSize = kFrameHeaderSize + kMaxFramePayload;  // 65560
 
 // Frame flags (16-bit field). bit0 = MUST_UNDERSTAND; every other bit is
-// reserved and must be zero in version 1. kFlagsMask makes reserved-bit
+// reserved and must be zero in version 2. kFlagsMask makes reserved-bit
 // rejection explicit (any bit outside the mask is rejected by the validator).
 inline constexpr uint16_t kFlagMustUnderstand = 0x0001;
 inline constexpr uint16_t kFlagsMask = kFlagMustUnderstand;
@@ -81,12 +81,18 @@ enum class MessageType : uint16_t {
   ACK = 0x0008,
   ERROR = 0x0009,
   WORKER_EXIT = 0x000A,
+  CREATE_WORKER = 0x000B,
+  CLOSE_WORKER = 0x000C,
+  CREATE_RUNTIME = 0x000D,
+  CLOSE_RUNTIME = 0x000E,
 
   // Events (broker -> client).
   STARTUP_READY = 0x0100,
   SECURITY_READY = 0x0101,
   RESULT = 0x0102,
   RUN_ERROR = 0x0103,
+  RUNTIME_READY = 0x0104,
+  RUNTIME_CLOSED = 0x0105,
 
   // Relay (opaque passthrough).
   RELAY_TO_WORKER = 0x0200,
@@ -108,6 +114,7 @@ enum class StatusCode : uint32_t {
   ERROR_BAD_STATE = 6,            // impossible state or object reference
   ERROR_INTERNAL = 7,             // unexpected internal failure
   ERROR_PROFILE_ALREADY_BOUND = 8,  // a later run's profile conflicts
+  ERROR_RUNTIME_FAILED = 9,       // runtime or thread creation failed; RUNTIME_CLOSED only
 };
 
 // Decoded form of the 32-byte frame header. This is NOT a wire-layout struct;
@@ -121,7 +128,7 @@ enum class StatusCode : uint32_t {
 //   8      2    type
 //   10     2    flags (bit0 = MUST_UNDERSTAND)
 //   12     4    conn_id
-//   16     4    session_id
+//   16     4    target_id
 //   20     4    run_id
 //   24     4    request_id
 //   28     4    payload_length
@@ -132,7 +139,7 @@ struct FrameHeader {
   MessageType type = MessageType::HELLO;
   uint16_t flags = 0;
   uint32_t conn_id = 0;
-  uint32_t session_id = 0;
+  uint32_t target_id = 0;
   uint32_t run_id = 0;
   uint32_t request_id = 0;
   uint32_t payload_length = 0;

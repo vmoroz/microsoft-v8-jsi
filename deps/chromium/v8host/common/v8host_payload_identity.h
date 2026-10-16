@@ -2,6 +2,7 @@
 #define V8HOST_COMMON_V8HOST_PAYLOAD_IDENTITY_H_
 
 #include "v8host_file_identity.h"
+#include "../protocol/v8host_protocol.h"
 
 #include <array>
 #include <string>
@@ -9,7 +10,10 @@
 
 namespace v8host {
 
-constexpr uint16_t kV8HostWireMajor = 1;
+constexpr uint16_t kV8HostWireMajor = 2;
+constexpr uint16_t kV8HostWireMinor = 0;
+static_assert(kV8HostWireMajor == protocol::kWireVersionMajor);
+static_assert(kV8HostWireMinor == protocol::kWireVersionMinor);
 
 enum class BrokerMode : uint8_t { kDedicated = 0, kShared = 1 };
 

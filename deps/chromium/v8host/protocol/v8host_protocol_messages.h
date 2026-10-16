@@ -150,6 +150,57 @@ struct ResultPayload {
   ResultDisposition disposition = ResultDisposition::kCompleted;
 };
 
+inline constexpr uint32_t kMaxRuntimesPerWorker = 16;
+inline constexpr uint32_t kMaxWorkerSnapshots = 8;
+inline constexpr uint32_t kWorkerFlagSingleUse = 1;
+// CREATE_WORKER: CREATE_SESSION bytes | u32 max_runtimes | u32 flags | string engine | u32 count | strings.
+struct CreateWorkerPayload {
+  CreateSessionPayload session;
+  uint32_t max_runtimes = 1;
+  uint32_t flags = 0;
+  std::string engine_dll;
+  std::vector<std::string> snapshot_paths;
+};
+// CREATE_RUNTIME: u16 schema | u16 reserved | u32 worker_id | i32 snapshot_index (-1 = none).
+struct CreateRuntimePayload {
+  uint16_t schema_version = kMessageSchemaVersion;
+  uint16_t reserved = 0;
+  uint32_t worker_id = 0;
+  int32_t snapshot_index = -1;
+};
+// RUNTIME_CLOSED: u16 schema | u16 reserved | u32 status (ERROR_RUNTIME_FAILED).
+struct RuntimeClosedPayload {
+  uint16_t schema_version = kMessageSchemaVersion;
+  uint16_t reserved = 0;
+  StatusCode status_code = StatusCode::ERROR_RUNTIME_FAILED;
+};
+// Value validators run after structural decoding; live worker lookup is coordinator-owned.
+bool ValidateCreateWorkerPayload(const CreateWorkerPayload&);
+bool ValidateCreateRuntimePayload(const CreateRuntimePayload&, uint32_t snapshot_count);
+void EncodeCreateWorkerPayload(const CreateWorkerPayload&, Writer&);
+bool DecodeCreateWorkerPayload(const uint8_t*, size_t, CreateWorkerPayload*);
+std::vector<uint8_t> BuildCreateWorkerFrame(FrameHeader, const CreateWorkerPayload&);
+void EncodeCreateRuntimePayload(const CreateRuntimePayload&, Writer&);
+bool DecodeCreateRuntimePayload(const uint8_t*, size_t, CreateRuntimePayload*);
+std::vector<uint8_t> BuildCreateRuntimeFrame(FrameHeader, const CreateRuntimePayload&);
+void EncodeRuntimeClosedPayload(const RuntimeClosedPayload&, Writer&);
+bool DecodeRuntimeClosedPayload(const uint8_t*, size_t, RuntimeClosedPayload*);
+std::vector<uint8_t> BuildRuntimeClosedFrame(FrameHeader, const RuntimeClosedPayload&);
+// CLOSE_WORKER, CLOSE_RUNTIME and RUNTIME_READY have empty payloads.
+std::vector<uint8_t> BuildCloseWorkerFrame(FrameHeader);
+std::vector<uint8_t> BuildCloseRuntimeFrame(FrameHeader);
+std::vector<uint8_t> BuildRuntimeReadyFrame(FrameHeader);
+
+// STARTUP_READY: u16 schema | u16 reserved | u32 process_id (nonzero).
+struct StartupReadyPayload {
+  uint16_t schema_version = kMessageSchemaVersion;
+  uint16_t reserved = 0;
+  uint32_t process_id = 0;
+};
+
+void EncodeStartupReadyPayload(const StartupReadyPayload&, Writer&);
+bool DecodeStartupReadyPayload(const uint8_t*, size_t, StartupReadyPayload*);
+
 // ---------------------------------------------------------------------------
 // Payload codecs. Encode* append the payload body to `writer`; Decode* read the
 // whole [data, data+size) payload, validate schema_version==1 and reserved==0,
@@ -195,7 +246,7 @@ bool DecodeResultPayload(const uint8_t* data, size_t size, ResultPayload* out);
 // ---------------------------------------------------------------------------
 // Full-frame builders. Each stamps header.type and header.payload_length, then
 // emits header + payload as a ready-to-send buffer. The caller supplies the
-// wire version, addressing (conn/session/run), request_id, and flags via
+// wire version, addressing (conn/target/run), request_id, and flags via
 // `header`; the builder owns the type and length. (A caller-set header.type is
 // overwritten.)
 // ---------------------------------------------------------------------------
@@ -212,12 +263,12 @@ std::vector<uint8_t> BuildStartRunFrame(FrameHeader header,
 std::vector<uint8_t> BuildCancelRunFrame(FrameHeader header);
 std::vector<uint8_t> BuildCloseSessionFrame(FrameHeader header);
 
-// Event frames (broker -> client). SESSION_READY / STARTUP_READY /
-// SECURITY_READY / WORKER_EXIT are header-only (empty payload), addressed by the
-// frame header's session_id (run_id = 0); the client routes them by header type.
-// RESULT carries the 8-byte terminal-disposition codec above.
+// Event frames (broker -> client), addressed by target_id with run_id = 0.
+// STARTUP_READY carries the process ID codec; SESSION_READY, SECURITY_READY,
+// and WORKER_EXIT are empty. RESULT carries the terminal-disposition codec.
 std::vector<uint8_t> BuildSessionReadyFrame(FrameHeader header);
-std::vector<uint8_t> BuildStartupReadyFrame(FrameHeader header);
+std::vector<uint8_t> BuildStartupReadyFrame(FrameHeader header,
+                                            const StartupReadyPayload& payload);
 std::vector<uint8_t> BuildSecurityReadyFrame(FrameHeader header);
 std::vector<uint8_t> BuildWorkerExitFrame(FrameHeader header);
 std::vector<uint8_t> BuildResultFrame(FrameHeader header,
@@ -298,7 +349,7 @@ NegotiationResult NegotiateHello(const FrameHeader& hello_header,
 struct RequestIdentity {
   MessageType type = MessageType::HELLO;
   uint32_t conn_id = 0;
-  uint32_t session_id = 0;
+  uint32_t target_id = 0;
   uint32_t run_id = 0;
   uint32_t request_id = 0;
   uint16_t flags = 0;

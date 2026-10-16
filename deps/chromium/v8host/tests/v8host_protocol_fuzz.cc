@@ -109,7 +109,7 @@ std::vector<std::vector<uint8_t>> BuiltinSeeds() {
     h.version_major = kWireVersionMajor;
     h.version_minor = kWireVersionMinor;
     h.conn_id = 9;
-    h.session_id = 2;
+    h.target_id = 2;
     h.run_id = 3;
     h.request_id = 0x2A;
     seeds.push_back(BuildAckFrame(h));
@@ -145,7 +145,7 @@ std::vector<std::vector<uint8_t>> BuiltinSeeds() {
     h.version_major = kWireVersionMajor;
     h.version_minor = kWireVersionMinor;
     h.conn_id = 9;
-    h.session_id = 2;
+    h.target_id = 2;
     h.run_id = 3;
     h.request_id = 0x31;
     StartRunPayload p;
@@ -163,7 +163,7 @@ std::vector<std::vector<uint8_t>> BuiltinSeeds() {
     h.version_minor = kWireVersionMinor;
     h.flags = kFlagMustUnderstand;
     h.conn_id = 9;
-    h.session_id = 2;
+    h.target_id = 2;
     h.run_id = 3;
     h.request_id = 0x32;
     seeds.push_back(BuildCancelRunFrame(h));
@@ -177,11 +177,29 @@ std::vector<std::vector<uint8_t>> BuiltinSeeds() {
     h.version_minor = kWireVersionMinor;
     h.type = MessageType::RELAY_TO_WORKER;
     h.conn_id = 9;
-    h.session_id = 2;
+    h.target_id = 2;
     h.run_id = 3;
     h.request_id = 0x34;
     const uint8_t body[] = {0xAA, 0x00, 0xBB};
     seeds.push_back(BuildRelayFrame(h, -2, body, sizeof(body)));
+  }
+
+  {
+    FrameHeader h;
+    h.version_major = kWireVersionMajor;
+    h.flags = kFlagMustUnderstand;
+    h.conn_id = 9;
+    h.target_id = 4;
+    h.request_id = 42;
+    seeds.push_back(BuildCreateWorkerFrame(h, CreateWorkerPayload{}));
+    seeds.push_back(BuildCloseWorkerFrame(h));
+    seeds.push_back(BuildCreateRuntimeFrame(h, CreateRuntimePayload{1, 0, 2, -1}));
+    seeds.push_back(BuildCloseRuntimeFrame(h));
+    h.flags = 0;
+    h.request_id = 0;
+    seeds.push_back(BuildRuntimeReadyFrame(h));
+    seeds.push_back(BuildRuntimeClosedFrame(h, RuntimeClosedPayload{}));
+    seeds.push_back(BuildStartupReadyFrame(h, StartupReadyPayload{1, 0, 1234}));
   }
 
   // A max-payload frame: a valid header whose payload_length is the ceiling,
@@ -192,7 +210,7 @@ std::vector<std::vector<uint8_t>> BuiltinSeeds() {
     h.version_minor = kWireVersionMinor;
     h.type = MessageType::RELAY_TO_WORKER;
     h.conn_id = 9;
-    h.session_id = 2;
+    h.target_id = 2;
     h.run_id = 3;
     h.request_id = 1;
     h.payload_length = kMaxFramePayload;
@@ -334,6 +352,31 @@ void ExerciseDecoders(const uint8_t* data, size_t size) {
         DecodeCreateSessionPayload(payload, payload_size, &p);
         break;
       }
+      case MessageType::CREATE_WORKER: {
+        CreateWorkerPayload p;
+        DecodeCreateWorkerPayload(payload, payload_size, &p);
+        break;
+      }
+      case MessageType::CREATE_RUNTIME: {
+        CreateRuntimePayload p;
+        DecodeCreateRuntimePayload(payload, payload_size, &p);
+        break;
+      }
+      case MessageType::RUNTIME_CLOSED: {
+        RuntimeClosedPayload p;
+        DecodeRuntimeClosedPayload(payload, payload_size, &p);
+        break;
+      }
+      case MessageType::STARTUP_READY: {
+        StartupReadyPayload p;
+        DecodeStartupReadyPayload(payload, payload_size, &p);
+        break;
+      }
+      case MessageType::RESULT: {
+        ResultPayload p;
+        DecodeResultPayload(payload, payload_size, &p);
+        break;
+      }
       case MessageType::START_RUN: {
         StartRunPayload p;
         DecodeStartRunPayload(payload, payload_size, &p);
@@ -358,6 +401,16 @@ void ExerciseDecoders(const uint8_t* data, size_t size) {
   DecodeCreateSessionPayload(data, size, &csp);
   StartRunPayload srp;
   DecodeStartRunPayload(data, size, &srp);
+  CreateWorkerPayload added0;
+  DecodeCreateWorkerPayload(data, size, &added0);
+  CreateRuntimePayload added1;
+  DecodeCreateRuntimePayload(data, size, &added1);
+  RuntimeClosedPayload added2;
+  DecodeRuntimeClosedPayload(data, size, &added2);
+  StartupReadyPayload added3;
+  DecodeStartupReadyPayload(data, size, &added3);
+  ResultPayload added4;
+  DecodeResultPayload(data, size, &added4);
   int32_t kind = 0;
   const uint8_t* relay_body = nullptr;
   size_t relay_body_len = 0;

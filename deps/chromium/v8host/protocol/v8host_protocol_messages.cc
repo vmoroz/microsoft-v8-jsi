@@ -446,6 +446,98 @@ bool DecodeCreateSessionPayload(const uint8_t* data,
   return true;
 }
 
+void EncodeCreateWorkerPayload(const CreateWorkerPayload& p, Writer& writer) {
+  EncodeCreateSessionPayload(p.session, writer);
+  writer.PutU32(p.max_runtimes);
+  writer.PutU32(p.flags);
+  writer.PutString(p.engine_dll);
+  writer.PutU32(static_cast<uint32_t>(p.snapshot_paths.size()));
+  for (const auto& path : p.snapshot_paths) writer.PutString(path);
+}
+bool DecodeCreateWorkerPayload(const uint8_t* data, size_t size, CreateWorkerPayload* out) {
+  if (size > kMaxFramePayload) return false;
+  Reader prefix(data, size);
+  uint16_t schema = 0, fixed = 0;
+  uint32_t session_size = 0;
+  if (!prefix.GetU16(&schema) || !prefix.GetU16(&fixed) ||
+      !prefix.GetU32(&session_size) || session_size > size) return false;
+  CreateWorkerPayload p;
+  if (!DecodeCreateSessionPayload(data, session_size, &p.session)) return false;
+  Reader reader(data + session_size, size - session_size);
+  uint32_t count = 0;
+  if (!reader.GetU32(&p.max_runtimes) || !reader.GetU32(&p.flags) ||
+      !reader.GetString(&p.engine_dll) || !reader.GetU32(&count) ||
+      count > kMaxWorkerSnapshots) return false;
+  for (uint32_t i = 0; i < count; ++i) {
+    std::string path;
+    if (!reader.GetString(&path)) return false;
+    p.snapshot_paths.push_back(std::move(path));
+  }
+  if (!reader.AtEnd()) return false;
+  *out = std::move(p);
+  return true;
+}
+void EncodeCreateRuntimePayload(const CreateRuntimePayload& p, Writer& writer) {
+  writer.PutU16(p.schema_version);
+  writer.PutU16(p.reserved);
+  writer.PutU32(p.worker_id);
+  writer.PutU32(static_cast<uint32_t>(p.snapshot_index));
+}
+bool DecodeCreateRuntimePayload(const uint8_t* data, size_t size, CreateRuntimePayload* out) {
+  Reader reader(data, size);
+  CreateRuntimePayload p;
+  uint32_t index = 0;
+  if (!ReadSchemaPrologue(reader, &p.schema_version, &p.reserved) ||
+      !reader.GetU32(&p.worker_id) || !reader.GetU32(&index) ||
+      !reader.AtEnd()) return false;
+  p.snapshot_index = static_cast<int32_t>(index);
+  *out = p;
+  return true;
+}
+bool ValidateCreateWorkerPayload(const CreateWorkerPayload& p) {
+  if (!p.max_runtimes || p.max_runtimes > kMaxRuntimesPerWorker ||
+      (p.flags & ~kWorkerFlagSingleUse) ||
+      (!p.engine_dll.empty() && !IsBareFilename(p.engine_dll)) ||
+      p.snapshot_paths.size() > kMaxWorkerSnapshots) return false;
+  for (const auto& path : p.snapshot_paths) {
+    if (path.empty() || path.front() == '/' || path.front() == '\\' ||
+        path.find(':') != std::string::npos) return false;
+    // Canonicalization at bind time also checks the resolved directory.
+    size_t start = 0;
+    while (start < path.size()) {
+      const size_t end = path.find_first_of("/\\", start);
+      const auto part = path.substr(start, end == std::string::npos ? end : end - start);
+      if (part == ".." || part == "." || part.empty() || part.back() == '.' ||
+          part.back() == ' ') return false;
+      if (end == std::string::npos) break;
+      start = end + 1;
+      if (start == path.size()) return false;
+    }
+  }
+  return true;
+}
+bool ValidateCreateRuntimePayload(const CreateRuntimePayload& p, uint32_t snapshot_count) {
+  return p.worker_id != 0 && snapshot_count <= kMaxWorkerSnapshots &&
+      (p.snapshot_index == -1 || (p.snapshot_index >= 0 &&
+       static_cast<uint32_t>(p.snapshot_index) < snapshot_count));
+}
+void EncodeRuntimeClosedPayload(const RuntimeClosedPayload& p, Writer& writer) {
+  writer.PutU16(p.schema_version);
+  writer.PutU16(p.reserved);
+  writer.PutU32(static_cast<uint32_t>(p.status_code));
+}
+bool DecodeRuntimeClosedPayload(const uint8_t* data, size_t size, RuntimeClosedPayload* out) {
+  Reader reader(data, size);
+  RuntimeClosedPayload p;
+  uint32_t status = 0;
+  if (!ReadSchemaPrologue(reader, &p.schema_version, &p.reserved) ||
+      !reader.GetU32(&status) || status != static_cast<uint32_t>(StatusCode::ERROR_RUNTIME_FAILED) ||
+      !reader.AtEnd()) return false;
+  p.status_code = static_cast<StatusCode>(status);
+  *out = p;
+  return true;
+}
+
 void EncodeStartRunPayload(const StartRunPayload& payload, Writer& writer) {
   Writer var;
   var.PutString(payload.engine_filename);
@@ -539,6 +631,37 @@ std::vector<uint8_t> AssembleFrame(FrameHeader header,
 
 }  // namespace
 
+std::vector<uint8_t> BuildCreateWorkerFrame(FrameHeader h, const CreateWorkerPayload& p) {
+  Writer writer;
+  EncodeCreateWorkerPayload(p, writer);
+  h.type = MessageType::CREATE_WORKER;
+  return AssembleFrame(h, writer.buffer());
+}
+std::vector<uint8_t> BuildCreateRuntimeFrame(FrameHeader h, const CreateRuntimePayload& p) {
+  Writer writer;
+  EncodeCreateRuntimePayload(p, writer);
+  h.type = MessageType::CREATE_RUNTIME;
+  return AssembleFrame(h, writer.buffer());
+}
+std::vector<uint8_t> BuildRuntimeClosedFrame(FrameHeader h, const RuntimeClosedPayload& p) {
+  Writer writer;
+  EncodeRuntimeClosedPayload(p, writer);
+  h.type = MessageType::RUNTIME_CLOSED;
+  return AssembleFrame(h, writer.buffer());
+}
+std::vector<uint8_t> BuildCloseWorkerFrame(FrameHeader h) {
+  h.type = MessageType::CLOSE_WORKER;
+  return AssembleFrame(h, {});
+}
+std::vector<uint8_t> BuildCloseRuntimeFrame(FrameHeader h) {
+  h.type = MessageType::CLOSE_RUNTIME;
+  return AssembleFrame(h, {});
+}
+std::vector<uint8_t> BuildRuntimeReadyFrame(FrameHeader h) {
+  h.type = MessageType::RUNTIME_READY;
+  return AssembleFrame(h, {});
+}
+
 std::vector<uint8_t> BuildHelloFrame(FrameHeader header) {
   Writer writer;
   EncodeHelloPayload(HelloPayload{}, writer);
@@ -601,9 +724,27 @@ std::vector<uint8_t> BuildSessionReadyFrame(FrameHeader header) {
   return AssembleFrame(header, {});
 }
 
-std::vector<uint8_t> BuildStartupReadyFrame(FrameHeader header) {
+void EncodeStartupReadyPayload(const StartupReadyPayload& p, Writer& writer) {
+  writer.PutU16(p.schema_version);
+  writer.PutU16(p.reserved);
+  writer.PutU32(p.process_id);
+}
+
+bool DecodeStartupReadyPayload(const uint8_t* data, size_t size, StartupReadyPayload* out) {
+  Reader reader(data, size);
+  StartupReadyPayload p;
+  if (!ReadSchemaPrologue(reader, &p.schema_version, &p.reserved) ||
+      !reader.GetU32(&p.process_id) || !p.process_id || !reader.AtEnd())
+    return false;
+  *out = p;
+  return true;
+}
+
+std::vector<uint8_t> BuildStartupReadyFrame(FrameHeader header, const StartupReadyPayload& p) {
+  Writer writer;
+  EncodeStartupReadyPayload(p, writer);
   header.type = MessageType::STARTUP_READY;
-  return AssembleFrame(header, {});
+  return AssembleFrame(header, writer.buffer());
 }
 
 std::vector<uint8_t> BuildSecurityReadyFrame(FrameHeader header) {
@@ -715,7 +856,7 @@ NegotiationResult NegotiateHello(const FrameHeader& hello_header,
 // ---------------------------------------------------------------------------
 bool operator==(const RequestIdentity& a, const RequestIdentity& b) {
   return a.type == b.type && a.conn_id == b.conn_id &&
-         a.session_id == b.session_id && a.run_id == b.run_id &&
+         a.target_id == b.target_id && a.run_id == b.run_id &&
          a.request_id == b.request_id && a.flags == b.flags;
 }
 

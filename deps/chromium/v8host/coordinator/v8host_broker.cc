@@ -392,7 +392,7 @@ class BrokerService {
           protocol::DecodeAndValidateFrame(buffer, len, &hello_header, &payload, &payload_size) ==
               protocol::DecodeStatus::kOk &&
           hello_header.type == protocol::MessageType::HELLO && hello_header.conn_id == 0 &&
-          hello_header.session_id == 0 && hello_header.run_id == 0 && hello_header.request_id != 0 &&
+          hello_header.target_id == 0 && hello_header.run_id == 0 && hello_header.request_id != 0 &&
           protocol::DecodeHelloPayload(payload, payload_size, &hello_payload)) {
         const uint32_t conn_id = router::AllocateId(next_conn_id_);
         if (conn_id != 0 && conn_id != UINT32_MAX) {

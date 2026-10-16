@@ -269,7 +269,7 @@ class PipeClientTransport final : public ClientTransport {
     std::lock_guard<std::mutex> lock(state.mutex);
     if (state.closed || state.terminal) return v8host_status_connect_failed;
     const bool relay = header.type == wire::MessageType::RELAY_TO_WORKER;
-    const uint64_t key = (uint64_t{header.session_id} << 32) | header.run_id;
+    const uint64_t key = (uint64_t{header.target_id} << 32) | header.run_id;
     const size_t charge = len;
     auto it = state.runs.find(key);
     const size_t run_bytes = it == state.runs.end() ? 0 : it->second;

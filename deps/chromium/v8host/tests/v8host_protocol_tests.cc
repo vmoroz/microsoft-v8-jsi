@@ -13,6 +13,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "../common/v8host_payload_identity.h"
+
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -189,7 +191,7 @@ FrameHeader Sentinel() {
   h.type = static_cast<MessageType>(0xCCCC);
   h.flags = 0xDDDD;
   h.conn_id = 0x11111111;
-  h.session_id = 0x22222222;
+  h.target_id = 0x22222222;
   h.run_id = 0x33333333;
   h.request_id = 0x44444444;
   h.payload_length = 0x55555555;
@@ -200,19 +202,19 @@ bool SameHeader(const FrameHeader& a, const FrameHeader& b) {
   return a.version_major == b.version_major &&
          a.version_minor == b.version_minor && a.type == b.type &&
          a.flags == b.flags && a.conn_id == b.conn_id &&
-         a.session_id == b.session_id && a.run_id == b.run_id &&
+         a.target_id == b.target_id && a.run_id == b.run_id &&
          a.request_id == b.request_id && a.payload_length == b.payload_length;
 }
 
 // A framing-valid frame with the given payload length (flags within the mask).
 std::vector<uint8_t> SampleFrame(uint32_t payload_len) {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.type = MessageType::START_RUN;
   h.flags = kFlagMustUnderstand;
   h.conn_id = 0x01020304;
-  h.session_id = 0x05060708;
+  h.target_id = 0x05060708;
   h.run_id = 0x090A0B0C;
   h.request_id = 0x0D0E0F10;
   h.payload_length = payload_len;
@@ -246,7 +248,7 @@ std::vector<uint8_t> VectorAllDistinctHeader() {
   h.type = MessageType::RELAY_FROM_WORKER;  // 0x0201
   h.flags = kFlagMustUnderstand;            // 0x0001
   h.conn_id = 0x11223344;
-  h.session_id = 0x55667788;
+  h.target_id = 0x55667788;
   h.run_id = 0x99AABBCC;
   h.request_id = 0xDDEEFF00;
   h.payload_length = 0x0000000A;
@@ -258,12 +260,12 @@ std::vector<uint8_t> VectorAllDistinctHeader() {
 // V2: a HELLO-shaped header (zero conn/session/run, nonzero request id).
 std::vector<uint8_t> VectorHelloHeader() {
   FrameHeader h;
-  h.version_major = kWireVersionMajor;  // 1
+  h.version_major = kWireVersionMajor;  // 2
   h.version_minor = kWireVersionMinor;  // 0
   h.type = MessageType::HELLO;          // 0x0001
   h.flags = 0;
   h.conn_id = 0;
-  h.session_id = 0;
+  h.target_id = 0;
   h.run_id = 0;
   h.request_id = 1;
   h.payload_length = 0;
@@ -290,7 +292,7 @@ std::vector<uint8_t> VectorFullFrame() {
   h.type = MessageType::CREATE_SESSION;  // 0x0003
   h.flags = 0;
   h.conn_id = 7;
-  h.session_id = 0;
+  h.target_id = 0;
   h.run_id = 0;
   h.request_id = 0x0000002A;
   h.payload_length = static_cast<uint32_t>(payload.size());
@@ -303,7 +305,7 @@ std::vector<uint8_t> VectorFullFrame() {
 // V5: a HELLO frame (client -> broker); schema-only payload, nonzero request id.
 std::vector<uint8_t> VectorHelloFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.request_id = 1;  // conn/session/run stay 0 by contract
   return BuildHelloFrame(h);
@@ -312,12 +314,12 @@ std::vector<uint8_t> VectorHelloFrame() {
 // V6: a HELLO_ACK frame (broker -> client) carrying the frozen limits.
 std::vector<uint8_t> VectorHelloAckFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.conn_id = 9;     // the assigned connection id
   h.request_id = 1;  // echoes the HELLO
   HelloAckPayload p;
-  p.broker_version_major = 1;
+  p.broker_version_major = 2;
   p.broker_version_minor = 0;
   p.endpoint_mode = kEndpointModeShared;
   p.max_frame_payload = kMaxFramePayload;
@@ -333,10 +335,10 @@ std::vector<uint8_t> VectorHelloAckFrame() {
 // V7: an ACK frame (broker -> client) echoing session/run/request correlation.
 std::vector<uint8_t> VectorAckFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.conn_id = 9;
-  h.session_id = 2;
+  h.target_id = 2;
   h.run_id = 3;
   h.request_id = 0x2A;
   return BuildAckFrame(h);
@@ -345,10 +347,10 @@ std::vector<uint8_t> VectorAckFrame() {
 // V8: an ERROR frame (broker -> client); status ERROR_QUOTA + a short message.
 std::vector<uint8_t> VectorErrorFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.conn_id = 9;
-  h.session_id = 2;
+  h.target_id = 2;
   h.run_id = 3;
   h.request_id = 0x2B;
   ErrorPayload p;
@@ -361,7 +363,7 @@ std::vector<uint8_t> VectorErrorFrame() {
 // a non-empty profile, two file rules (one read-only), and two capabilities.
 std::vector<uint8_t> VectorCreateSessionFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.conn_id = 9;
   h.request_id = 0x30;
@@ -385,10 +387,10 @@ std::vector<uint8_t> VectorCreateSessionFrame() {
 // path, and a short opaque guest payload.
 std::vector<uint8_t> VectorStartRunFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.conn_id = 9;
-  h.session_id = 2;
+  h.target_id = 2;
   h.run_id = 3;
   h.request_id = 0x31;
   StartRunPayload p;
@@ -404,11 +406,11 @@ std::vector<uint8_t> VectorStartRunFrame() {
 // V11/V12: header-only run/session controls.
 std::vector<uint8_t> VectorCancelRunFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.flags = kFlagMustUnderstand;
   h.conn_id = 9;
-  h.session_id = 2;
+  h.target_id = 2;
   h.run_id = 3;
   h.request_id = 0x32;
   return BuildCancelRunFrame(h);
@@ -416,11 +418,11 @@ std::vector<uint8_t> VectorCancelRunFrame() {
 
 std::vector<uint8_t> VectorCloseSessionFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.flags = kFlagMustUnderstand;
   h.conn_id = 9;
-  h.session_id = 2;
+  h.target_id = 2;
   h.request_id = 0x33;
   return BuildCloseSessionFrame(h);
 }
@@ -428,11 +430,11 @@ std::vector<uint8_t> VectorCloseSessionFrame() {
 // V13: relay payload = [little-endian i32 kind | opaque bytes].
 std::vector<uint8_t> VectorRelayFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.type = MessageType::RELAY_TO_WORKER;
   h.conn_id = 9;
-  h.session_id = 2;
+  h.target_id = 2;
   h.run_id = 3;
   h.request_id = 0x34;
   const uint8_t body[] = {0xAA, 0x00, 0xBB};
@@ -443,53 +445,242 @@ std::vector<uint8_t> VectorRelayFrame() {
 // codec. All addressed by the header; RESULT carries the 8-byte codec.
 std::vector<uint8_t> VectorSessionReadyFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.conn_id = 9;
-  h.session_id = 2;
+  h.target_id = 2;
   h.request_id = 0x35;
   return BuildSessionReadyFrame(h);
 }
 
 std::vector<uint8_t> VectorStartupReadyFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.conn_id = 9;
-  h.session_id = 2;
+  h.target_id = 2;
   h.request_id = 0x36;
-  return BuildStartupReadyFrame(h);
+  return BuildStartupReadyFrame(h, StartupReadyPayload{1, 0, 1234});
 }
 
 std::vector<uint8_t> VectorSecurityReadyFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.conn_id = 9;
-  h.session_id = 2;
+  h.target_id = 2;
   h.request_id = 0x37;
   return BuildSecurityReadyFrame(h);
 }
 
 std::vector<uint8_t> VectorWorkerExitFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.conn_id = 9;
-  h.session_id = 2;
+  h.target_id = 2;
   h.request_id = 0x38;
   return BuildWorkerExitFrame(h);
 }
 
 std::vector<uint8_t> VectorResultFrame() {
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.conn_id = 9;
-  h.session_id = 2;
+  h.target_id = 2;
   h.run_id = 3;
   h.request_id = 0x39;
   return BuildResultFrame(h, ResultDisposition::kCancelled);
+}
+
+std::vector<std::vector<uint8_t>> WorkerRuntimeFrames() {
+  FrameHeader h;
+  h.version_major = kWireVersionMajor;
+  h.flags = kFlagMustUnderstand;
+  h.conn_id = 9;
+  h.target_id = 4;
+  h.request_id = 42;
+  std::vector<std::vector<uint8_t>> frames = {
+      BuildCreateWorkerFrame(h, CreateWorkerPayload{}), BuildCloseWorkerFrame(h),
+      BuildCreateRuntimeFrame(h, CreateRuntimePayload{1, 0, 2, -1}), BuildCloseRuntimeFrame(h)};
+  h.flags = 0;
+  h.request_id = 0;
+  frames.push_back(BuildRuntimeReadyFrame(h));
+  frames.push_back(BuildRuntimeClosedFrame(h, RuntimeClosedPayload{}));
+  return frames;
+}
+
+const uint8_t kExpectTopology0[] = {
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x0B, 0x00, 0x01, 0x00,
+    0x09, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2A, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x34, 0x00,
+    0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+const uint8_t kExpectTopology1[] = {
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x01, 0x00,
+    0x09, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+const uint8_t kExpectTopology2[] = {
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x0D, 0x00, 0x01, 0x00,
+    0x09, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2A, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+};
+const uint8_t kExpectTopology3[] = {
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x01, 0x00,
+    0x09, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+const uint8_t kExpectTopology4[] = {
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00,
+    0x09, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+const uint8_t kExpectTopology5[] = {
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x05, 0x01, 0x00, 0x00,
+    0x09, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x09, 0x00, 0x00, 0x00,
+};
+
+bool CanonicalWorkerRuntimeFrames(std::string* detail) {
+  const auto frames = WorkerRuntimeFrames();
+  const std::vector<std::vector<uint8_t>> expected = {
+      {std::begin(kExpectTopology0), std::end(kExpectTopology0)},
+      {std::begin(kExpectTopology1), std::end(kExpectTopology1)},
+      {std::begin(kExpectTopology2), std::end(kExpectTopology2)},
+      {std::begin(kExpectTopology3), std::end(kExpectTopology3)},
+      {std::begin(kExpectTopology4), std::end(kExpectTopology4)},
+      {std::begin(kExpectTopology5), std::end(kExpectTopology5)}};
+  if (frames != expected) return Fail(detail, "worker/runtime literal frames");
+  CreateWorkerPayload worker;
+  CreateRuntimePayload runtime;
+  RuntimeClosedPayload closed;
+  return DecodeCreateWorkerPayload(expected[0].data() + 32, expected[0].size() - 32, &worker) &&
+      worker.max_runtimes == 1 && worker.snapshot_paths.empty() &&
+      DecodeCreateRuntimePayload(expected[2].data() + 32, expected[2].size() - 32, &runtime) &&
+      runtime.worker_id == 2 && runtime.snapshot_index == -1 &&
+      DecodeRuntimeClosedPayload(expected[5].data() + 32, 8, &closed) &&
+      closed.status_code == StatusCode::ERROR_RUNTIME_FAILED;
+}
+
+void PatchU32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value);
+
+bool WorkerRuntimeRejects(std::string* detail) {
+  CreateWorkerPayload worker;
+  CreateRuntimePayload runtime;
+  RuntimeClosedPayload closed;
+  auto reject_worker = [&](const std::vector<uint8_t>& b) {
+    worker.max_runtimes = 123;
+    return !DecodeCreateWorkerPayload(b.data(), b.size(), &worker) && worker.max_runtimes == 123;
+  };
+  const auto frames = WorkerRuntimeFrames();
+  for (size_t which : {0u, 2u, 5u}) {
+    const auto& f = frames[which];
+    std::vector<uint8_t> body(f.begin() + 32, f.end());
+    auto accepts = [&](const std::vector<uint8_t>& b) {
+      if (which == 0) return DecodeCreateWorkerPayload(b.data(), b.size(), &worker);
+      if (which == 2) return DecodeCreateRuntimePayload(b.data(), b.size(), &runtime);
+      return DecodeRuntimeClosedPayload(b.data(), b.size(), &closed);
+    };
+    if (!accepts(body)) return Fail(detail, "valid topology payload");
+    for (size_t n = 0; n < body.size(); ++n)
+      if (accepts({body.begin(), body.begin() + n})) return Fail(detail, "topology truncation");
+    auto bad = body; bad.push_back(0);
+    if (accepts(bad)) return Fail(detail, "topology trailing");
+    bad = body; bad[0] = 2;
+    if (accepts(bad)) return Fail(detail, "topology schema");
+    bad = body; bad[2] = 1;
+    if (accepts(bad)) return Fail(detail, "topology reserved/fixed size");
+  }
+  CreateWorkerPayload w;
+  for (uint32_t count : {0u, 8u}) for (uint32_t max : {1u, 16u}) {
+    w.max_runtimes = max;
+    w.flags = kWorkerFlagSingleUse;
+    w.engine_dll = "engine.dll";
+    w.snapshot_paths.assign(count, "data/snapshot.bin");
+    Writer bytes; EncodeCreateWorkerPayload(w, bytes);
+    if (!DecodeCreateWorkerPayload(bytes.buffer().data(), bytes.size(), &worker) ||
+        worker.max_runtimes != max || worker.snapshot_paths != w.snapshot_paths ||
+        !ValidateCreateWorkerPayload(worker))
+      return Fail(detail, "worker bounds roundtrip");
+  }
+  auto malformed = [&](const CreateWorkerPayload& value) {
+    Writer bytes; EncodeCreateWorkerPayload(value, bytes); return reject_worker(bytes.buffer());
+  };
+  auto rejects = [&](const CreateWorkerPayload& value) {
+    Writer bytes; EncodeCreateWorkerPayload(value, bytes);
+    return DecodeCreateWorkerPayload(bytes.buffer().data(), bytes.size(), &worker) &&
+        !ValidateCreateWorkerPayload(worker);
+  };
+  for (uint32_t max : {0u, 17u, UINT32_MAX}) {
+    auto bad = w; bad.max_runtimes = max;
+    if (!rejects(bad)) return Fail(detail, "worker runtime bound");
+  }
+  auto bad = w; bad.flags = 2;
+  if (!rejects(bad)) return Fail(detail, "worker flags");
+  bad = w; bad.snapshot_paths.assign(9, "s.bin");
+  if (!malformed(bad) || ValidateCreateWorkerPayload(bad)) return Fail(detail, "snapshot count");
+  for (const auto& name : {"../engine.dll", "C:engine.dll", "a/b.dll", "a\\b.dll", ".", "a..dll"}) {
+    bad = w; bad.engine_dll = name;
+    if (!rejects(bad)) return Fail(detail, "engine name");
+  }
+  for (const auto& path : {"", "../s", "a/../s", "a\\..\\s", "/s", "\\s", "C:s", "s:stream", "a/.. /s"}) {
+    bad = w; bad.snapshot_paths = {path};
+    if (!rejects(bad)) return Fail(detail, "snapshot relative path");
+  }
+  for (const std::string text : {std::string(1, char(0xFF)), std::string("a\0b", 3), std::string(kMaxStringBytes + 1, 'a')}) {
+    bad = w; bad.engine_dll = text;
+    if (!malformed(bad)) return Fail(detail, "worker UTF8/NUL/limit");
+    bad = w; bad.snapshot_paths = {text};
+    if (!malformed(bad)) return Fail(detail, "snapshot UTF8/NUL/limit");
+  }
+  bad = w; bad.snapshot_paths.assign(8, std::string(kMaxStringBytes, 's'));
+  if (!malformed(bad)) return Fail(detail, "worker payload ceiling");
+  for (uint32_t offset : {4u, 8u}) {
+    std::vector<uint8_t> b(frames[2].begin() + 32, frames[2].end());
+    PatchU32(b, offset, offset == 4 ? 0 : 8);
+    if (!DecodeCreateRuntimePayload(b.data(), b.size(), &runtime) ||
+        ValidateCreateRuntimePayload(runtime, kMaxWorkerSnapshots)) return Fail(detail, "runtime fields");
+  }
+  for (int32_t index : {-2, -1, 0, 7, 8, INT32_MAX}) {
+    CreateRuntimePayload value{1, 0, 1, index};
+    Writer bytes; EncodeCreateRuntimePayload(value, bytes);
+    if (!DecodeCreateRuntimePayload(bytes.buffer().data(), bytes.size(), &runtime) ||
+        ValidateCreateRuntimePayload(runtime, 8) != (index >= -1 && index < 8) ||
+        ValidateCreateRuntimePayload(runtime, 0) != (index == -1) ||
+        ValidateCreateRuntimePayload(runtime, 1) != (index == -1 || index == 0))
+      return Fail(detail, "runtime snapshot bounds");
+  }
+  std::vector<uint8_t> b(frames[5].begin() + 32, frames[5].end());
+  PatchU32(b, 4, 0);
+  if (DecodeRuntimeClosedPayload(b.data(), b.size(), &closed)) return Fail(detail, "runtime status");
+  for (size_t i = 0; i < 4; ++i) {
+    RequestCache cache;
+    FrameHeader h; const uint8_t* payload = nullptr; size_t size = 0;
+    if (DecodeAndValidateFrame(frames[i].data(), frames[i].size(), &h, &payload, &size) != DecodeStatus::kOk)
+      return false;
+    RequestIdentity id{h.type, h.conn_id, h.target_id, h.run_id, h.request_id, h.flags};
+    const auto reply = BuildAckFrame(h);
+    cache.Record(id, payload, size, reply);
+    const auto duplicate = cache.Classify(id, payload, size);
+    if (duplicate.classification != RequestClass::kExactDuplicate || *duplicate.cached_response != reply)
+      return Fail(detail, "topology duplicate replay");
+    std::vector<uint8_t> changed(payload, payload + size); changed.push_back(0);
+    if (cache.Classify(id, changed.data(), changed.size()).classification != RequestClass::kMismatchedDuplicate)
+      return Fail(detail, "topology fingerprint");
+    ++id.target_id;
+    if (cache.Classify(id, payload, size).classification != RequestClass::kMismatchedDuplicate)
+      return Fail(detail, "topology identity");
+  }
+  return true;
 }
 
 std::vector<std::vector<uint8_t>> CanonicalVectors() {
@@ -501,7 +692,9 @@ std::vector<std::vector<uint8_t>> CanonicalVectors() {
           VectorCancelRunFrame(),     VectorCloseSessionFrame(),
           VectorRelayFrame(),         VectorSessionReadyFrame(),
           VectorStartupReadyFrame(),  VectorSecurityReadyFrame(),
-          VectorWorkerExitFrame(),    VectorResultFrame()};
+          VectorWorkerExitFrame(),    VectorResultFrame(),
+          WorkerRuntimeFrames()[0], WorkerRuntimeFrames()[1], WorkerRuntimeFrames()[2],
+          WorkerRuntimeFrames()[3], WorkerRuntimeFrames()[4], WorkerRuntimeFrames()[5]};
 }
 
 std::vector<uint8_t> CanonicalConcat() {
@@ -517,7 +710,7 @@ std::vector<uint8_t> CanonicalConcat() {
 // value on x86/x64/arm64 IS the cross-arch equality gate and any wire/byte
 // change trips it. Update this ONLY together with a deliberate wire change.
 constexpr const char kExpectedVectorsSha256[] =
-    "0921a53c9361213e11c0fbe1490a97d909823e53d3f36a33412dcfdf2857e301";
+    "716a302585704f14a300a70eeaa38290017adb1b29f98b02d719d8b7e67e394c";
 
 // Hard-coded expected bytes (computed independently). These exact-byte asserts
 // are the cross-arch contract: any arch must produce precisely these bytes.
@@ -527,7 +720,7 @@ const uint8_t kExpectAllDistinct[32] = {
     0xAA, 0x99, 0x00, 0xFF, 0xEE, 0xDD, 0x0A, 0x00, 0x00, 0x00};
 
 const uint8_t kExpectHello[32] = {
-    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
@@ -538,25 +731,25 @@ const uint8_t kExpectWriterPayload[14] = {0xCD, 0xAB, 0x78, 0x56, 0x34, 0x12,
 // Handshake/control frames. Exact bytes computed independently; any arch must
 // produce precisely these for the HELLO / HELLO_ACK / ACK / ERROR layers.
 const uint8_t kExpectHelloFrame[36] = {
-    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00};
 
 const uint8_t kExpectHelloAckFrame[72] = {
-    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
     0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x01, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-    0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xF8, 0xFF, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xF8, 0xFF, 0x00, 0x00,
     0x20, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
     0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x01};
 
 const uint8_t kExpectAckFrame[36] = {
-    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
     0x09, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
     0x2A, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00};
 
 const uint8_t kExpectErrorFrame[49] = {
-    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
     0x09, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
     0x2B, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
     0x05, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x71, 0x75, 0x6F, 0x74,
@@ -565,7 +758,7 @@ const uint8_t kExpectErrorFrame[49] = {
 // Session/run frames. Exact bytes computed independently; any arch must
 // produce precisely these for the CREATE_SESSION / START_RUN payloads.
 const uint8_t kExpectCreateSessionFrame[131] = {
-    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
     0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x30, 0x00, 0x00, 0x00, 0x63, 0x00, 0x00, 0x00, 0x01, 0x00, 0x34, 0x00,
     0x63, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
@@ -578,7 +771,7 @@ const uint8_t kExpectCreateSessionFrame[131] = {
     0x61, 0x70, 0x31, 0x04, 0x00, 0x00, 0x00, 0x63, 0x61, 0x70, 0x32};
 
 const uint8_t kExpectStartRunFrame[86] = {
-    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
     0x09, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
     0x31, 0x00, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x01, 0x00, 0x18, 0x00,
     0x36, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
@@ -588,17 +781,17 @@ const uint8_t kExpectStartRunFrame[86] = {
     0xBE, 0xEF};
 
 const uint8_t kExpectCancelRunFrame[32] = {
-    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x01,
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x06, 0x00, 0x01,
     0x00, 0x09, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00,
     0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
 const uint8_t kExpectCloseSessionFrame[32] = {
-    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x07, 0x00, 0x01,
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x07, 0x00, 0x01,
     0x00, 0x09, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
 const uint8_t kExpectRelayFrame[39] = {
-    0x56, 0x38, 0x48, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+    0x56, 0x38, 0x48, 0x57, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
     0x00, 0x09, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00,
     0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0xFE,
     0xFF, 0xFF, 0xFF, 0xAA, 0x00, 0xBB};
@@ -630,11 +823,11 @@ bool FullFrameRoundTrip(std::string* detail) {
                                                  &out, &payload, &payload_size);
   if (st != DecodeStatus::kOk)
     return Fail(detail, "decode failed");
-  if (out.version_major != 1 || out.version_minor != 0)
+  if (out.version_major != 2 || out.version_minor != 0)
     return Fail(detail, "version mismatch");
   if (out.type != MessageType::CREATE_SESSION)
     return Fail(detail, "type mismatch");
-  if (out.conn_id != 7 || out.session_id != 0 || out.run_id != 0 ||
+  if (out.conn_id != 7 || out.target_id != 0 || out.run_id != 0 ||
       out.request_id != 0x0000002A)
     return Fail(detail, "id mismatch");
   const std::vector<uint8_t> expected = VectorWriterPayload();
@@ -717,6 +910,27 @@ bool RelayPayloadCodec(std::string* detail) {
   return true;
 }
 
+bool StartupReadyPid(std::string* detail) {
+  const uint8_t valid[] = {1, 0, 0, 0, 0xD2, 4, 0, 0};
+  StartupReadyPayload p;
+  if (!DecodeStartupReadyPayload(valid, sizeof(valid), &p) || p.process_id != 1234)
+    return Fail(detail, "startup PID literal");
+  Writer w;
+  EncodeStartupReadyPayload(p, w);
+  if (!CheckBytes("startup PID", w.buffer(), valid, sizeof(valid), detail)) return false;
+  for (size_t n = 0; n < sizeof(valid); ++n)
+    if (DecodeStartupReadyPayload(valid, n, &p)) return Fail(detail, "startup truncation");
+  for (size_t offset : {0u, 2u, 4u}) {
+    std::vector<uint8_t> bad(valid, valid + sizeof(valid));
+    bad[offset] = offset == 4 ? 0 : 2;
+    if (offset == 4) bad[5] = 0;
+    if (DecodeStartupReadyPayload(bad.data(), bad.size(), &p)) return Fail(detail, "startup malformed");
+  }
+  std::vector<uint8_t> trailing(valid, valid + sizeof(valid));
+  trailing.push_back(0);
+  return !DecodeStartupReadyPayload(trailing.data(), trailing.size(), &p);
+}
+
 bool CanonicalEventFrames(std::string* detail) {
   struct Case {
     const char* name;
@@ -737,7 +951,7 @@ bool CanonicalEventFrames(std::string* detail) {
     if (DecodeAndValidateFrame(c.frame.data(), c.frame.size(), &header,
                                &payload, &payload_len) != DecodeStatus::kOk)
       return Fail(detail, std::string(c.name) + " frame rejected");
-    if (header.type != c.type || payload_len != 0)
+    if (header.type != c.type || payload_len != (c.type == MessageType::STARTUP_READY ? 8u : 0u))
       return Fail(detail, std::string(c.name) + " wrong type/payload");
   }
   // RESULT carries the disposition codec (here, cancelled).
@@ -806,7 +1020,7 @@ bool HeaderRoundTrip(std::string* detail) {
   in.type = MessageType::RESULT;
   in.flags = kFlagMustUnderstand;
   in.conn_id = 0x11223344;
-  in.session_id = 0x55667788;
+  in.target_id = 0x55667788;
   in.run_id = 0x99AABBCC;
   in.request_id = 0xDDEEFF00;
   in.payload_length = static_cast<uint32_t>(payload.size());
@@ -873,7 +1087,7 @@ bool PayloadLengthBounds(std::string* detail) {
   // payload_length == kMaxFramePayload, size == 32 + 65528 -> ok.
   {
     FrameHeader h;
-    h.version_major = 1;
+    h.version_major = 2;
     h.type = MessageType::RELAY_TO_WORKER;
     h.payload_length = kMaxFramePayload;
     std::vector<uint8_t> frame;
@@ -890,7 +1104,7 @@ bool PayloadLengthBounds(std::string* detail) {
   // payload_length == kMaxFramePayload + 1 (65529) -> reject (oversize).
   {
     FrameHeader h;
-    h.version_major = 1;
+    h.version_major = 2;
     h.type = MessageType::RELAY_TO_WORKER;
     h.payload_length = kMaxFramePayload + 1;
     std::vector<uint8_t> frame;
@@ -907,7 +1121,7 @@ bool PayloadLengthBounds(std::string* detail) {
   // before any addition — a 32-byte buffer claiming a 4 GiB payload.
   {
     FrameHeader h;
-    h.version_major = 1;
+    h.version_major = 2;
     h.type = MessageType::RELAY_TO_WORKER;
     h.payload_length = 0xFFFFFFFFu;
     std::vector<uint8_t> frame;
@@ -962,7 +1176,7 @@ bool ReservedFlags(std::string* detail) {
   const uint16_t reserved_values[] = {0x0002, 0x8000, 0xFFFE};
   for (uint16_t flags : reserved_values) {
     FrameHeader h;
-    h.version_major = 1;
+    h.version_major = 2;
     h.type = MessageType::HELLO;
     h.flags = flags;
     h.payload_length = 0;
@@ -978,7 +1192,7 @@ bool ReservedFlags(std::string* detail) {
   // MUST_UNDERSTAND alone is framing-valid.
   {
     FrameHeader h;
-    h.version_major = 1;
+    h.version_major = 2;
     h.type = MessageType::HELLO;
     h.flags = kFlagMustUnderstand;
     h.payload_length = 0;
@@ -1377,7 +1591,7 @@ bool MessagesBuildersStampType(std::string* detail) {
   // Each builder owns the message type and produces a frame that decodes back
   // to that type, regardless of a caller-set header.type.
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.request_id = 1;
   h.type = MessageType::RESULT;  // deliberately wrong; must be overwritten
@@ -1410,10 +1624,10 @@ bool MessagesBuildersStampType(std::string* detail) {
 bool MessagesCorrelation(std::string* detail) {
   // ACK/ERROR builders echo conn/session/run/request in the frame header.
   FrameHeader h;
-  h.version_major = 1;
+  h.version_major = 2;
   h.version_minor = 0;
   h.conn_id = 0x0A0B0C0D;
-  h.session_id = 0x11223344;
+  h.target_id = 0x11223344;
   h.run_id = 0x55667788;
   h.request_id = 0x99AABBCC;
   auto check = [&](const std::vector<uint8_t>& frame, MessageType want) {
@@ -1422,7 +1636,7 @@ bool MessagesCorrelation(std::string* detail) {
         DecodeStatus::kOk)
       return false;
     return out.type == want && out.conn_id == h.conn_id &&
-           out.session_id == h.session_id && out.run_id == h.run_id &&
+           out.target_id == h.target_id && out.run_id == h.run_id &&
            out.request_id == h.request_id;
   };
   if (!check(BuildAckFrame(h), MessageType::ACK))
@@ -1548,7 +1762,7 @@ bool SessionRoundTrip(std::string* detail) {
   // Frame round-trip exercises BuildCreateSessionFrame + the frame validator.
   {
     FrameHeader h;
-    h.version_major = 1;
+    h.version_major = 2;
     h.conn_id = 9;
     h.request_id = 0x30;
     const std::vector<uint8_t> frame =
@@ -1904,9 +2118,9 @@ bool RunRoundTrip(std::string* detail) {
   // Frame round-trip exercises BuildStartRunFrame + the frame validator.
   {
     FrameHeader h;
-    h.version_major = 1;
+    h.version_major = 2;
     h.conn_id = 9;
-    h.session_id = 2;
+    h.target_id = 2;
     h.run_id = 3;
     h.request_id = 0x31;
     StartRunPayload in;
@@ -2166,12 +2380,12 @@ bool CheckHelloAck(const NegotiationResult& r,
     return Fail(detail, "assigned conn id not in header");
   if (out.request_id != expect_request)
     return Fail(detail, "request id not echoed");
-  if (out.version_major != 1 || out.version_minor != expect_selected_minor)
+  if (out.version_major != 2 || out.version_minor != expect_selected_minor)
     return Fail(detail, "header wire version wrong");
   HelloAckPayload p;
   if (!DecodeHelloAckPayload(pl, pls, &p))
     return Fail(detail, "hello-ack payload decode failed");
-  if (p.broker_version_major != 1 ||
+  if (p.broker_version_major != 2 ||
       p.broker_version_minor != expect_broker_minor)
     return Fail(detail, "broker max version wrong");
   if (p.endpoint_mode != kEndpointModeShared ||
@@ -2187,22 +2401,57 @@ bool CheckHelloAck(const NegotiationResult& r,
   return true;
 }
 
+bool Wire2VersionSet(std::string* detail) {
+  static_assert(v8host::kV8HostWireMajor == kWireVersionMajor);
+  static_assert(v8host::kV8HostWireMinor == kWireVersionMinor);
+  if (kWireVersionMajor != 2 || kWireVersionMinor != 0) return Fail(detail, "wire version");
+  FrameHeader h;
+  h.request_id = 1;
+  BrokerCapabilities caps;
+  for (uint16_t major : {1, 3}) {
+    h.version_major = major;
+    auto rejected = NegotiateHello(h, HelloPayload{}, caps, 9);
+    FrameHeader reply; const uint8_t* bytes = nullptr; size_t size = 0;
+    ErrorPayload error;
+    if (rejected.decision != NegotiationDecision::kReject ||
+        DecodeAndValidateFrame(rejected.frame.data(), rejected.frame.size(), &reply, &bytes, &size) != DecodeStatus::kOk ||
+        reply.version_major != kWireVersionMajor || !DecodeErrorPayload(bytes, size, &error) ||
+        error.status_code != StatusCode::ERROR_VERSION) return Fail(detail, "incompatible major accepted");
+  }
+  h.version_major = 2;
+  auto accepted = NegotiateHello(h, HelloPayload{}, caps, 9);
+  if (accepted.decision != NegotiationDecision::kAck || accepted.selected_minor != 0)
+    return Fail(detail, "wire2 rejected");
+  const std::array<uint8_t, 32> zero = {};
+  std::array<uint8_t, 32> actual = {};
+  const std::array<uint8_t, 32> expected = {0xFD, 0x11, 0xCA, 0x68, 0x4D, 0xD7, 0x2E, 0x52, 0x77, 0x3F, 0x86, 0x9E, 0xB4, 0x5A, 0x9F, 0xC1, 0x68, 0x60, 0x56, 0x0D, 0x59, 0x79, 0x58, 0x83, 0x76, 0x91, 0xAD, 0xC4, 0xA2, 0x83, 0x84, 0x0E};
+  if (!v8host::ComputePluginSetId(0x8664, zero, zero, &actual) || actual != expected)
+    return Fail(detail, "wire2 plugin hash literal");
+  std::vector<uint8_t> input;
+  const char domain[] = "V8HOST-PLUGIN-SET-V1";
+  input.insert(input.end(), domain, domain + sizeof(domain));
+  input.insert(input.end(), {0x64, 0x86, 1, 0});
+  input.resize(input.size() + 64, 0);
+  const auto old_hash = Sha256Hex(input);
+  return old_hash == "368ca3ef621dfebe7542a3442a18b9036d8a008b5f5fc1691a8f0b723087f04b" && actual != zero && actual == expected;
+}
+
 bool NegotiateEqualMinor(std::string* detail) {
-  return CheckHelloAck(RunNegotiate(1, 0, 1, 0, 9, 1), 0, 0, 9, 1, detail);
+  return CheckHelloAck(RunNegotiate(2, 0, 2, 0, 9, 1), 0, 0, 9, 1, detail);
 }
 
 bool NegotiateNewerBroker(std::string* detail) {
   // broker_minor (7) > client_minor (3) -> selected == client_minor (3).
-  return CheckHelloAck(RunNegotiate(1, 3, 1, 7, 9, 1), 3, 7, 9, 1, detail);
+  return CheckHelloAck(RunNegotiate(2, 3, 2, 7, 9, 1), 3, 7, 9, 1, detail);
 }
 
 bool NegotiateNewerClient(std::string* detail) {
   // client_minor (7) > broker_minor (3) -> selected == broker_minor (3).
-  return CheckHelloAck(RunNegotiate(1, 7, 1, 3, 9, 1), 3, 3, 9, 1, detail);
+  return CheckHelloAck(RunNegotiate(2, 7, 2, 3, 9, 1), 3, 3, 9, 1, detail);
 }
 
 bool NegotiateMajorMismatch(std::string* detail) {
-  NegotiationResult r = RunNegotiate(2, 0, 1, 0, 9, 1);
+  NegotiationResult r = RunNegotiate(1, 0, 2, 0, 9, 1);
   if (r.decision != NegotiationDecision::kReject)
     return Fail(detail, "decision not kReject");
   FrameHeader out;
@@ -2217,7 +2466,7 @@ bool NegotiateMajorMismatch(std::string* detail) {
     return Fail(detail, "request id not echoed");
   if (out.conn_id != 9)
     return Fail(detail, "assigned conn id not in reject header");
-  if (out.version_major != 1)
+  if (out.version_major != 2)
     return Fail(detail, "broker major not spoken in reject");
   ErrorPayload p;
   if (!DecodeErrorPayload(pl, pls, &p))
@@ -2234,7 +2483,7 @@ RequestIdentity MakeRequestId(uint32_t request_id, uint32_t session_id = 1) {
   RequestIdentity id;
   id.type = MessageType::CREATE_SESSION;
   id.conn_id = 1;
-  id.session_id = session_id;
+  id.target_id = session_id;
   id.run_id = 0;
   id.request_id = request_id;
   id.flags = 0;
@@ -2376,6 +2625,9 @@ int main(int argc, char** argv) {
       {"vectors", "canonical-close-session-frame", CanonicalCloseSessionFrame},
       {"vectors", "canonical-relay-frame", CanonicalRelayFrame},
       {"vectors", "canonical-event-frames", CanonicalEventFrames},
+      {"messages", "startup-ready-pid", StartupReadyPid},
+      {"vectors", "canonical-worker-runtime-frames", CanonicalWorkerRuntimeFrames},
+      {"messages", "worker-runtime-rejects", WorkerRuntimeRejects},
       {"protocol", "sha256-self-test", Sha256SelfTest},
       {"protocol", "header-round-trip", HeaderRoundTrip},
       {"protocol", "magic-reject", MagicReject},
@@ -2419,6 +2671,7 @@ int main(int argc, char** argv) {
       {"run", "reject-lying-guest-len", RunRejectLyingGuestLen},
       {"run", "forward-compat", RunForwardCompat},
       {"run", "guest-ceiling", RunGuestCeiling},
+      {"negotiate", "wire2-version-set", Wire2VersionSet},
       {"negotiate", "equal-minor", NegotiateEqualMinor},
       {"negotiate", "newer-broker", NegotiateNewerBroker},
       {"negotiate", "newer-client", NegotiateNewerClient},

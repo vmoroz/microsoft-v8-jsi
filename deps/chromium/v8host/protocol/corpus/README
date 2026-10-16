@@ -18,6 +18,10 @@ Files
   ack.bin              valid ACK frame
   error.bin            valid ERROR frame (ERROR_QUOTA + short message)
   create_session.bin   valid CREATE_SESSION frame (AppContainer, 2 rules, 2 caps)
+  create_worker.bin    valid CREATE_WORKER frame (one runtime, no snapshots)
+  close_worker.bin     valid header-only CLOSE_WORKER frame
+  create_runtime.bin   valid CREATE_RUNTIME frame (worker 2, no snapshot)
+  close_runtime.bin    valid header-only CLOSE_RUNTIME frame
   start_run.bin        valid START_RUN frame (engine override + snapshot + guest)
   cancel_run.bin       valid header-only CANCEL_RUN frame
   close_session.bin    valid header-only CLOSE_SESSION frame

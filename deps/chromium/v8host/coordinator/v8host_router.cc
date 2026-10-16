@@ -317,7 +317,7 @@ bool Run::TryTerminal(RunState desired) {
     header.version_major = protocol::kWireVersionMajor;
     header.version_minor = conn->version_minor;
     header.conn_id = conn->conn_id;
-    header.session_id = session->session_id;
+    header.target_id = session->session_id;
     header.run_id = run_id;
     if (desired == RunState::kCompleted || desired == RunState::kCancelled) {
       protocol::ResultPayload result;
@@ -441,7 +441,7 @@ protocol::FrameHeader ReplyHeader(const Connection &conn, uint32_t session, uint
   h.version_major = protocol::kWireVersionMajor;
   h.version_minor = conn.version_minor;
   h.conn_id = conn.conn_id;
-  h.session_id = session;
+  h.target_id = session;
   h.run_id = run;
   return h;
 }
@@ -607,6 +607,12 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
   switch (h.type) {
     case protocol::MessageType::HELLO:
     case protocol::MessageType::HELLO_ACK:
+    case protocol::MessageType::CREATE_WORKER:
+    case protocol::MessageType::CLOSE_WORKER:
+    case protocol::MessageType::CREATE_RUNTIME:
+    case protocol::MessageType::CLOSE_RUNTIME:
+    case protocol::MessageType::RUNTIME_READY:
+    case protocol::MessageType::RUNTIME_CLOSED:
     case protocol::MessageType::CREATE_SESSION:
     case protocol::MessageType::SESSION_READY:
     case protocol::MessageType::START_RUN:
@@ -629,17 +635,22 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
         conn.state = ConnState::kClosing;
       return false;
   }
-  if (h.session_id == UINT32_MAX || h.run_id == UINT32_MAX || h.request_id == UINT32_MAX) {
+  if (h.target_id == UINT32_MAX || h.run_id == UINT32_MAX || h.request_id == UINT32_MAX) {
     conn.Stop(); return false;
   }
-  if (!h.session_id) return false;
+  if (!h.target_id) return false;
+  const bool explicit_create = h.type == protocol::MessageType::CREATE_WORKER ||
+      h.type == protocol::MessageType::CREATE_RUNTIME;
+  const bool explicit_close = h.type == protocol::MessageType::CLOSE_WORKER ||
+      h.type == protocol::MessageType::CLOSE_RUNTIME;
+  if ((explicit_create || explicit_close) && !(h.flags & protocol::kFlagMustUnderstand)) return false;
   const bool relay = h.type == protocol::MessageType::RELAY_TO_WORKER;
   const bool create = h.type == protocol::MessageType::CREATE_SESSION;
   const bool start = h.type == protocol::MessageType::START_RUN;
   const bool cancel = h.type == protocol::MessageType::CANCEL_RUN;
   const bool close = h.type == protocol::MessageType::CLOSE_SESSION;
-  if ((!relay && !create && !start && !cancel && !close) || ((create || close) ? h.run_id != 0 : h.run_id == 0) ||
-      (relay ? h.request_id != 0 : h.request_id == 0) || ((cancel || close) && payload_size != 0))
+  if ((!relay && !create && !start && !cancel && !close && !explicit_create && !explicit_close) || ((create || close || explicit_create || explicit_close) ? h.run_id != 0 : h.run_id == 0) ||
+      (relay ? h.request_id != 0 : h.request_id == 0) || ((cancel || close || explicit_close) && payload_size != 0))
     return false;
   if (relay) {
     int32_t kind = 0;
@@ -649,7 +660,7 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
         (kind != sbox_msg_kind_string && kind != sbox_msg_kind_binary))
       return false;
     Pump(conn);
-    auto sit = conn.sessions.find(h.session_id);
+    auto sit = conn.sessions.find(h.target_id);
     if (sit == conn.sessions.end())
       return true;
     auto &session = *sit->second;
@@ -684,7 +695,7 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
     Pump(conn);
     return true;
   }
-  protocol::RequestIdentity identity{h.type, h.conn_id, h.session_id, h.run_id, h.request_id, h.flags};
+  protocol::RequestIdentity identity{h.type, h.conn_id, h.target_id, h.run_id, h.request_id, h.flags};
   auto classified = conn.request_cache.Classify(identity, payload, payload_size);
   if (classified.classification == protocol::RequestClass::kMismatchedDuplicate)
     return false;
@@ -699,25 +710,43 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
   Session *admitted_session = nullptr;
   Run *admitted_run = nullptr;
   bool needs_spawn = false;
-  if (create) {
+  if (explicit_create) {
+    protocol::CreateWorkerPayload worker_config;
+    protocol::CreateRuntimePayload runtime_config;
+    if (h.type == protocol::MessageType::CREATE_WORKER
+            ? !protocol::DecodeCreateWorkerPayload(payload, payload_size, &worker_config)
+            : !protocol::DecodeCreateRuntimePayload(payload, payload_size, &runtime_config)) return false;
+    const bool valid = h.type == protocol::MessageType::CREATE_WORKER
+        ? ValidateSessionConfig(worker_config.session, mode_) &&
+          protocol::ValidateCreateWorkerPayload(worker_config)
+        : protocol::ValidateCreateRuntimePayload(runtime_config, protocol::kMaxWorkerSnapshots);
+    if (!valid) {
+      response = Error(h, protocol::StatusCode::ERROR_BAD_STATE);
+    } else {
+      // Explicit object admission is not enabled, even for valid fresh targets.
+      response = Error(h, protocol::StatusCode::ERROR_BAD_STATE);
+    }
+  } else if (explicit_close) {
+    response = protocol::BuildAckFrame(h);
+  } else if (create) {
     Reclaim(conn, false);
     SessionConfig config;
     if (!protocol::DecodeCreateSessionPayload(payload, payload_size, &config))
       return false;
     std::lock_guard<std::mutex> lock(conn.mutex);
-    if (conn.sessions.contains(h.session_id))
+    if (conn.sessions.contains(h.target_id))
       return false;
-    if (!ValidateSessionConfig(config, mode_) || h.session_id <= conn.highest_session_id) {
+    if (!ValidateSessionConfig(config, mode_) || h.target_id <= conn.highest_session_id) {
       response = Error(h, protocol::StatusCode::ERROR_BAD_STATE);
     } else if (conn.sessions.size() + conn.retired_sessions.size() >= protocol::kMaxSessionsPerConnection) {
       response = Error(h, protocol::StatusCode::ERROR_QUOTA);
     } else {
       auto session = std::make_unique<Session>();
-      session->session_id = h.session_id;
+      session->session_id = h.target_id;
       session->conn = &conn;
       session->config = std::move(config);
-      conn.sessions.emplace(h.session_id, std::move(session));
-      conn.highest_session_id = h.session_id;
+      conn.sessions.emplace(h.target_id, std::move(session));
+      conn.highest_session_id = h.target_id;
       response = protocol::BuildAckFrame(h);
       ready = true;
     }
@@ -725,7 +754,7 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
     protocol::StartRunPayload inputs;
     if (!protocol::DecodeStartRunPayload(payload, payload_size, &inputs))
       return false;
-    auto it = conn.sessions.find(h.session_id);
+    auto it = conn.sessions.find(h.target_id);
     BoundProfile profile;
     bool prepared =
         it != conn.sessions.end() && PrepareProfile(it->second->config, inputs, payload_directory_, &profile);
@@ -771,10 +800,10 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
     }
   } else {
     if (close)
-      CloseSession(conn, h.session_id, RunState::kCancelled);
+      CloseSession(conn, h.target_id, RunState::kCancelled);
     if (cancel) {
       Pump(conn);
-      auto sit = conn.sessions.find(h.session_id);
+      auto sit = conn.sessions.find(h.target_id);
       if (sit != conn.sessions.end() && sit->second->worker) {
         auto& session = *sit->second;
         auto rit = session.runs.find(h.run_id);
@@ -792,10 +821,10 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
   if (!conn.Enqueue(std::move(response)))
     return false;
   if (ready) {
-    if (!conn.Enqueue(protocol::BuildSessionReadyFrame(ReplyHeader(conn, h.session_id))))
+    if (!conn.Enqueue(protocol::BuildSessionReadyFrame(ReplyHeader(conn, h.target_id))))
       return false;
     std::lock_guard<std::mutex> lock(conn.mutex);
-    auto &session = *conn.sessions.at(h.session_id);
+    auto &session = *conn.sessions.at(h.target_id);
     std::lock_guard<std::mutex> session_lock(session.mutex);
     session.state = SessionState::kLogicalReady;
   }
@@ -805,12 +834,12 @@ bool Router::Route(Connection &conn, const uint8_t *data, size_t size) {
     else if (needs_spawn && !Spawn(*admitted_session)) {
       admitted_run->error = protocol::StatusCode::ERROR_INTERNAL;
       admitted_run->TryTerminal(RunState::kFailed);
-      CloseSession(conn, h.session_id, RunState::kWorkerExited);
+      CloseSession(conn, h.target_id, RunState::kWorkerExited);
     } else if (::WaitForSingleObject(conn.stop, 0) == WAIT_OBJECT_0) {
-      CloseSession(conn, h.session_id, RunState::kBrokerLost);
+      CloseSession(conn, h.target_id, RunState::kBrokerLost);
     } else {
       Pump(conn);
-      auto it = conn.sessions.find(h.session_id);
+      auto it = conn.sessions.find(h.target_id);
       if (it != conn.sessions.end())
         Dispatch(*it->second);
     }
@@ -974,6 +1003,8 @@ bool Router::Spawn(Session &session) {
       !handle)
     return false;
   worker.handle = handle;
+  if (api_->get_process_id(handle, &worker.process_id) != sbox_status_ok || !worker.process_id)
+    return false;
   worker.state = WorkerState::kWarming;
   return true;
 }
@@ -1181,7 +1212,8 @@ void Router::Pump(Connection &conn) {
             worker.startup = true;
             worker.engine_image = HeldFile();
             session.state = SessionState::kStartupReady;
-            conn.Enqueue(protocol::BuildStartupReadyFrame(ReplyHeader(conn, id)));
+            conn.Enqueue(protocol::BuildStartupReadyFrame(ReplyHeader(conn, id),
+                protocol::StartupReadyPayload{protocol::kMessageSchemaVersion, 0, worker.process_id}));
           }
         } else if (phase == sbox_lifecycle_phase_security && worker.startup) {
           if (!worker.security) {

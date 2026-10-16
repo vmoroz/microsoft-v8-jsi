@@ -196,8 +196,10 @@ std::vector<uint8_t> EventFrame(MessageType type,
   h.version_minor = kWireVersionMinor;
   h.type = type;
   h.conn_id = 1;
-  h.session_id = session;
+  h.target_id = session;
   h.run_id = run;
+  if (type == MessageType::STARTUP_READY)
+    return BuildStartupReadyFrame(h, StartupReadyPayload{1, 0, 4321});
   std::vector<uint8_t> out;
   EncodeHeader(h, out);
   return out;
@@ -213,7 +215,7 @@ std::vector<uint8_t> ResultFrame(uint32_t session,
   h.version_major = kWireVersionMajor;
   h.version_minor = kWireVersionMinor;
   h.conn_id = 1;
-  h.session_id = session;
+  h.target_id = session;
   h.run_id = run;
   return BuildResultFrame(h, disposition);
 }
@@ -862,7 +864,7 @@ bool ConfigRoundTrip(std::string* detail) {
             p.use_app_container && p.low_privilege_app_container &&
             p.app_container_profile == "profile" &&
             p.file_rules.size() == 64 && p.capabilities.size() == 64 &&
-            h.session_id != 0 && h.request_id != 0;
+            h.target_id != 0 && h.request_id != 0;
   for (size_t n = 0; ok && n < 64; ++n) {
     ok = p.file_rules[n].pattern == "rule" + std::to_string(n) &&
          p.file_rules[n].readonly == ((n & 1) != 0) &&
@@ -1091,7 +1093,7 @@ bool CallbackRoutingAndReplacement(std::string* detail) {
                          &create_header);
   std::thread io([&] {
     fake->Inbound(EventFrame(MessageType::SESSION_READY,
-                             create_header.session_id));
+                             create_header.target_id));
   });
   io.join();
   v8host_session_set_callbacks(session, &cb);
@@ -1101,7 +1103,7 @@ bool CallbackRoutingAndReplacement(std::string* detail) {
   clear.struct_size = sizeof(clear);
   v8host_session_set_callbacks(session, &clear);
   fake->Inbound(EventFrame(MessageType::STARTUP_READY,
-                           create_header.session_id));
+                           create_header.target_id));
   Drain();
   const bool ok = a.states.size() == 1 && b.total.load() == 0 &&
                   a.state_thread == ::GetCurrentThreadId();
@@ -1124,7 +1126,7 @@ bool CallbackAllocationFailure(std::string* detail) {
   FrameHeader h;
   const auto create = fake->Frame(0);
   DecodeAndValidateFrame(create.data(), create.size(), &h);
-  fake->Inbound(EventFrame(MessageType::SESSION_READY, h.session_id));
+  fake->Inbound(EventFrame(MessageType::SESSION_READY, h.target_id));
   const bool delivered =
       PumpUntil([&] { return prior.total.load() == 1; }) &&
       rejected.total.load() == 0;
@@ -1154,9 +1156,9 @@ bool InboundRunAndTerminal(std::string* detail) {
   std::thread io([&] {
     fake->Inbound(ack);
     fake->Inbound(relay_frame);
-    fake->Inbound(ResultFrame(start.session_id, start.run_id));
+    fake->Inbound(ResultFrame(start.target_id, start.run_id));
     fake->Inbound(
-        EventFrame(MessageType::WORKER_EXIT, start.session_id, start.run_id));
+        EventFrame(MessageType::WORKER_EXIT, start.target_id, start.run_id));
   });
   io.join();
   if (!PumpUntil([&] { return r.total.load() >= 3; }))
@@ -1189,7 +1191,7 @@ bool InboundCancelledResult(std::string* detail) {
   DecodeAndValidateFrame(start_frame.data(), start_frame.size(), &start);
   std::thread io([&] {
     fake->Inbound(AckFor(fake->Frame(1)));
-    fake->Inbound(ResultFrame(start.session_id, start.run_id,
+    fake->Inbound(ResultFrame(start.target_id, start.run_id,
                               ResultDisposition::kCancelled));
   });
   io.join();
@@ -1217,7 +1219,7 @@ bool LateTrafficAfterTerminal(std::string* detail) {
   FrameHeader start;
   DecodeAndValidateFrame(start_frame.data(), start_frame.size(), &start);
 
-  fake->Inbound(ResultFrame(start.session_id, start.run_id));
+  fake->Inbound(ResultFrame(start.target_id, start.run_id));
   fake->Inbound(AckFor(start_frame));
   const uint8_t byte = 0x5A;
   FrameHeader relay = start;
@@ -1258,7 +1260,7 @@ bool CorrelationMismatchDisconnects(std::string* detail) {
     if (variant == 0)
       bad.conn_id++;
     else if (variant == 1)
-      bad.session_id++;
+      bad.target_id++;
     else
       bad.run_id++;
     std::vector<uint8_t> mutated;
@@ -1328,9 +1330,9 @@ bool RelayQuotaError(std::string* detail) {
     FrameHeader h; auto request = fake->Frame(1); DecodeAndValidateFrame(request.data(), request.size(), &h);
     fake->Inbound(AckFor(fake->Frame(0)));
     h.request_id = 0;
-    if (path == 2) fake->Inbound(ResultFrame(h.session_id, h.run_id));
+    if (path == 2) fake->Inbound(ResultFrame(h.target_id, h.run_id));
     if (path == 3) v8host_session_close(session);
-    if (path == 4) ++h.session_id;
+    if (path == 4) ++h.target_id;
     if (path == 5) h.run_id += 10;
     if (path == 8) h.request_id = 10000;
     if (path == 9) ++h.conn_id;
@@ -1349,7 +1351,7 @@ bool RelayQuotaError(std::string* detail) {
           v8host_run_post_message(second, v8host_message_kind_string, nullptr, 0) !=
           v8host_status_ok)
         return Fail(detail, "quota addressing/duplicate/winner/other-run containment");
-      if (path == 0) fake->Inbound(ResultFrame(h.session_id, h.run_id + 1));
+      if (path == 0) fake->Inbound(ResultFrame(h.target_id, h.run_id + 1));
       else fake->Disconnect();
       fake->Inbound(frame); Drain();
       if (r.events.size() != 2 || r.event_status[1] != (path == 0 ? v8host_status_ok : v8host_status_broker_lost) ||
@@ -1419,7 +1421,7 @@ bool ReentrantClose(std::string* detail) {
   FrameHeader h;
   auto create = fake->Frame(0);
   DecodeAndValidateFrame(create.data(), create.size(), &h);
-  fake->Inbound(EventFrame(MessageType::SESSION_READY, h.session_id));
+  fake->Inbound(EventFrame(MessageType::SESSION_READY, h.target_id));
   if (!PumpUntil([&] { return r.total.load() == 1; }))
     return Fail(detail, "reentrant callback");
   const bool transport_closed = fake->closed.load();
@@ -1473,10 +1475,10 @@ bool ReentrantPostAndSet(std::string* detail) {
   FrameHeader h;
   const auto create = fake->Frame(0);
   DecodeAndValidateFrame(create.data(), create.size(), &h);
-  fake->Inbound(EventFrame(MessageType::SESSION_READY, h.session_id));
+  fake->Inbound(EventFrame(MessageType::SESSION_READY, h.target_id));
   if (!PumpUntil([&] { return ops.calls.load() == 1; }))
     return Fail(detail, "reentrant post/set callback");
-  fake->Inbound(EventFrame(MessageType::STARTUP_READY, h.session_id));
+  fake->Inbound(EventFrame(MessageType::STARTUP_READY, h.target_id));
   if (!PumpUntil([&] { return replacement.total.load() == 1; }))
     return Fail(detail, "replacement callback after reentrant set");
   FrameHeader relay;
@@ -1501,7 +1503,7 @@ bool BackpressureAndCloseSuppression(std::string* detail) {
   FrameHeader h; auto create = fake->Frame(0);
   DecodeAndValidateFrame(create.data(), create.size(), &h);
   for (size_t n = 0; n < v8host::client::kSessionQueueCapacity + 10; ++n)
-    fake->Inbound(EventFrame(MessageType::SESSION_READY, h.session_id));
+    fake->Inbound(EventFrame(MessageType::SESSION_READY, h.target_id));
   if (!PumpUntil([&] { return r.total.load() == 1; }))
     return Fail(detail, "backpressure terminal");
   const bool overflow = r.states.size() == 1 &&
@@ -1516,7 +1518,7 @@ bool BackpressureAndCloseSuppression(std::string* detail) {
   v8host_session_set_callbacks(session, &cb);
   create = fake->Frame(0);
   DecodeAndValidateFrame(create.data(), create.size(), &h);
-  fake->Inbound(EventFrame(MessageType::SESSION_READY, h.session_id));
+  fake->Inbound(EventFrame(MessageType::SESSION_READY, h.target_id));
   v8host_session_close(session);
   Drain();
   return (overflow && suppressed.total.load() == 0) ||
@@ -1537,7 +1539,7 @@ bool CloseWhileFloodingNonblocking(std::string* detail) {
   std::thread flood([&] {
     started.store(true, std::memory_order_release);
     while (!stop.load(std::memory_order_acquire))
-      fake->Inbound(EventFrame(MessageType::SESSION_READY, h.session_id));
+      fake->Inbound(EventFrame(MessageType::SESSION_READY, h.target_id));
   });
   while (!started.load(std::memory_order_acquire))
     ::SwitchToThread();
@@ -1586,20 +1588,33 @@ bool DisconnectNoReplay(std::string* detail) {
 }
 
 bool MalformedFrameDisconnects(std::string* detail) {
-  FakeTransport* fake = nullptr;
-  v8host_session_s* session = Create(&fake);
-  Recorder r;
-  v8host_callbacks callbacks = Callbacks(&r);
-  v8host_session_set_callbacks(session, &callbacks);
-  fake->Inbound({0x01, 0x02, 0x03});
-  if (!PumpUntil([&] { return r.total.load() >= 2; }))
-    return Fail(detail, "malformed frame did not disconnect");
-  const bool ok = r.disconnects == 1 && r.states.size() == 1 &&
-                  r.states[0] == v8host_session_state_closed &&
-                  r.state_status[0] == v8host_status_protocol_error;
-  v8host_session_close(session);
-  Drain();
-  return ok || Fail(detail, "malformed frame protocol outcome");
+  for (unsigned variant = 0; variant < 6; ++variant) {
+    FakeTransport* fake = nullptr;
+    v8host_session_s* session = Create(&fake);
+    Recorder r;
+    v8host_callbacks callbacks = Callbacks(&r);
+    v8host_session_set_callbacks(session, &callbacks);
+    FrameHeader create;
+    const auto frame = fake->Frame(0);
+    DecodeAndValidateFrame(frame.data(), frame.size(), &create);
+    auto malformed = EventFrame(MessageType::STARTUP_READY, create.target_id);
+    if (variant == 0) malformed = {1, 2, 3};
+    if (variant == 1) malformed[32] = 2;
+    if (variant == 2) malformed[34] = 1;
+    if (variant == 3) for (size_t i = 36; i < 40; ++i) malformed[i] = 0;
+    if (variant == 4) { malformed.resize(32); malformed[28] = 0; }
+    if (variant == 5) { malformed.push_back(0); malformed[28] = 9; }
+    fake->Inbound(malformed);
+    if (!PumpUntil([&] { return r.total.load() >= 2; }))
+      return Fail(detail, "malformed frame did not disconnect");
+    const bool ok = r.disconnects == 1 && r.states.size() == 1 &&
+                    r.states[0] == v8host_session_state_closed &&
+                    r.state_status[0] == v8host_status_protocol_error;
+    v8host_session_close(session);
+    Drain();
+    if (!ok) return Fail(detail, "malformed frame protocol outcome");
+  }
+  return true;
 }
 
 bool InboundVsCloseRace(std::string* detail) {
@@ -1619,7 +1634,7 @@ bool InboundVsCloseRace(std::string* detail) {
     std::thread io([&] {
       started.store(true, std::memory_order_release);
       for (int n = 0; n < 16; ++n)
-        fake->Inbound(EventFrame(MessageType::SESSION_READY, h.session_id));
+        fake->Inbound(EventFrame(MessageType::SESSION_READY, h.target_id));
     });
     while (!started.load(std::memory_order_acquire))
       ::SwitchToThread();
@@ -2397,9 +2412,9 @@ bool RealClientFailurePaths(std::string* detail) {
 }
 
 std::vector<uint8_t> SizedTransportFrame(size_t len, bool relay, uint32_t run = 1) {
-  FrameHeader h; h.version_major = 1;
+  FrameHeader h; h.version_major = kWireVersionMajor;
   h.type = relay ? MessageType::RELAY_TO_WORKER : MessageType::START_RUN;
-  h.session_id = 1; h.run_id = run; h.request_id = relay ? 0 : run + 1;
+  h.target_id = 1; h.run_id = run; h.request_id = relay ? 0 : run + 1;
   h.payload_length = static_cast<uint32_t>(len - kFrameHeaderSize);
   std::vector<uint8_t> bytes; EncodeHeader(h, bytes); bytes.resize(len, 0x61);
   return bytes;
@@ -2407,7 +2422,7 @@ std::vector<uint8_t> SizedTransportFrame(size_t len, bool relay, uint32_t run = 
 bool TransportFifo(std::string* detail) {
   PumpFixture f;
   if (!f.Init()) return Fail(detail, "pipe pair");
-  FrameHeader header; header.version_major = 1; header.session_id = 1; header.request_id = 2;
+  FrameHeader header; header.version_major = kWireVersionMajor; header.target_id = 1; header.request_id = 2;
   CreateSessionPayload config; config.broker_mode = 1; config.prohibit_dynamic_code = true;
   auto create = BuildCreateSessionFrame(header, config);
   header.request_id = 3; header.run_id = 1;
