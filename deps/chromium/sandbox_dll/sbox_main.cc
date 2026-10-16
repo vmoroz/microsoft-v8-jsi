@@ -278,7 +278,8 @@ bool LoadPlugin(const std::wstring& plugin_name, bool verify, const char* tag,
   const std::wstring full = sbox_harden::ExeDir() + plugin_name;
   v8host::HeldFile held;
   DWORD error = ERROR_SUCCESS;
-  if (!v8host::OpenImmutableFile(full, &held, &error)) {
+  if (!v8host::OpenImmutableFile(full, &held, &error,
+      verify ? v8host::FinalPathMode::kRequired : v8host::FinalPathMode::kOmitForWorkerHold)) {
     printf("[sbox] %s: immutable open failed: %lu\n", tag, error);
     return false;
   }

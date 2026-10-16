@@ -359,6 +359,7 @@
               'ExceptionHandling': 1,
             },
             'VCLinkerTool': {
+              'GenerateManifest': 'false',
               'AdditionalDependencies': [
                 'dbghelp.lib',
                 'bcrypt.lib',

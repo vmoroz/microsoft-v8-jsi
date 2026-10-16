@@ -15,6 +15,8 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <aclapi.h>
+#include <userenv.h>
 
 #include <algorithm>
 #include <array>
@@ -4542,8 +4544,8 @@ struct PublicCapture {
   ~PublicCapture() { if (session && !closed) client->close(session); }
 };
 template <class Predicate>
-bool PumpPublic(Predicate done) {
-  ULONGLONG deadline = ::GetTickCount64() + 10000;
+bool PumpPublic(Predicate done, DWORD timeout = 10000) {
+  ULONGLONG deadline = ::GetTickCount64() + timeout;
   while (!done()) {
     if (::GetTickCount64() >= deadline) return false;
     MSG msg;
@@ -4639,7 +4641,7 @@ struct PublicDedicatedProcesses {
     return exited;
   }
 };
-bool PublicRealJsMode(int32_t mode, std::string* detail) {
+bool PublicRealJsMode(int32_t mode, std::string* detail, bool lpac = false) {
   CapturedBroker broker;
   PublicDedicatedProcesses dedicated;
   if (mode == v8host_broker_mode_shared && !broker.Launch(detail)) return false;
@@ -4654,6 +4656,12 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
   config.broker_mode = static_cast<v8host_broker_mode>(mode); config.tier = v8host_tier_untrusted;
   config.prohibit_dynamic_code = 1; config.initial_token = sbox_token_level_restricted_same_access;
   config.delayed_integrity = sbox_integrity_level_untrusted;
+  if (lpac) {
+    config.use_app_container = config.low_privilege_app_container = true;
+    config.app_container_profile_name = L"v8host.lpac.test";
+    config.integrity = config.delayed_integrity = sbox_integrity_level_low;
+    config.lockdown_token = sbox_token_level_lockdown;
+  }
   if (client.Open(&config, &capture.session) != v8host_status_ok || !capture.session) {
     *detail = "public create"; return false;
   }
@@ -4682,7 +4690,9 @@ bool PublicRealJsMode(int32_t mode, std::string* detail) {
       *detail = "public relay admission"; return false;
     }
     std::memset(text, 'x', 5); std::memset(binary, 0xFF, 3);
-    if (!PumpPublic([&] { return capture.terminal >= round + 1 || capture.disconnects; })) {
+    // First LPAC load has taken 41.1 s; allow 90 s without extending ordinary run waits.
+    if (!PumpPublic([&] { return capture.terminal >= round + 1 || capture.disconnects; },
+        lpac && round == 0 ? 90000 : 10000)) {
       for (size_t i = 0; i < capture.events.size(); ++i) std::printf("[failure event] %d status=%d\n", capture.events[i], capture.statuses[i]);
       for (int32_t state : capture.states) std::printf("[failure state] %d\n", state);
       std::printf("[failure callbacks] states=%zu events=%zu messages=%zu terminals=%d disconnects=%d\n", capture.states.size(), capture.events.size(), capture.messages.size(), capture.terminal, capture.disconnects);
@@ -5510,6 +5520,245 @@ bool IdleAcceptBoundary(std::string* detail) {
   return true;
 }
 
+struct ChildResult {
+  bool launched = false, in_owned_job = false, exited = false, empty = false, overflow = false;
+  bool forced = false, drained = false;
+  DWORD code = 1, error = ERROR_SUCCESS;
+  std::string output;
+};
+ChildResult RunOwnedChild(const std::wstring& directory, const char* name,
+                         DWORD watchdog = 120000, bool fail_create = false) {
+  ChildResult result;
+  HANDLE job = ::CreateJobObjectW(nullptr, nullptr), read = nullptr, write = nullptr;
+  LPPROC_THREAD_ATTRIBUTE_LIST attributes = nullptr;
+  struct Cleanup {
+    HANDLE& job; HANDLE& read; HANDLE& write; LPPROC_THREAD_ATTRIBUTE_LIST& attributes;
+    ~Cleanup() {
+      if (attributes) { ::DeleteProcThreadAttributeList(attributes); ::HeapFree(::GetProcessHeap(), 0, attributes); }
+      for (HANDLE h : {write, read, job}) if (h) ::CloseHandle(h);
+    }
+  } cleanup{job, read, write, attributes};
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+  if (!job || !::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
+      !::CreatePipe(&read, &write, &sa, 0) || !::SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0)) {
+    result.error = ::GetLastError(); return result;
+  }
+  SIZE_T bytes = 0;
+  ::InitializeProcThreadAttributeList(nullptr, 2, 0, &bytes);
+  auto* storage = static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(::HeapAlloc(::GetProcessHeap(), 0, bytes));
+  if (!storage) { result.error = ERROR_NOT_ENOUGH_MEMORY; return result; }
+  if (!::InitializeProcThreadAttributeList(storage, 2, 0, &bytes)) {
+    result.error = ::GetLastError(); ::HeapFree(::GetProcessHeap(), 0, storage); return result;
+  }
+  attributes = storage;
+  if (!::UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, &job, sizeof(job), nullptr, nullptr) ||
+      !::UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &write, sizeof(write), nullptr, nullptr)) {
+    result.error = ::GetLastError(); return result;
+  }
+  STARTUPINFOEXW startup = {}; startup.StartupInfo.cb = sizeof(startup);
+  startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+  startup.StartupInfo.hStdOutput = startup.StartupInfo.hStdError = startup.StartupInfo.hStdInput = write;
+  startup.lpAttributeList = attributes;
+  const std::wstring exe = directory + L"\\v8host_broker_tests.exe";
+  std::wstring command = L"\"" + exe + L"\" --public-child=" + std::wstring(name, name + std::strlen(name));
+  PROCESS_INFORMATION pi = {};
+  // The test-only seam fails before creating any process.
+  result.launched = !fail_create && ::CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE,
+      EXTENDED_STARTUPINFO_PRESENT, nullptr, directory.c_str(), &startup.StartupInfo, &pi);
+  result.error = fail_create ? ERROR_CANCELLED : result.launched ? ERROR_SUCCESS : ::GetLastError();
+  ::CloseHandle(write); write = nullptr;
+  auto empty = [&] {
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting = {};
+    return ::QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting,
+        sizeof(accounting), nullptr) && accounting.ActiveProcesses == 0;
+  };
+  if (!result.launched) { result.empty = empty(); return result; }
+  BOOL in_job = FALSE;
+  result.in_owned_job = ::IsProcessInJob(pi.hProcess, job, &in_job) && in_job;
+  ::CloseHandle(pi.hThread);
+  std::thread reader([&] {
+    char buffer[4096]; DWORD count = 0;
+    while (::ReadFile(read, buffer, sizeof(buffer), &count, nullptr) && count) {
+      if (result.output.size() + count <= 1024 * 1024) result.output.append(buffer, count);
+      else result.overflow = true;
+    }
+  });
+  result.exited = ::WaitForSingleObject(pi.hProcess, watchdog) == WAIT_OBJECT_0;
+  // Process signaling can precede job accounting retirement. Allow natural drain
+  // before deciding whether descendants leaked; forced cleanup never counts as success.
+  const ULONGLONG natural_deadline = ::GetTickCount64() + 5000;
+  while (result.exited && !empty() && ::GetTickCount64() < natural_deadline) ::Sleep(10);
+  result.empty = empty();
+  if (!result.exited || !result.empty) {
+    result.forced = true;
+    ::TerminateJobObject(job, 1);
+    ::WaitForSingleObject(pi.hProcess, 5000);
+    const ULONGLONG deadline = ::GetTickCount64() + 5000;
+    while (!empty() && ::GetTickCount64() < deadline) ::Sleep(10);
+  }
+  result.drained = empty();
+  ::GetExitCodeProcess(pi.hProcess, &result.code); ::CloseHandle(pi.hProcess);
+  // Closing the owned job also closes any remaining writers before joining.
+  ::CloseHandle(job); job = nullptr;
+  reader.join();
+  if (!result.drained) result.output += "\n[cleanup] owned job did not drain\n";
+  return result;
+}
+bool ChildPassed(const ChildResult& result, const char* name) {
+  const std::string marker = std::string("[public-child-result] ") + name + ": PASS\n";
+  std::string output;
+  for (size_t i = 0; i < result.output.size(); ++i) {
+    if (result.output[i] == '\r' && i + 1 < result.output.size() && result.output[i + 1] == '\n') continue;
+    output += result.output[i];
+  }
+  const auto at = output.find(marker);
+  return result.launched && result.in_owned_job && result.exited && result.empty &&
+      result.drained && !result.forced && !result.overflow && result.code == 0 &&
+      result.output.find("FAIL") == std::string::npos && result.output.find("[cleanup]") == std::string::npos &&
+      at != std::string::npos && (at == 0 || output[at - 1] == '\n') &&
+      output.find(marker, at + marker.size()) == std::string::npos;
+}
+bool LpacReadable(const std::wstring& path) {
+  PSID sid = nullptr;
+  SID_IDENTIFIER_AUTHORITY authority = SECURITY_APP_PACKAGE_AUTHORITY;
+  if (!::AllocateAndInitializeSid(&authority, 2, SECURITY_APP_PACKAGE_BASE_RID,
+      SECURITY_BUILTIN_PACKAGE_ANY_RESTRICTED_PACKAGE, 0, 0, 0, 0, 0, 0, &sid)) return false;
+  PACL acl = nullptr; PSECURITY_DESCRIPTOR security = nullptr;
+  const DWORD error = ::GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+      nullptr, nullptr, &acl, nullptr, &security);
+  bool allowed = false, denied = false;
+  if (error == ERROR_SUCCESS && acl) {
+    for (DWORD i = 0; i < acl->AceCount; ++i) {
+      void* ace = nullptr;
+      if (!::GetAce(acl, i, &ace)) { denied = true; break; }
+      const auto* header = static_cast<ACE_HEADER*>(ace);
+      if (header->AceFlags & INHERIT_ONLY_ACE) continue;
+      if (header->AceType != ACCESS_ALLOWED_ACE_TYPE && header->AceType != ACCESS_DENIED_ACE_TYPE) continue;
+      const auto* entry = static_cast<ACCESS_ALLOWED_ACE*>(ace);
+      if (::EqualSid(sid, const_cast<DWORD*>(&entry->SidStart))) {
+        allowed |= header->AceType == ACCESS_ALLOWED_ACE_TYPE && (entry->Mask & FILE_GENERIC_EXECUTE) == FILE_GENERIC_EXECUTE &&
+            (entry->Mask & FILE_GENERIC_READ) == FILE_GENERIC_READ;
+        denied |= header->AceType == ACCESS_DENIED_ACE_TYPE && (entry->Mask & (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE));
+      }
+    }
+  }
+  if (security) ::LocalFree(security);
+  ::FreeSid(sid); return allowed && !denied;
+}
+struct OwnedLpacProfile {
+  bool owned = false;
+  bool Create() {
+    PSID sid = nullptr;
+    const HRESULT result = ::CreateAppContainerProfile(L"v8host.lpac.test", L"LPAC test", L"LPAC test", nullptr, 0, &sid);
+    if (sid) ::FreeSid(sid);
+    owned = SUCCEEDED(result);
+    return owned;
+  }
+  bool Remove() {
+    if (!owned) return true;
+    const bool removed = SUCCEEDED(::DeleteAppContainerProfile(L"v8host.lpac.test"));
+    if (removed) owned = false;
+    return removed;
+  }
+  ~OwnedLpacProfile() { if (owned && !Remove()) std::printf("[cleanup] owned profile removal failed\n"); }
+};
+bool BuildOutputPublicCase(const char* name, std::string* detail) {
+  const auto directory = ExecutableDirectory();
+  std::vector<std::filesystem::path> paths{directory};
+  std::error_code ec;
+  for (std::filesystem::recursive_directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec)) {
+    const auto extension = it->path().extension().wstring();
+    if (::_wcsicmp(extension.c_str(), L".exe") == 0 || ::_wcsicmp(extension.c_str(), L".dll") == 0 ||
+        ::_wcsicmp(extension.c_str(), L".bin") == 0 || ::_wcsicmp(extension.c_str(), L".blob") == 0 ||
+        ::_wcsicmp(extension.c_str(), L".dat") == 0) paths.push_back(it->path());
+  }
+  if (ec) { *detail = "LPAC preflight enumeration error=" + std::to_string(ec.value()); return false; }
+  for (const auto& path : paths) {
+    if (!LpacReadable(path.wstring())) { *detail = "LPAC SID read/execute preflight: " + path.string(); return false; }
+  }
+  OwnedLpacProfile profile;
+  if (!profile.Create()) { *detail = "LPAC profile exists or creation failed; no unowned state removed"; return false; }
+  const ChildResult result = RunOwnedChild(directory, name, std::strcmp(name, "real-lpac-session") == 0 ? 180000 : 120000);
+  const bool removed = profile.Remove();
+  std::printf("%s", result.output.c_str());
+  *detail = "build-output child exit=" + std::to_string(result.code) + " error=" + std::to_string(result.error) +
+      " job_empty=" + std::to_string(result.empty) + " profile_removed=" + std::to_string(removed);
+  return removed && ChildPassed(result, name);
+}
+bool ImmutableWorkerHold(std::string* detail) {
+  v8host::HeldFile verified, worker, denied;
+  DWORD error = 0;
+  *detail = "default open";
+  const auto path = ExecutableDirectory() + L"\\v8host.dll";
+  if (!v8host::OpenImmutableFile(path, &verified, &error) || verified.final_path().empty()) return false;
+  struct Reset { ~Reset() { v8host::FailFinalPathForTesting(false); } } reset;
+  v8host::FailFinalPathForTesting(true);
+  if (v8host::OpenImmutableFile(path, &denied, &error) || error != ERROR_ACCESS_DENIED || denied) {
+    *detail = "default verified open did not fail closed"; return false;
+  }
+  *detail = "worker open/hash/machine";
+  if (!v8host::OpenImmutableFile(path, &worker, &error, v8host::FinalPathMode::kOmitForWorkerHold) ||
+      !worker.final_path().empty() || worker.sha256() != verified.sha256() || worker.machine() != verified.machine()) return false;
+  verified = v8host::HeldFile();
+  denied = v8host::HeldFile();
+  *detail = "write/delete share denial";
+  for (DWORD access : {GENERIC_WRITE, DELETE}) {
+    HANDLE mutator = ::CreateFileW(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (mutator != INVALID_HANDLE_VALUE) { ::CloseHandle(mutator); return false; }
+    if (::GetLastError() != ERROR_SHARING_VIOLATION) { *detail += " error=" + std::to_string(::GetLastError()); return false; }
+  }
+  *detail = "invalid/missing/directory rejection";
+  for (auto mode : {v8host::FinalPathMode::kRequired, v8host::FinalPathMode::kOmitForWorkerHold}) {
+    v8host::HeldFile invalid;
+    if (v8host::OpenImmutableFile(L"", &invalid, &error, mode) || error != ERROR_INVALID_PARAMETER ||
+        v8host::OpenImmutableFile(ExecutableDirectory(), &invalid, &error, mode) || invalid) return false;
+    if (v8host::OpenImmutableFile(path + L".missing", &invalid, &error, mode) || invalid) return false;
+  }
+  *detail = "worker hold retains machine/hash/share checks; verified default fails closed on final-path denial";
+  return true;
+}
+bool RealLpacSession(std::string* detail) { return BuildOutputPublicCase("real-lpac-session", detail); }
+bool BuildOutputChild(std::string* detail) { return BuildOutputPublicCase("build-output-child", detail); }
+bool ChildFailureCleanup(std::string* detail) {
+  OwnedLpacProfile profile;
+  if (!profile.Create()) { *detail = "LPAC profile exists or creation failed"; return false; }
+  ChildResult spoof; spoof.launched = spoof.in_owned_job = spoof.exited = spoof.empty = spoof.drained = true; spoof.code = 0;
+  bool ok = true;
+  for (const char* text : {"prefix[public-child-result] probe: PASS\n", "child/probe: PASS\n",
+      "[public-child-result] probe: PASS extra\n", "[public-child-result] pro\rbe: PASS\n"}) {
+    spoof.output = text;
+    if (ChildPassed(spoof, "probe")) { *detail = std::string("accepted invalid marker: ") + text; return false; }
+  }
+  for (const char* name : {"launch-create-failure", "launch-nonzero", "launch-absent", "launch-wrong", "launch-overflow", "launch-timeout"}) {
+    const bool create_failure = std::strcmp(name, "launch-create-failure") == 0;
+    const bool timeout = std::strcmp(name, "launch-timeout") == 0;
+    const auto result = RunOwnedChild(ExecutableDirectory(), name, timeout ? 1000 : 120000, create_failure);
+    bool passed = !ChildPassed(result, name) && result.output.find("[cleanup]") == std::string::npos &&
+        (create_failure ? !result.launched && result.empty && result.error == ERROR_CANCELLED :
+          result.launched && result.in_owned_job && result.drained &&
+          (timeout ? !result.exited && result.forced : result.exited && result.empty && !result.forced));
+    if (std::strcmp(name, "launch-overflow") == 0) passed &= result.overflow;
+    if (std::strcmp(name, "launch-nonzero") == 0) passed &= result.code == 7;
+    if (!passed) {
+      *detail = std::string(name) + " launched=" + std::to_string(result.launched) +
+          " in_owned_job=" + std::to_string(result.in_owned_job) + " exited=" + std::to_string(result.exited) +
+          " empty=" + std::to_string(result.empty) + " forced=" + std::to_string(result.forced) +
+          " drained=" + std::to_string(result.drained) + " overflow=" + std::to_string(result.overflow) +
+          " code=" + std::to_string(result.code) + " error=" + std::to_string(result.error) +
+          " output_bytes=" + std::to_string(result.output.size());
+      ok = false;
+      std::printf("[launch subcase] %s\n", detail->c_str());
+    }
+    if (result.error == ERROR_VIRUS_INFECTED) { *detail = "STOP: Defender WinError 225"; return false; }
+  }
+  const bool removed = profile.Remove();
+  if (!removed) { *detail = "owned profile removal failed"; return false; }
+  if (ok) *detail = "create failure, exit, markers, overflow, watchdog; owned job/reader/profile cleanup";
+  return ok;
+}
 bool IsolatedPublicCase(const char* name, std::string* detail) {
   namespace fs = std::filesystem;
   static std::atomic<unsigned> sequence{0};
@@ -5559,59 +5808,10 @@ bool IsolatedPublicCase(const char* name, std::string* detail) {
     *detail = "fixture identity/endpoint not isolated"; return false;
   }
   std::printf("[fixture] distinct exact-set endpoints; immutable DLL hashes identical; case=%s\n", name);
-  SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
-  HANDLE read = nullptr, write = nullptr;
-  if (!::CreatePipe(&read, &write, &sa, 0)) { *detail = "fixture capture pipe"; return false; }
-  ::SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0);
-  STARTUPINFOW startup = {}; startup.cb = sizeof(startup);
-  startup.dwFlags = STARTF_USESTDHANDLES; startup.hStdOutput = startup.hStdError = write;
-  startup.hStdInput = ::GetStdHandle(STD_INPUT_HANDLE);
-  const std::wstring exe = (dir / L"v8host_broker_tests.exe").wstring();
-  std::wstring command = L"\"" + exe + L"\" --public-child=" + std::wstring(name, name + std::strlen(name));
-  HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
-  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
-  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-  if (!job || !::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
-    if (job) ::CloseHandle(job);
-    ::CloseHandle(read); ::CloseHandle(write); *detail = "fixture kill-on-close job"; return false;
-  }
-  PROCESS_INFORMATION pi = {};
-  const bool launched = ::CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_SUSPENDED, nullptr,
-      dir.c_str(), &startup, &pi) != FALSE;
-  ::CloseHandle(write);
-  if (!launched) { ::CloseHandle(job); ::CloseHandle(read); *detail = "fixture child launch"; return false; }
-  if (!::AssignProcessToJobObject(job, pi.hProcess) || ::ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {
-    ::TerminateProcess(pi.hProcess, 1); ::WaitForSingleObject(pi.hProcess, 5000);
-    ::CloseHandle(pi.hThread); ::CloseHandle(pi.hProcess); ::CloseHandle(read); ::CloseHandle(job);
-    *detail = "fixture child job ownership"; return false;
-  }
-  ::CloseHandle(pi.hThread);
-  std::string output;
-  bool overflow = false;
-  std::thread reader([&] {
-    char bytes[4096]; DWORD len;
-    while (::ReadFile(read, bytes, sizeof(bytes), &len, nullptr) && len) {
-      if (output.size() + len <= 1024 * 1024) output.append(bytes, len);
-      else overflow = true;
-    }
-  });
-  bool exited = ::WaitForSingleObject(pi.hProcess, 120000) == WAIT_OBJECT_0;
-  if (!exited) { ::TerminateJobObject(job, 1); ::WaitForSingleObject(pi.hProcess, 5000); }
-  JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting = {};
-  const bool empty = ::QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
-      &accounting, sizeof(accounting), nullptr) && accounting.ActiveProcesses == 0;
-  if (!empty) {
-    ::TerminateJobObject(job, 1);
-    // Drain only the owned failed fixture job before removing its files.
-    const ULONGLONG drain_deadline = ::GetTickCount64() + 5000;
-    while (::QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
-        &accounting, sizeof(accounting), nullptr) && accounting.ActiveProcesses &&
-        ::GetTickCount64() < drain_deadline) ::Sleep(10);
-    if (accounting.ActiveProcesses) std::printf("[cleanup] fixture job did not drain\n");
-  }
-  DWORD code = 1; ::GetExitCodeProcess(pi.hProcess, &code);
-  ::CloseHandle(pi.hProcess);
-  reader.join(); ::CloseHandle(read); ::CloseHandle(job);
+  const auto result = RunOwnedChild(dir.wstring(), name);
+  const auto& output = result.output;
+  const bool exited = result.exited, empty = result.empty, overflow = result.overflow;
+  const DWORD code = result.code;
   std::printf("%s", output.c_str());
   const bool passed = exited && empty && !overflow && code == 0 &&
       output.find("[cleanup]") == std::string::npos &&
@@ -5658,6 +5858,32 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     if (std::strncmp(argv[i], "--public-child=", 15) != 0) continue;
     std::string name = argv[i] + 15, detail;
+    if (name == "build-output-child" || name == "real-lpac-session" || name.rfind("launch-", 0) == 0) {
+      BOOL in_job = FALSE;
+      if (!::IsProcessInJob(::GetCurrentProcess(), nullptr, &in_job) || !in_job) return 9;
+      if (name == "launch-timeout") { ::Sleep(INFINITE); return 9; }
+      if (name == "launch-absent") return 0;
+      if (name == "launch-nonzero") {
+        std::printf("[public-child-result] launch-nonzero: PASS\n"); return 7;
+      }
+      if (name == "launch-overflow") {
+        const std::string bytes(1024 * 1024 + 1, 'x');
+        std::fwrite(bytes.data(), 1, bytes.size(), stdout);
+      }
+      wchar_t image[32768] = {}, cwd[32768] = {}, plugin[32768] = {};
+      const auto directory = ExecutableDirectory();
+      bool ok = ::GetModuleFileNameW(nullptr, image, 32768) && ::GetCurrentDirectoryW(32768, cwd) &&
+          ::_wcsicmp(image, (directory + L"\\v8host_broker_tests.exe").c_str()) == 0 && directory == cwd;
+      if (name == "build-output-child" || name == "real-lpac-session") {
+        ok = ok && PublicRealJsMode(v8host_broker_mode_dedicated, &detail, name == "real-lpac-session") &&
+            ::GetModuleFileNameW(::GetModuleHandleW(L"v8host.dll"), plugin, 32768) &&
+            ::_wcsicmp(plugin, (directory + L"\\v8host.dll").c_str()) == 0;
+        std::printf("[public paths] exe=%ls plugin=%ls container=%ls\\sbox.exe engine=%ls\\v8jsisb.dll in_job=%d\n",
+            image, plugin, directory.c_str(), directory.c_str(), in_job);
+      }
+      std::printf("[public-child-result] %s: %s\n", name == "launch-wrong" ? "other" : name.c_str(), ok ? "PASS" : "FAIL");
+      return ok ? 0 : 1;
+    }
     bool ok = name == "real-noncooperative-fallback" ? RealNoncooperativeFallbackBody(&detail) :
         name == "real-idle-lifecycle" ? RealIdleLifecycleBody(&detail) :
         name == "real-inbound-aggregate" ? RealInboundAggregateBody(&detail) :
@@ -5673,6 +5899,10 @@ int main(int argc, char** argv) {
     return ok ? 0 : 1;
   }
   const std::vector<v8host::test::TestCase> tests = {
+      {"lpac", "immutable-worker-hold", ImmutableWorkerHold},
+      {"client", "real-lpac-session", RealLpacSession},
+      {"launch", "build-output-child", BuildOutputChild},
+      {"launch", "child-failure-cleanup", ChildFailureCleanup},
       {"cancel", "real-noncooperative-fallback", RealNoncooperativeFallback},
       {"rendezvous", "real-idle-lifecycle", RealIdleLifecycle},
       {"rendezvous", "idle-accept-boundary", IdleAcceptBoundary},

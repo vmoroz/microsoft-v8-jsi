@@ -15,6 +15,12 @@ namespace v8host {
 
 enum class TrustStatus { kSignedValid, kUnsigned, kInvalid, kError };
 
+enum class FinalPathMode { kRequired, kOmitForWorkerHold };
+
+#ifdef V8HOST_FILE_IDENTITY_TESTING
+void FailFinalPathForTesting(bool fail);
+#endif
+
 class HeldFile {
  public:
   HeldFile() = default;
@@ -31,7 +37,7 @@ class HeldFile {
   explicit operator bool() const { return handle_ != INVALID_HANDLE_VALUE; }
 
  private:
-  friend bool OpenImmutableFile(const std::wstring&, HeldFile*, DWORD*);
+  friend bool OpenImmutableFile(const std::wstring&, HeldFile*, DWORD*, FinalPathMode);
   HANDLE handle_ = INVALID_HANDLE_VALUE;
   std::wstring final_path_;
   uint16_t machine_ = 0;
@@ -68,7 +74,8 @@ class HeldProcess {
   HeldFile image_;
 };
 
-bool OpenImmutableFile(const std::wstring& path, HeldFile* out, DWORD* error);
+bool OpenImmutableFile(const std::wstring& path, HeldFile* out, DWORD* error,
+                       FinalPathMode final_path = FinalPathMode::kRequired);
 TrustStatus VerifyTrust(const HeldFile& file);
 bool TrustAllowed(TrustStatus trust);
 bool QueryProcessIdentity(DWORD pid, HeldProcess* out, DWORD* error);

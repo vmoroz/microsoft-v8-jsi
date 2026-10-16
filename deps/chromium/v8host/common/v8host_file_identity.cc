@@ -10,6 +10,10 @@
 #include <utility>
 
 namespace v8host {
+#ifdef V8HOST_FILE_IDENTITY_TESTING
+thread_local bool fail_final_path = false;
+void FailFinalPathForTesting(bool fail) { fail_final_path = fail; }
+#endif
 namespace {
 
 void CloseHandleIfValid(HANDLE handle) {
@@ -27,6 +31,9 @@ bool ReadAt(HANDLE file, uint64_t offset, void* data, DWORD size) {
 }
 
 bool ReadFinalPath(HANDLE file, std::wstring* path) {
+#ifdef V8HOST_FILE_IDENTITY_TESTING
+  if (fail_final_path) { ::SetLastError(ERROR_ACCESS_DENIED); return false; }
+#endif
   const DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_GUID;
   DWORD size = ::GetFinalPathNameByHandleW(file, nullptr, 0, flags);
   if (!size)
@@ -176,7 +183,8 @@ HeldProcess& HeldProcess::operator=(HeldProcess&& other) noexcept {
   return *this;
 }
 
-bool OpenImmutableFile(const std::wstring& path, HeldFile* out, DWORD* error) {
+bool OpenImmutableFile(const std::wstring& path, HeldFile* out, DWORD* error,
+                       FinalPathMode final_path) {
   if (!out || path.empty()) {
     if (error)
       *error = ERROR_INVALID_PARAMETER;
@@ -200,7 +208,8 @@ bool OpenImmutableFile(const std::wstring& path, HeldFile* out, DWORD* error) {
       !::GetFileInformationByHandleEx(result.handle_, FileStandardInfo,
                                       &standard, sizeof(standard)) ||
       standard.Directory || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
-      !ReadFinalPath(result.handle_, &result.final_path_) ||
+      (final_path != FinalPathMode::kOmitForWorkerHold &&
+       !ReadFinalPath(result.handle_, &result.final_path_)) ||
       !ReadMachine(result.handle_, &result.machine_) ||
       !HashFile(result.handle_, &result.sha256_)) {
     if (error)

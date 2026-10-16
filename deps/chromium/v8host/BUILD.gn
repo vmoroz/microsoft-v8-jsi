@@ -276,12 +276,14 @@ action("v8host_layering_tests") {
 }
 
 executable("v8host_broker_tests") {
+  libs = [ "userenv.lib" ]
   testonly = true
-  defines = [ "V8HOST_ROUTER_TESTING", "V8HOST_ENGINE_TESTING" ]
+  defines = [ "V8HOST_ROUTER_TESTING", "V8HOST_ENGINE_TESTING", "V8HOST_FILE_IDENTITY_TESTING" ]
   include_dirs = [ "//../../src" ]
   configs -= [ "//build/config/compiler:no_exceptions" ]
   configs += [ "//build/config/compiler:exceptions" ]
   sources = [
+    "common/v8host_file_identity.cc",
     "coordinator/v8host_router.cc",
     "coordinator/v8host_router.h",
     "tests/v8host_broker_tests.cc",
