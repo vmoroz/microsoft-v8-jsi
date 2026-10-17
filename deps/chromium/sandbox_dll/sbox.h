@@ -66,7 +66,7 @@
 #endif
 #endif
 
-#define SBOX_ABI_VERSION 8u
+#define SBOX_ABI_VERSION 1u
 
 #ifdef __cplusplus
 extern "C" {

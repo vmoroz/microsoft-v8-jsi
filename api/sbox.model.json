@@ -50,11 +50,11 @@
           "doc": null,
           "annotations": [],
           "functionLike": false,
-          "replacement": ["7u"],
+          "replacement": ["1u"],
           "perTarget": {
-            "x86_64-pc-windows-msvc": {"value": "7"},
-            "i686-pc-windows-msvc": {"value": "7"},
-            "aarch64-pc-windows-msvc": {"value": "7"}
+            "x86_64-pc-windows-msvc": {"value": "1"},
+            "i686-pc-windows-msvc": {"value": "1"},
+            "aarch64-pc-windows-msvc": {"value": "1"}
           }
         },
         {
@@ -931,50 +931,71 @@
               },
               "annotations": [],
               "doc": "Copies the plugin DLL's final path."
+            },
+            {
+              "name": "get_process_id",
+              "type": {
+                "pointer": {
+                  "function": {
+                    "result": {"name": "sbox_status"},
+                    "params": [
+                      {"name": "worker", "type": {"name": "sbox_broker_worker"}, "annotations": []},
+                      {
+                        "name": "out_process_id",
+                        "type": {"pointer": {"name": "uint32_t"}},
+                        "annotations": []
+                      }
+                    ],
+                    "variadic": false
+                  }
+                }
+              },
+              "annotations": [],
+              "doc": "The worker's process ID, valid while the worker handle is live and before\n/// wait, even after the worker exits. After wait the OS may reuse the ID.\n/// Failure zeroes a non-NULL output."
             }
           ],
           "perTarget": {
             "x86_64-pc-windows-msvc": {
-              "size": 64,
+              "size": 72,
               "align": 8,
-              "offsets": [0, 8, 16, 24, 32, 40, 48, 56],
-              "fieldCallingConventions": [null, "c", "c", "c", "c", "c", "c", "c"]
+              "offsets": [0, 8, 16, 24, 32, 40, 48, 56, 64],
+              "fieldCallingConventions": [null, "c", "c", "c", "c", "c", "c", "c", "c"]
             },
             "i686-pc-windows-msvc": {
-              "size": 32,
+              "size": 36,
               "align": 4,
-              "offsets": [0, 4, 8, 12, 16, 20, 24, 28],
-              "fieldCallingConventions": [null, "c", "c", "c", "c", "c", "c", "c"]
+              "offsets": [0, 4, 8, 12, 16, 20, 24, 28, 32],
+              "fieldCallingConventions": [null, "c", "c", "c", "c", "c", "c", "c", "c"]
             },
             "aarch64-pc-windows-msvc": {
-              "size": 64,
+              "size": 72,
               "align": 8,
-              "offsets": [0, 8, 16, 24, 32, 40, 48, 56],
-              "fieldCallingConventions": [null, "c", "c", "c", "c", "c", "c", "c"]
+              "offsets": [0, 8, 16, 24, 32, 40, 48, 56, 64],
+              "fieldCallingConventions": [null, "c", "c", "c", "c", "c", "c", "c", "c"]
             }
           }
         },
         {
           "kind": "typedef",
           "name": "sbox_broker_api",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 252, "column": 3},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 257, "column": 3},
           "doc": "sbox.exe -> plugin, BROKER role: worker spawning and the broker side of the\nworker channel. The host owns this table and every opaque host token.\n\nconfigure_and_spawn copies configure_data before the call returns. Message\nbuffers are borrowed only for callback duration. After a successful spawn,\nthe plugin owns the worker: close is called at most once and wait exactly\nonce. wait is destructive and invalidates the handle; callbacks have stopped\nwhen it returns. EXIT arrives at most once, after all queued worker output,\nbut may be absent once close/wait starts. It carries no exit code, does not\nreplace the single wait, and is not permission to free handles or context.\nCallbacks must return promptly and never block or call close/wait; wait\ngives the reader 5 s to join; a callback still running after that budget is\nunsupported.\n\nThe get_* text slots copy host text into a caller-owned buffer. Each sets\n*out_length to the text's length in sbox_char16 units, without the NUL.\nWith a NULL buffer and buffer_length 0 it only reports the length. Otherwise\nbuffer_length must exceed the length; the slot then writes the text and a\nNUL. A buffer that is too small gets sbox_status_invalid_arg, nothing\nwritten, and the required length in *out_length.",
           "annotations": [],
           "type": {"name": "sbox_broker_api"},
           "perTarget": {
             "x86_64-pc-windows-msvc": {
               "canonicalType": {"name": "sbox_broker_api"},
-              "size": 64,
+              "size": 72,
               "align": 8
             },
             "i686-pc-windows-msvc": {
               "canonicalType": {"name": "sbox_broker_api"},
-              "size": 32,
+              "size": 36,
               "align": 4
             },
             "aarch64-pc-windows-msvc": {
               "canonicalType": {"name": "sbox_broker_api"},
-              "size": 64,
+              "size": 72,
               "align": 8
             }
           }
@@ -982,7 +1003,7 @@
         {
           "kind": "macro",
           "name": "SBOX_BROKER_API_INIT",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 253, "column": 9},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 258, "column": 9},
           "doc": null,
           "annotations": [],
           "functionLike": false,
@@ -1006,13 +1027,15 @@
             "NULL",
             ",",
             "NULL",
+            ",",
+            "NULL",
             "}"
           ]
         },
         {
           "kind": "struct",
           "name": "sbox_config_api",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 263, "column": 16},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 268, "column": 16},
           "doc": "sbox.exe -> plugin, BROKER role: services configure() uses to describe the\nsandbox. sbox speaks ACG (a mitigation), never JIT. Every setter returns\nsbox_status; a rejected setter poisons the builder so a partial or invalid\nconfig can never spawn (fail closed). Limits: at most 64 file rules, 64\ncapabilities, and 4096 plugin-data bytes.",
           "annotations": [],
           "fields": [
@@ -1225,7 +1248,7 @@
         {
           "kind": "typedef",
           "name": "sbox_config_api",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 304, "column": 3},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 309, "column": 3},
           "doc": "sbox.exe -> plugin, BROKER role: services configure() uses to describe the\nsandbox. sbox speaks ACG (a mitigation), never JIT. Every setter returns\nsbox_status; a rejected setter poisons the builder so a partial or invalid\nconfig can never spawn (fail closed). Limits: at most 64 file rules, 64\ncapabilities, and 4096 plugin-data bytes.",
           "annotations": [],
           "type": {"name": "sbox_config_api"},
@@ -1250,7 +1273,7 @@
         {
           "kind": "macro",
           "name": "SBOX_CONFIG_API_INIT",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 305, "column": 9},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 310, "column": 9},
           "doc": null,
           "annotations": [],
           "functionLike": false,
@@ -1282,7 +1305,7 @@
         {
           "kind": "struct",
           "name": "sbox_worker_api",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 309, "column": 16},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 314, "column": 16},
           "doc": "sbox.exe -> plugin, WORKER role: services warmup() and run() use.",
           "annotations": [],
           "fields": [
@@ -1436,7 +1459,7 @@
         {
           "kind": "typedef",
           "name": "sbox_worker_api",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 331, "column": 3},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 336, "column": 3},
           "doc": "sbox.exe -> plugin, WORKER role: services warmup() and run() use.",
           "annotations": [],
           "type": {"name": "sbox_worker_api"},
@@ -1461,7 +1484,7 @@
         {
           "kind": "macro",
           "name": "SBOX_WORKER_API_INIT",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 332, "column": 9},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 337, "column": 9},
           "doc": null,
           "annotations": [],
           "functionLike": false,
@@ -1489,7 +1512,7 @@
         {
           "kind": "struct",
           "name": "sbox_plugin_api",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 336, "column": 16},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 341, "column": 16},
           "doc": "The plugin interface: the plugin implements it; sbox.exe calls by role.",
           "annotations": [],
           "fields": [
@@ -1641,7 +1664,7 @@
         {
           "kind": "typedef",
           "name": "sbox_plugin_api",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 358, "column": 3},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 363, "column": 3},
           "doc": "The plugin interface: the plugin implements it; sbox.exe calls by role.",
           "annotations": [],
           "type": {"name": "sbox_plugin_api"},
@@ -1666,7 +1689,7 @@
         {
           "kind": "macro",
           "name": "SBOX_PLUGIN_API_INIT",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 359, "column": 9},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 364, "column": 9},
           "doc": null,
           "annotations": [],
           "functionLike": false,
@@ -1694,7 +1717,7 @@
         {
           "kind": "macro",
           "name": "SBOX_PLUGIN_ENTRY",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 363, "column": 9},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 368, "column": 9},
           "doc": null,
           "annotations": [],
           "functionLike": false,
@@ -1703,7 +1726,7 @@
         {
           "kind": "typedef",
           "name": "sbox_plugin_main_fn",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 365, "column": 33},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 370, "column": 33},
           "doc": "The function-pointer type of sbox_plugin_main, for GetProcAddress.",
           "annotations": [],
           "type": {
@@ -1791,7 +1814,7 @@
         {
           "kind": "function",
           "name": "sbox_plugin_main",
-          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 380, "column": 1},
+          "location": {"file": "deps/chromium/sandbox_dll/sbox.h", "line": 385, "column": 1},
           "doc": "The plugin's single required export (cf. Node-API napi_register_module_v1).\nsbox.exe resolves it by name from the --plugin DLL - no import lib, so the\nhost EXE can be renamed. Both sides version-check host_abi_version against\nSBOX_ABI_VERSION. The returned sbox_plugin_api is owned by the plugin\n(typically a file-scope static) and must outlive every call sbox.exe makes\nthrough it.\n\n\\param host_abi_version the SBOX_ABI_VERSION sbox.exe was built against\n\\param out_plugin receives the plugin's function table",
           "annotations": [],
           "result": {"type": {"name": "sbox_status"}},

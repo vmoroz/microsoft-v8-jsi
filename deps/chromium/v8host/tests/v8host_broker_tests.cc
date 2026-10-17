@@ -979,24 +979,27 @@ bool PopWorkerExit(router::Connection& conn, uint32_t session_id = 1) {
   return PopFrame(conn, &h) && h.type == protocol::MessageType::WORKER_EXIT &&
       h.target_id == session_id && h.run_id == 0 && h.request_id == 0 && conn.out_queue.empty();
 }
-bool LifecycleAbi8(std::string* detail) {
-  bool ok = SBOX_ABI_VERSION == 8u;
+bool LifecycleAbi(std::string* detail) {
+  bool ok = SBOX_ABI_VERSION == 1u;
   for (const auto* dll : {L"v8host.dll", L"v8host_abi4_plugin.dll"}) {
     HMODULE module = ::LoadLibraryExW((ExecutableDirectory() + L"\\" + dll).c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
     if (!module)
       return false;
     auto entry = reinterpret_cast<sbox_plugin_main_fn>(::GetProcAddress(module, SBOX_PLUGIN_ENTRY));
+    // The fixture plugin was built for ABI 4: an exact-version host rejects it, and it rejects the current one.
     const bool old = std::wstring(dll) == L"v8host_abi4_plugin.dll";
     const sbox_plugin_api* plugin = nullptr;
-    ok = entry && entry(old ? 4u : 8u, &plugin) == sbox_status_ok && plugin &&
-        plugin->abi_version == (old ? 4u : 8u) && plugin->configure && plugin->broker_run &&
+    ok = entry && entry(old ? 4u : SBOX_ABI_VERSION, &plugin) == sbox_status_ok && plugin &&
+        plugin->abi_version == (old ? 4u : SBOX_ABI_VERSION) && plugin->configure && plugin->broker_run &&
         plugin->warmup && plugin->run && plugin->shutdown && ok;
     plugin = reinterpret_cast<const sbox_plugin_api*>(1);
-    ok = entry && entry(old ? 8u : 4u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
+    ok = entry && entry(old ? SBOX_ABI_VERSION : 4u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
     if (!old) {
       plugin = reinterpret_cast<const sbox_plugin_api*>(1);
-      ok = entry && entry(7u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
+      ok = entry && entry(SBOX_ABI_VERSION + 1u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
+      plugin = reinterpret_cast<const sbox_plugin_api*>(1);
+      ok = entry && entry(0u, &plugin) == sbox_status_version_mismatch && !plugin && ok;
     }
     ::FreeLibrary(module);
   }
@@ -7342,7 +7345,7 @@ int main(int argc, char** argv) {
       {"router", "worker-mailbox-pump-bound", MailboxPumpBound},
       {"cancel", "cancels-first", CancelsFirst},
       {"cancel", "completes-first", CompletesFirst},
-      {"run", "lifecycle-abi8", LifecycleAbi8},
+      {"run", "lifecycle-abi", LifecycleAbi},
       {"run", "exit-fact-origin", ExitFactOrigin},
       {"run", "exit-fact-final-drain", ExitFinalDrain},
       {"run", "smoke-lifecycle-two", SmokeLifecycleTwo},

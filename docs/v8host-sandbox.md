@@ -3,7 +3,7 @@
 ## Status and build
 
 The Windows C client API in [v8host_client.h](../src/public/v8host_client.h)
-is **experimental, not ABI-stable** (`V8HOST_ABI_VERSION` 3). Signatures,
+is **experimental, not ABI-stable** (`V8HOST_ABI_VERSION` 1). Signatures,
 fields, and values may change between builds; do not assume binary compatibility.
 The payload contains `sbox.exe`, the generic sandbox container; `v8host.dll`,
 which provides the client, broker plugin, and worker engine plugin; and engine

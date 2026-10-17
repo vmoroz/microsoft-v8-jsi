@@ -60,7 +60,7 @@
 // The consumer passes the value it compiled against to v8host_initialize. The
 // DLL serves older consumers and rejects newer ones. The end-to-end runtime
 // contract is the broker wire version, negotiated separately.
-#define V8HOST_ABI_VERSION 3u
+#define V8HOST_ABI_VERSION 1u
 
 // A string length meaning "the string is NUL-terminated".
 #define V8HOST_AUTO_LENGTH SIZE_MAX
