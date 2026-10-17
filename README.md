@@ -140,6 +140,9 @@ To regenerate after manual fix-ups, run:
 * `git diff --output=..\..\scripts\patch\src.diff --ignore-cr-at-eol` from `\build\v8\`.
 * `git diff --output=..\..\..\..\scripts\patch\zlib.diff --ignore-cr-at-eol` from `\build\v8\third_party\zlib\`.
 
+For the experimental Windows sandbox client API, see
+[Sandboxed JavaScript through v8host.dll](docs/v8host-sandbox.md).
+
 ## Contributing
 See [Contributing guidelines](./docs/CONTRIBUTING.md) for how to setup your fork of the repo and start a PR to contribute to React Native V8 JSI adapter.
 
