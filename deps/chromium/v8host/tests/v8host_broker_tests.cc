@@ -5134,6 +5134,7 @@ ContractCClient& PublicClient() {
   static ContractCClient client;
   return client;
 }
+std::vector<ULONGLONG> g_startup_ms;  // child-process samples for the timing case
 struct PublicCapture {
   ContractCClient* client = nullptr;
   v8host_session_s* session = nullptr;
@@ -5150,8 +5151,11 @@ struct PublicCapture {
     auto& c = *static_cast<PublicCapture*>(user_data);
     c.valid &= ::GetCurrentThreadId() == c.thread && session == c.session && status == v8host_status_ok && !c.closed;
     c.states.push_back(state);
-    if (state == v8host_session_state_worker_security_ready && c.startup_started)
-      std::printf("[client startup] session=%p duration_ms=%llu\n", session, ::GetTickCount64() - c.startup_started);
+    if (state == v8host_session_state_worker_security_ready && c.startup_started) {
+      const ULONGLONG duration = ::GetTickCount64() - c.startup_started;
+      g_startup_ms.push_back(duration);
+      std::printf("[client startup] session=%p duration_ms=%llu\n", session, duration);
+    }
   }
   static void V8HOST_CDECL Run(void* user_data, v8host_run run, v8host_run_event event, v8host_status status) {
     auto& c = *static_cast<PublicCapture*>(user_data);
@@ -5283,7 +5287,7 @@ struct PublicDedicatedProcesses {
     return exited;
   }
 };
-bool PublicRealJsMode(int32_t mode, std::string* detail, bool lpac = false) {
+bool PublicRealJsMode(int32_t mode, std::string* detail, bool lpac = false, bool trusted = false) {
   CapturedBroker broker;
   PublicDedicatedProcesses dedicated;
   if (mode == v8host_broker_mode_shared && !broker.Launch(detail)) return false;
@@ -5295,8 +5299,10 @@ bool PublicRealJsMode(int32_t mode, std::string* detail, bool lpac = false) {
     capture.observe_worker = [&] { return dedicated.Observe(); };
   }
   v8host::test::TestSessionConfig config;
-  config.broker_mode = static_cast<v8host_broker_mode>(mode); config.tier = v8host_tier_untrusted;
-  config.prohibit_dynamic_code = 1; config.initial_token = sbox_token_level_restricted_same_access;
+  config.broker_mode = static_cast<v8host_broker_mode>(mode);
+  // Trusted tier: the normal v8jsi.dll engine with JIT, and ACG off.
+  config.tier = trusted ? v8host_tier_trusted : v8host_tier_untrusted;
+  config.prohibit_dynamic_code = trusted ? 0 : 1; config.initial_token = sbox_token_level_restricted_same_access;
   config.delayed_integrity = sbox_integrity_level_untrusted;
   if (lpac) {
     config.use_app_container = config.low_privilege_app_container = true;
@@ -5360,6 +5366,16 @@ bool PublicRealJsMode(int32_t mode, std::string* detail, bool lpac = false) {
       std::printf("[failure invariant] valid=%d states=%zu events=%zu messages=%zu terminal=%d closed=%d observation=%s\n", capture.valid, capture.states.size(), capture.events.size(), capture.messages.size(), capture.terminal, capture.closed, dedicated.observation_failure.c_str());
       *detail = "public readiness/copy/FIFO/sole terminal invariant round=" + std::to_string(round + 1);
       return false;
+    }
+    if (trusted && round == 0) {
+      // The trusted worker keeps dynamic code allowed (JIT, ACG off) after lockdown.
+      HANDLE query = ::OpenProcess(0x400, FALSE, ::GetProcessId(dedicated.worker));
+      PROCESS_MITIGATION_DYNAMIC_CODE_POLICY policy = {};
+      const bool acg_off = query && ::GetProcessMitigationPolicy(query, ProcessDynamicCodePolicy, &policy, sizeof(policy)) &&
+          policy.ProhibitDynamicCode == 0;
+      if (query) ::CloseHandle(query);
+      if (!acg_off) { *detail = "trusted worker has ACG on or the query failed"; return false; }
+      std::printf("[public trusted] worker=%lu ACG=0 (JIT)\n", ::GetProcessId(dedicated.worker));
     }
   }
   if (!(mode == v8host_broker_mode_shared ? broker.Reaped(1) : dedicated.Reaped())) {
@@ -6911,8 +6927,8 @@ struct OwnedLpacProfile {
   }
   ~OwnedLpacProfile() { if (owned && !Remove()) std::printf("[cleanup] owned profile removal failed\n"); }
 };
-bool BuildOutputPublicCase(const char* name, std::string* detail) {
-  const auto directory = ExecutableDirectory();
+bool BuildOutputPublicCase(const char* name, std::string* detail, const std::wstring& layout_directory = std::wstring()) {
+  const std::wstring directory = layout_directory.empty() ? ExecutableDirectory() : layout_directory;
   std::vector<std::filesystem::path> paths{directory};
   std::error_code ec;
   for (std::filesystem::recursive_directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec)) {
@@ -6928,7 +6944,8 @@ bool BuildOutputPublicCase(const char* name, std::string* detail) {
   OwnedLpacProfile profile;
   if (!profile.Create()) { *detail = "LPAC profile exists or creation failed; no unowned state removed"; return false; }
   ChildResult result = RunOwnedChild(directory, name,
-      std::strcmp(name, "real-lpac-session") == 0 || std::strcmp(name, "lpac-worker-token") == 0 ? 180000 : 120000);
+      std::strcmp(name, "real-lpac-session") == 0 || std::strcmp(name, "lpac-worker-token") == 0 ? 180000 :
+      std::strcmp(name, "timing-samples") == 0 ? 300000 : 120000);
   const bool removed = profile.Remove();
   std::printf("%s", result.output.c_str());
   if (std::strcmp(name, "create-close-and-runaway") == 0 || std::strcmp(name, "public-worker-crash") == 0) {
@@ -7054,97 +7071,150 @@ bool ChildFailureCleanup(std::string* detail) {
   if (ok) *detail = "create failure, exit, markers, overflow, watchdog; owned job/reader/profile cleanup";
   return ok;
 }
-bool IsolatedPublicCase(const char* name, std::string* detail) {
-  namespace fs = std::filesystem;
-  static std::atomic<unsigned> sequence{0};
-  wchar_t temp[MAX_PATH] = {};
-  if (!::GetTempPathW(MAX_PATH, temp)) { *detail = "fixture temp path"; return false; }
-  const fs::path root = fs::path(temp) / L"v8host-broker-tests" /
-      (L"fixture-" + std::to_wstring(::GetCurrentProcessId()) + L"-" + std::to_wstring(++sequence));
-  const fs::path dir = root / L"x64";
-  std::error_code ec;
-  fs::create_directories(dir, ec);
-  if (ec) { *detail = "fixture directory: " + ec.message(); return false; }
-  struct Cleanup {
-    fs::path root;
-    ~Cleanup() {
-      std::error_code error; fs::remove_all(root, error);
-      if (error) std::printf("[cleanup] fixture removal failed: %s\n", error.message().c_str());
-    }
-  } cleanup{root};
-  for (const wchar_t* file : {L"v8host_broker_tests.exe", L"sbox.exe", L"v8host.dll", L"v8jsisb.dll",
-      L"msvcp140.dll", L"msvcp140_atomic_wait.dll", L"vcruntime140.dll", L"vcruntime140_1.dll"}) {
-    fs::copy_file(fs::path(ExecutableDirectory()) / file, dir / file, fs::copy_options::none, ec);
-    if (ec) { *detail = "fixture copy: " + ec.message(); return false; }
-  }
-  {
-    std::ofstream trailer(dir / L"sbox.exe", std::ios::binary | std::ios::app);
-    trailer << "\nfixture:" << ::GetCurrentProcessId() << ':' << sequence.load() << ':' << ::GetTickCount64();
-    trailer.close();
-    if (!trailer) { *detail = "fixture container trailer"; return false; }
-  }
-  v8host::PayloadIdentity original, isolated;
-  v8host::HeldFile original_engine, isolated_engine;
+// The shared-mode cases below run from the build output, so they use its
+// shared endpoint. Each child's job drains, and its brokers exit, before the
+// child returns; only a shared broker started by this process's earlier cases
+// can linger (5 s idle grace). Wait for it to retire so each case starts with
+// no broker, as the old per-case payload copy guaranteed.
+bool WaitForSharedBrokerRetired(std::string* detail) {
+  v8host::PayloadIdentity identity;
   DWORD error = 0;
   std::vector<uint8_t> sid;
   LUID session;
-  std::wstring a, b;
+  std::wstring endpoint;
   std::array<uint8_t, 32> key;
-  if (!v8host::ResolvePayloadIdentity(ExecutableDirectory(), L"sbox.exe", L"v8host.dll", &original, &error) ||
-      !v8host::ResolvePayloadIdentity(dir.wstring(), L"sbox.exe", L"v8host.dll", &isolated, &error) ||
-      original.plugin.sha256() != isolated.plugin.sha256() ||
-      original.container.sha256() == isolated.container.sha256() ||
-      !v8host::OpenImmutableFile(ExecutableDirectory() + L"\\v8jsisb.dll", &original_engine, &error) ||
-      !v8host::OpenImmutableFile((dir / L"v8jsisb.dll").wstring(), &isolated_engine, &error) ||
-      original_engine.sha256() != isolated_engine.sha256() ||
+  if (!v8host::ResolvePayloadIdentity(ExecutableDirectory(), L"sbox.exe", L"v8host.dll", &identity, &error) ||
       !v8host::QueryCurrentSidAndSession(&sid, &session, &error) ||
-      !v8host::DeriveEndpoint(sid, original.plugin_set_id, BrokerMode::kShared, nullptr, &a, &key) ||
-      !v8host::DeriveEndpoint(sid, isolated.plugin_set_id, BrokerMode::kShared, nullptr, &b, &key) || a == b) {
-    *detail = "fixture identity/endpoint not isolated"; return false;
+      !v8host::DeriveEndpoint(sid, identity.plugin_set_id, BrokerMode::kShared, nullptr, &endpoint, &key)) {
+    *detail = "shared endpoint derivation failed"; return false;
   }
-  std::printf("[fixture] distinct exact-set endpoints; immutable DLL hashes identical; case=%s\n", name);
-  const auto result = RunOwnedChild(dir.wstring(), name);
-  const auto& output = result.output;
-  const bool exited = result.exited, empty = result.empty, overflow = result.overflow;
-  const DWORD code = result.code;
-  std::printf("%s", output.c_str());
-  const bool passed = exited && empty && !overflow && code == 0 &&
-      output.find("[cleanup]") == std::string::npos &&
-      output.find(std::string("child/") + name + ": PASS") != std::string::npos;
-  if (!passed) *detail = "isolated child exit=" + std::to_string(code) + " exited=" + std::to_string(exited) +
-      " job_empty=" + std::to_string(empty) + " overflow=" + std::to_string(overflow);
-  return passed;
+  const ULONGLONG deadline = ::GetTickCount64() + 20000;
+  while (::WaitNamedPipeW(endpoint.c_str(), NMPWAIT_NOWAIT) || ::GetLastError() != ERROR_FILE_NOT_FOUND) {
+    if (::GetTickCount64() >= deadline) { *detail = "shared broker did not retire within 20 s"; return false; }
+    ::Sleep(100);
+  }
+  return true;
 }
-bool RealNoncooperativeFallback(std::string* detail) { return IsolatedPublicCase("real-noncooperative-fallback", detail); }
-bool RealIdleLifecycle(std::string* detail) { return IsolatedPublicCase("real-idle-lifecycle", detail); }
-bool RealInboundAggregate(std::string* detail) { return IsolatedPublicCase("real-inbound-aggregate", detail); }
-bool PublicRealJs(std::string* detail) { return IsolatedPublicCase("real-js", detail); }
-bool PublicRealDedicatedJs(std::string* detail) { return IsolatedPublicCase("real-dedicated-js", detail); }
-bool PublicRealCancelAndProfile(std::string* detail) { return IsolatedPublicCase("real-cancel-and-profile", detail); }
-bool PublicBrokerKill(std::string* detail) { return IsolatedPublicCase("broker-kill-no-replay", detail); }
-bool PublicDisconnect(std::string* detail) { return IsolatedPublicCase("disconnect-orderings", detail); }
-bool PublicWorkerExit(std::string* detail) { return IsolatedPublicCase("worker-exit-isolation", detail); }
-bool SameConnectionWorkerExit(std::string* detail) { return IsolatedPublicCase("same-connection-worker-exit", detail); }
-bool PublicNSession(std::string* detail) { return IsolatedPublicCase("n-session-n-pid", detail); }
-bool PublicDllIsolation(std::string* detail) {
-  *detail = "unrelated owner/child isolation/reap check";
-  CapturedBroker unrelated;
-  WireHarness owner;
-  if (!OpenCaptured(unrelated, owner, detail) ||
-      !owner.Send(protocol::BuildStartRunFrame(owner.Header(2, 1, 1), Script(
-          "host.onmessage=function(m){host.postMessage(m);};host.postMessage('owner');"))) ||
-      !owner.Expect(protocol::MessageType::ACK, 2, 1, 1) ||
-      !owner.Expect(protocol::MessageType::STARTUP_READY, 0, 1) ||
-      !owner.Expect(protocol::MessageType::SECURITY_READY, 0, 1) ||
-      !ExpectString(owner, 1, "owner") || !unrelated.Observe(1)) return false;
-  HANDLE worker = unrelated.Worker(0);
-  for (const char* name : {"real-js", "real-dedicated-js", "real-cancel-and-profile"}) {
-    if (!IsolatedPublicCase(name, detail) || ::WaitForSingleObject(worker, 0) != WAIT_TIMEOUT ||
-        ::WaitForSingleObject(unrelated.process, 0) != WAIT_TIMEOUT ||
-        !SendString(owner, 1, name) || !ExpectString(owner, 1, name) || !unrelated.Observe(1)) return false;
+bool BuildOutputSharedCase(const char* name, std::string* detail) {
+  return WaitForSharedBrokerRetired(detail) && BuildOutputPublicCase(name, detail);
+}
+bool RealNoncooperativeFallback(std::string* detail) { return BuildOutputSharedCase("real-noncooperative-fallback", detail); }
+bool RealIdleLifecycle(std::string* detail) { return BuildOutputSharedCase("real-idle-lifecycle", detail); }
+bool RealInboundAggregate(std::string* detail) { return BuildOutputSharedCase("real-inbound-aggregate", detail); }
+bool PublicRealJs(std::string* detail) { return BuildOutputSharedCase("real-js", detail); }
+bool PublicRealDedicatedJs(std::string* detail) { return BuildOutputSharedCase("real-dedicated-js", detail); }
+bool PublicRealCancelAndProfile(std::string* detail) { return BuildOutputSharedCase("real-cancel-and-profile", detail); }
+bool PublicBrokerKill(std::string* detail) { return BuildOutputSharedCase("broker-kill-no-replay", detail); }
+bool PublicDisconnect(std::string* detail) { return BuildOutputSharedCase("disconnect-orderings", detail); }
+bool PublicWorkerExit(std::string* detail) { return BuildOutputSharedCase("worker-exit-isolation", detail); }
+bool SameConnectionWorkerExit(std::string* detail) { return BuildOutputSharedCase("same-connection-worker-exit", detail); }
+bool PublicNSession(std::string* detail) { return BuildOutputSharedCase("n-session-n-pid", detail); }
+// Hard-link layout `<root>\<native-arch>\` of build outputs (no executable is
+// copied or written): the product's installed shape, where the broker derives
+// its install root from the architecture directory's parent.
+struct InstalledLayout {
+  std::filesystem::path root, arch_dir;
+  // Removal is best effort: Windows refuses to delete a hard-link name while
+  // another name of the file is a running image (this test's own exe, loaded
+  // DLLs), so leftovers are swept at the start of the next layout case.
+  ~InstalledLayout() {
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
   }
-  owner.connection.Close();
-  return unrelated.Reaped(1);
+  bool Create(std::string* detail) {
+    static std::atomic<unsigned> sequence{0};
+    std::error_code ec;
+    std::filesystem::remove_all(std::filesystem::path(ExecutableDirectory()) / L"layouts", ec);
+    root = std::filesystem::path(ExecutableDirectory()) / L"layouts" /
+        (L"il-" + std::to_wstring(::GetCurrentProcessId()) + L"-" + std::to_wstring(++sequence));
+    arch_dir = root / (v8host::kModuleMachine == IMAGE_FILE_MACHINE_ARM64 ? L"arm64" : L"x64");
+    std::filesystem::create_directories(arch_dir, ec);
+    if (ec) { *detail = "layout directory: " + ec.message(); return false; }
+    struct File { const wchar_t* name; bool required; };
+    for (const File& file : {File{L"v8host_broker_tests.exe", true}, File{L"sbox.exe", true}, File{L"v8host.dll", true},
+        File{L"v8jsisb.dll", true}, File{L"v8jsi.dll", false}, File{L"msvcp140.dll", false},
+        File{L"msvcp140_atomic_wait.dll", false}, File{L"vcruntime140.dll", false}, File{L"vcruntime140_1.dll", false}}) {
+      const auto source = std::filesystem::path(ExecutableDirectory()) / file.name;
+      if (!std::filesystem::exists(source, ec)) {
+        if (file.required) { *detail = "layout source missing: " + source.string(); return false; }
+        continue;
+      }
+      if (!::CreateHardLinkW((arch_dir / file.name).c_str(), source.c_str(), nullptr)) {
+        *detail = "layout hard link failed error=" + std::to_string(::GetLastError());
+        return false;
+      }
+    }
+    return true;
+  }
+};
+bool InstalledLayoutCase(const char* name, std::string* detail) {
+  InstalledLayout layout;
+  v8host::PayloadIdentity identity;
+  DWORD error = 0;
+  if (!layout.Create(detail)) return false;
+  // The architecture directory's parent is the install root (not the dev fallback).
+  if (!v8host::ResolvePayloadIdentity(layout.arch_dir.wstring(), L"sbox.exe", L"v8host.dll", &identity, &error)) {
+    *detail = "layout payload identity failed error=" + std::to_string(error);
+    return false;
+  }
+  // Final paths use the volume GUID instead of the drive letter: compare the tail.
+  const std::wstring want = layout.root.wstring().substr(2);
+  std::wstring derived = identity.install_root;
+  const bool root_matches = derived.size() >= want.size() &&
+      ::_wcsicmp(derived.c_str() + (derived.size() - want.size()), want.c_str()) == 0;
+  if (!root_matches) {
+    *detail = "install root was not derived from the architecture directory: got " +
+        std::string(derived.begin(), derived.end()) + " want " + layout.root.string();
+    return false;
+  }
+  std::printf("[layout] root=%ls arch_dir=%ls\n", layout.root.c_str(), layout.arch_dir.c_str());
+  return WaitForSharedBrokerRetired(detail) && BuildOutputPublicCase(name, detail, layout.arch_dir.wstring());
+}
+bool InstalledRealJs(std::string* detail) { return InstalledLayoutCase("real-js", detail); }
+bool InstalledDedicatedJs(std::string* detail) { return InstalledLayoutCase("real-dedicated-js", detail); }
+bool InstalledIdleRetirement(std::string* detail) { return InstalledLayoutCase("real-idle-lifecycle", detail); }
+bool PublicRealTrustedJs(std::string* detail) { return BuildOutputPublicCase("real-trusted-js", detail); }
+bool TimingSamples(std::string* detail) { return BuildOutputPublicCase("timing-samples", detail); }
+// Worker startup (run start to security_ready) for each tier; samples only, no threshold.
+bool TimingSamplesBody(std::string* detail) {
+  constexpr size_t kSamples = 10;
+  for (bool trusted : {false, true}) {
+    g_startup_ms.clear();
+    for (size_t i = 0; i < kSamples; ++i) {
+      if (!PublicRealJsMode(v8host_broker_mode_dedicated, detail, false, trusted)) return false;
+    }
+    if (g_startup_ms.size() < kSamples) { *detail = "missing startup samples"; return false; }
+    std::vector<ULONGLONG> sorted(g_startup_ms);
+    std::sort(sorted.begin(), sorted.end());
+    std::printf("[timing] tier=%s samples=%zu startup_ms min=%llu median=%llu p90=%llu max=%llu\n",
+        trusted ? "trusted" : "untrusted", sorted.size(), sorted.front(),
+        sorted[sorted.size() / 2], sorted[(sorted.size() * 9) / 10], sorted.back());
+  }
+  *detail = "worker startup samples for both tiers";
+  return true;
+}
+bool IsSharedLegacyCase(const std::string& name) {
+  for (const char* legacy : {"real-noncooperative-fallback", "real-idle-lifecycle", "real-inbound-aggregate",
+      "real-js", "real-dedicated-js", "real-cancel-and-profile", "broker-kill-no-replay", "disconnect-orderings",
+      "worker-exit-isolation", "same-connection-worker-exit", "n-session-n-pid", "real-trusted-js", "timing-samples"}) {
+    if (name == legacy) return true;
+  }
+  return false;
+}
+bool SharedLegacyBody(const std::string& name, std::string* detail) {
+  return name == "real-noncooperative-fallback" ? RealNoncooperativeFallbackBody(detail) :
+      name == "real-idle-lifecycle" ? RealIdleLifecycleBody(detail) :
+      name == "real-inbound-aggregate" ? RealInboundAggregateBody(detail) :
+      name == "real-js" ? PublicRealJsMode(v8host_broker_mode_shared, detail) :
+      name == "real-dedicated-js" ? PublicRealJsMode(v8host_broker_mode_dedicated, detail) :
+      name == "real-trusted-js" ? PublicRealJsMode(v8host_broker_mode_dedicated, detail, false, true) :
+      name == "timing-samples" ? TimingSamplesBody(detail) :
+      name == "real-cancel-and-profile" ? PublicRealCancelAndProfileBody(detail) :
+      name == "n-session-n-pid" ? PublicNSessionBody(detail) :
+      name == "worker-exit-isolation" ? PublicWorkerExitBody(detail) :
+      name == "same-connection-worker-exit" ? SameConnectionWorkerExitBody(detail) :
+      name == "disconnect-orderings" ? PublicDisconnectBody(detail) :
+      name == "broker-kill-no-replay" && PublicBrokerKillBody(detail);
 }
 
 }  // namespace
@@ -7153,7 +7223,7 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     if (std::strncmp(argv[i], "--public-child=", 15) != 0) continue;
     std::string name = argv[i] + 15, detail;
-    if (name == "build-output-child" || name == "real-lpac-session" ||
+    if (name == "build-output-child" || name == "real-lpac-session" || IsSharedLegacyCase(name) ||
         IsTopologyPublicCase(name) || name.rfind("launch-", 0) == 0) {
       BOOL in_job = FALSE;
       if (!::IsProcessInJob(::GetCurrentProcess(), nullptr, &in_job) || !in_job) return 9;
@@ -7177,6 +7247,10 @@ int main(int argc, char** argv) {
         std::printf("[public paths] exe=%ls plugin=%ls container=%ls\\sbox.exe engine=%ls\\v8jsisb.dll in_job=%d\n",
             image, plugin, directory.c_str(), directory.c_str(), in_job);
       }
+      if (IsSharedLegacyCase(name)) {
+        ok = ok && SharedLegacyBody(name, &detail);
+        std::printf("child/%s: %s - %s\n", name.c_str(), ok ? "PASS" : "FAIL", detail.c_str());
+      }
       if (IsTopologyPublicCase(name)) {
         ok = ok && TopologyPublicBody(name, &detail);
         std::printf("[public topology] %s: %s\n", name.c_str(), detail.c_str());
@@ -7184,19 +7258,8 @@ int main(int argc, char** argv) {
       std::printf("[public-child-result] %s: %s\n", name == "launch-wrong" ? "other" : name.c_str(), ok ? "PASS" : "FAIL");
       return ok ? 0 : 1;
     }
-    bool ok = name == "real-noncooperative-fallback" ? RealNoncooperativeFallbackBody(&detail) :
-        name == "real-idle-lifecycle" ? RealIdleLifecycleBody(&detail) :
-        name == "real-inbound-aggregate" ? RealInboundAggregateBody(&detail) :
-        name == "real-js" ? PublicRealJsMode(v8host_broker_mode_shared, &detail) :
-        name == "real-dedicated-js" ? PublicRealJsMode(v8host_broker_mode_dedicated, &detail) :
-        name == "real-cancel-and-profile" ? PublicRealCancelAndProfileBody(&detail) :
-        name == "n-session-n-pid" ? PublicNSessionBody(&detail) :
-        name == "worker-exit-isolation" ? PublicWorkerExitBody(&detail) :
-        name == "same-connection-worker-exit" ? SameConnectionWorkerExitBody(&detail) :
-        name == "disconnect-orderings" ? PublicDisconnectBody(&detail) :
-        name == "broker-kill-no-replay" && PublicBrokerKillBody(&detail);
-    std::printf("child/%s: %s - %s\n", name.c_str(), ok ? "PASS" : "FAIL", detail.c_str());
-    return ok ? 0 : 1;
+    std::printf("child/%s: FAIL - unknown public child\n", name.c_str());
+    return 1;
   }
   const std::vector<v8host::test::TestCase> tests = {
 #define TOPOLOGY_PUBLIC_REGISTER(fn, suite, name) {suite, name, fn},
@@ -7230,9 +7293,13 @@ int main(int argc, char** argv) {
       {"no-crosstalk", "same-connection-worker-exit", SameConnectionWorkerExit},
       {"worker-crash", "same-connection-worker-exit", SameConnectionWorkerExit},
       {"crash", "same-connection-worker-exit", SameConnectionWorkerExit},
-      {"client", "real-dll-isolation", PublicDllIsolation},
       {"client", "real-js", PublicRealJs},
       {"client", "real-dedicated-js", PublicRealDedicatedJs},
+      {"client", "real-trusted-js", PublicRealTrustedJs},
+      {"timing", "timing-samples", TimingSamples},
+      {"layout", "installed-real-js", InstalledRealJs},
+      {"layout", "installed-dedicated-js", InstalledDedicatedJs},
+      {"layout", "installed-idle-retirement", InstalledIdleRetirement},
       {"client", "real-cancel-and-profile", PublicRealCancelAndProfile},
       {"router", "discard-intake-ordering", DiscardIntakeOrdering},
       {"cancel", "terminal-before-fallback", TerminalBeforeFallback},

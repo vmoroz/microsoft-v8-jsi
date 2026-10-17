@@ -373,7 +373,12 @@ executable("v8host_dispatcher_tests") {
     "tests/v8host_test_support.cc",
     "tests/v8host_test_support.h",
   ]
-  deps = [ ":dispatcher" ]
+  # Without a manifest, Windows treats a 32-bit exe whose name contains "patch"
+  # (dis-patch-er) as an installer and demands elevation.
+  deps = [
+    ":dispatcher",
+    "//build/win:default_exe_manifest",
+  ]
   libs = [ "user32.lib" ]
 }
 
@@ -402,6 +407,16 @@ executable("v8host_client_tests") {
   libs = [ "user32.lib" ]
   # Real rendezvous cases use the adjacent broker and plugin.
   data_deps = [ ":v8host", "//sandbox_dll:sbox" ]
+}
+
+executable("v8host_cross_arch_tests") {
+  testonly = true
+  sources = [ "tests/v8host_cross_arch_tests.cc" ]
+  include_dirs = [ "//../../src/public" ]
+  libs = [
+    "bcrypt.lib",
+    "user32.lib",
+  ]
 }
 
 # Deterministic, in-process unit tests for the sbox_config builder: the
@@ -447,6 +462,27 @@ executable("v8host_spawn_config_tests") {
   # it on the include path so the test .cc (in tests/) can reach the lowering.
   include_dirs = [ "." ]
   defines = [ "SBOX_STATIC" ]
+}
+
+executable("v8host_layout_release_tests") {
+  testonly = true
+  # The identity code is compiled in here, not linked from :payload_identity,
+  # whose public config defines SBOX_DEV_ALLOW_UNSIGNED. This is the release policy.
+  sources = [
+    "common/v8host_file_identity.cc",
+    "common/v8host_file_identity.h",
+    "common/v8host_payload_identity.cc",
+    "common/v8host_payload_identity.h",
+    "tests/v8host_layout_release_tests.cc",
+    "tests/v8host_test_support.cc",
+    "tests/v8host_test_support.h",
+  ]
+  include_dirs = [ "common" ]
+  deps = [ ":protocol" ]
+  libs = [
+    "bcrypt.lib",
+    "wintrust.lib",
+  ]
 }
 
 # Deliberately invalid plugin used by the host-rejects-bad-plugin-abi case.

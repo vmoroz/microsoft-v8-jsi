@@ -93,6 +93,49 @@ bool DeriveInstallRoot(const std::wstring& container_final_path,
 #endif
 }
 
+bool QueryNativeMachine(uint16_t* machine) {
+  if (!machine)
+    return false;
+  using IsWow64Process2Fn = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
+  const HMODULE kernel32 = ::GetModuleHandleW(L"kernel32.dll");
+  const auto is_wow64_process2 = kernel32
+      ? reinterpret_cast<IsWow64Process2Fn>(
+            reinterpret_cast<void*>(::GetProcAddress(kernel32, "IsWow64Process2")))
+      : nullptr;
+  USHORT process_machine = 0;
+  USHORT native_machine = 0;
+  if (!is_wow64_process2 ||
+      !is_wow64_process2(::GetCurrentProcess(), &process_machine, &native_machine))
+    return false;
+  *machine = native_machine;
+  return true;
+}
+
+bool ResolveNativePayloadDirectory(const std::wstring& module_dir,
+                                   uint16_t module_machine,
+                                   uint16_t native_machine,
+                                   std::wstring* out) {
+  if (!out || module_dir.empty())
+    return false;
+  const wchar_t* native_arch = native_machine == IMAGE_FILE_MACHINE_AMD64   ? L"x64"
+                               : native_machine == IMAGE_FILE_MACHINE_ARM64 ? L"arm64"
+                                                                            : nullptr;
+  if (!native_arch)
+    return false;
+  if (module_machine == native_machine) {
+    *out = module_dir;
+    return true;
+  }
+  std::wstring dir = module_dir;
+  while (dir.size() > 1 && (dir.back() == L'\\' || dir.back() == L'/'))
+    dir.pop_back();
+  const std::wstring parent = ParentPath(dir);
+  if (parent.empty())
+    return false;
+  *out = parent + L"\\" + native_arch;
+  return true;
+}
+
 bool ResolvePayloadIdentity(const std::wstring& directory,
                             const std::wstring& container_name,
                             const std::wstring& plugin_name,

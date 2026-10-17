@@ -2636,10 +2636,77 @@ bool CacheEvictionStale(std::string* detail) {
   return true;
 }
 
+bool NativePayloadDirectory(std::string* detail) {
+  constexpr uint16_t kI386 = 0x014C, kAmd64 = 0x8664, kArm64 = 0xAA64;
+  struct Row {
+    uint16_t module, native;
+    const wchar_t* dir;
+    const wchar_t* expected;
+  };
+  const Row rows[] = {
+      {kAmd64, kAmd64, L"C:\\app\\x64", L"C:\\app\\x64"},
+      {kArm64, kArm64, L"C:\\app\\arm64", L"C:\\app\\arm64"},
+      {kI386, kAmd64, L"C:\\app\\x86", L"C:\\app\\x64"},
+      {kI386, kAmd64, L"C:\\app\\x86\\", L"C:\\app\\x64"},
+      {kAmd64, kArm64, L"C:\\app\\arm64ec", L"C:\\app\\arm64"},
+      {kAmd64, kArm64, L"C:\\app\\x64", L"C:\\app\\arm64"},
+      {kI386, kArm64, L"C:\\app\\x86", L"C:\\app\\arm64"},
+      {kI386, kAmd64, L"\\\\?\\C:\\app\\x86", L"\\\\?\\C:\\app\\x64"},
+      {kI386, kAmd64, L"\\\\server\\share\\app\\x86", L"\\\\server\\share\\app\\x64"},
+      {kI386, kAmd64, L"C:\\x86", L"C:\\x64"},
+  };
+  for (const Row& row : rows) {
+    std::wstring out = L"unchanged";
+    if (!v8host::ResolveNativePayloadDirectory(row.dir, row.module, row.native, &out) ||
+        out != row.expected)
+      return Fail(detail, "native payload directory mapping");
+  }
+  return true;
+}
+
+bool NativePayloadNoFallback(std::string* detail) {
+  constexpr uint16_t kI386 = 0x014C, kAmd64 = 0x8664, kArm64 = 0xAA64;
+  std::wstring out = L"unchanged";
+  // 32-bit Windows (native I386) and unknown machines have no payload: no fallback.
+  for (uint16_t native : {kI386, uint16_t{0}, uint16_t{0x01C4}}) {
+    for (uint16_t module : {kI386, kAmd64, kArm64}) {
+      if (v8host::ResolveNativePayloadDirectory(L"C:\\app\\x86", module, native, &out) ||
+          out != L"unchanged")
+        return Fail(detail, "non-x64/arm64 native machine resolved a payload");
+    }
+  }
+  // A cross-architecture client needs a parent directory; a null output or empty input fails.
+  if (v8host::ResolveNativePayloadDirectory(L"x86", kI386, kAmd64, &out) ||
+      v8host::ResolveNativePayloadDirectory(L"", kI386, kAmd64, &out) ||
+      v8host::ResolveNativePayloadDirectory(L"C:\\app\\x86", kI386, kAmd64, nullptr) ||
+      out != L"unchanged")
+    return Fail(detail, "missing parent, empty input, or null output accepted");
+  // The same-architecture case needs no parent.
+  return v8host::ResolveNativePayloadDirectory(L"x64", kAmd64, kAmd64, &out) && out == L"x64"
+      ? true : Fail(detail, "same-architecture directory changed");
+}
+
+bool NativeMachineMatchesBuild(std::string* detail) {
+  uint16_t native = 0;
+  if (!v8host::QueryNativeMachine(&native) || (native != 0x8664 && native != 0xAA64))
+    return Fail(detail, "native machine is not x64 or ARM64");
+  if (sizeof(void*) == 4 ? v8host::kModuleMachine != 0x014C
+                         : v8host::kModuleMachine != 0x8664 && v8host::kModuleMachine != 0xAA64)
+    return Fail(detail, "module machine does not match the pointer size");
+  std::wstring out;
+  if (!v8host::ResolveNativePayloadDirectory(L"C:\\app\\here", v8host::kModuleMachine, native, &out) ||
+      (v8host::kModuleMachine == native) != (out == L"C:\\app\\here"))
+    return Fail(detail, "resolution disagrees with the live machine pair");
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   const std::vector<TestCase> tests = {
+      {"layout", "native-payload-directory", NativePayloadDirectory},
+      {"layout", "native-payload-no-fallback", NativePayloadNoFallback},
+      {"layout", "native-machine-matches-build", NativeMachineMatchesBuild},
       {"vectors", "canonical-all-distinct-header", CanonicalAllDistinctHeader},
       {"vectors", "canonical-hello-header", CanonicalHelloHeader},
       {"vectors", "canonical-writer-payload", CanonicalWriterPayload},

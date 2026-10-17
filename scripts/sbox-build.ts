@@ -115,6 +115,7 @@ const options = {
   target: { type: "string" as const, default: "generic" },
   "target-cpu": { type: "string" as const, default: "x64" },
   "out-dir": { type: "string" as const },
+  "version-stamp": { type: "string" as const },
   "output-path": { type: "string" as const, default: "./out" },
 };
 
@@ -141,6 +142,9 @@ String arguments:
                   gn target_cpu: x64 | x86 | arm64 (default: x64). The host
                   clang cross-compiles all three targets.
   --out-dir <dir> gn/ninja output dir (default: deps/chromium/out/sandbox-<cpu>)
+  --version-stamp <n>
+                  Test-only VERSIONINFO stamp (integer 1..65535); omitted
+                  leaves the shipping resources unchanged.
   --output-path <dir>
                   Tools dir parent for BinSkim/nuget (default: ./out)
 
@@ -555,7 +559,7 @@ function toolchainRc(outDir: string, targetCpu: TargetCpu): { env: NodeJS.Proces
 // (rc.py) needs the hermetic rc binary + hermetic clang, neither of which the
 // pruned VS-clang sandbox tree carries — so we use the Windows SDK rc.exe
 // directly (see toolchainRc). VER_BINARY selects each binary's strings.
-function compileVersionResources(outDir: string, targetCpu: TargetCpu): void {
+function compileVersionResources(outDir: string, targetCpu: TargetCpu, versionStamp?: number): void {
   console.log("\n=== version resources (sbox.exe / v8host.dll) ===\n");
   const { env, rcExe } = toolchainRc(outDir, targetCpu);
 
@@ -568,7 +572,9 @@ function compileVersionResources(outDir: string, targetCpu: TargetCpu): void {
     console.log(`  rc ${b.name} (VER_BINARY=${b.verBinary}) -> ${path.basename(fresh)}`);
     execFileSync(
       rcExe,
-      ["/nologo", `/dVER_BINARY=${b.verBinary}`, `/fo${fresh}`, rcSource],
+      ["/nologo", `/dVER_BINARY=${b.verBinary}`,
+        ...(versionStamp === undefined ? [] : [`/dVER_TEST_STAMP=${versionStamp}`]),
+        `/fo${fresh}`, rcSource],
       { env, stdio: "inherit" },
     );
     installLinkInput(outDir, fresh, [b.binary]);
@@ -774,6 +780,13 @@ async function main(): Promise<void> {
   }
 
   const targetCpu = (args["target-cpu"] ?? "x64") as TargetCpu;
+  const stampText = args["version-stamp"];
+  const versionStamp = stampText === undefined ? undefined : Number(stampText);
+  if (stampText !== undefined &&
+      (!/^[0-9]+$/.test(stampText) || !Number.isInteger(versionStamp) ||
+       versionStamp! < 1 || versionStamp! > 65535)) {
+    floor("--version-stamp must be an integer in 1..65535.");
+  }
   if (!supportedTargetCpus.includes(targetCpu)) {
     floor(
       `--target-cpu must be one of ${supportedTargetCpus.join(" | ")} ` +
@@ -817,7 +830,7 @@ async function main(): Promise<void> {
       // Write each out-dir link input (the VERSIONINFO and Stela manifest .res
       // files, the SourceLink map) after gn gen has written the toolchain env
       // block, before ninja links; a changed input forces its binaries' relink.
-      compileVersionResources(outDir, targetCpu);
+      compileVersionResources(outDir, targetCpu, versionStamp);
       embedStelaManifests(outDir, targetCpu);
       generateSourceLink(outDir);
       ninjaBuild(tc.ninja, outDir, args.target ?? "generic");

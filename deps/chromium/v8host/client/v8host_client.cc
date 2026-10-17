@@ -5,6 +5,7 @@
 
 #include "v8host_client_transport.h"
 #include "v8host_dispatcher.h"
+#include "v8host_payload_identity.h"
 #include "v8host_protocol.h"
 #include "v8host_protocol_messages.h"
 
@@ -511,10 +512,15 @@ class ClientConnection final
                                              static_cast<DWORD>(path.size()));
       if (!len) return v8host_status_connect_failed;
       if (len < path.size()) {
-        params.payload_directory.assign(path.data(), len);
-        const size_t slash = params.payload_directory.find_last_of(L"\\/");
+        std::wstring module_dir(path.data(), len);
+        const size_t slash = module_dir.find_last_of(L"\\/");
         if (slash == std::wstring::npos) return v8host_status_connect_failed;
-        params.payload_directory.resize(slash);
+        module_dir.resize(slash);
+        uint16_t native_machine = 0;
+        if (!v8host::QueryNativeMachine(&native_machine) ||
+            !v8host::ResolveNativePayloadDirectory(module_dir, v8host::kModuleMachine,
+                                                   native_machine, &params.payload_directory))
+          return v8host_status_connect_failed;
         break;
       }
       if (path.size() >= 32768) return v8host_status_connect_failed;

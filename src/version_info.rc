@@ -44,6 +44,14 @@
 #define VER_FILETYPE         0x2L
 #endif
 
+#ifdef VER_TEST_STAMP
+#define VER_TEST_STRING_IMPL(n) #n
+#define VER_TEST_STRING(n) VER_TEST_STRING_IMPL(n)
+#define VER_DESCRIPTION VER_FILEDESCRIPTION " (test stamp " VER_TEST_STRING(VER_TEST_STAMP) ")"
+#else
+#define VER_DESCRIPTION VER_FILEDESCRIPTION
+#endif
+
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION VER_FILE_VERSION
  PRODUCTVERSION VER_FILE_VERSION
@@ -62,7 +70,7 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "Microsoft Corporation"
-            VALUE "FileDescription", VER_FILEDESCRIPTION
+            VALUE "FileDescription", VER_DESCRIPTION
             VALUE "FileVersion", VER_FILE_VERSION_STR
             VALUE "InternalName", VER_ORIGINALFILENAME
             VALUE "LegalCopyright", "\251 Microsoft Corporation. All rights reserved."

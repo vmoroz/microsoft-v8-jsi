@@ -43,6 +43,28 @@ bool ComputePluginSetId(uint16_t machine,
 bool DeriveInstallRoot(const std::wstring& container_final_path,
                        uint16_t machine,
                        std::wstring* out);
+// The machine this module was compiled for; a client DLL loaded by an x86
+// process is I386, by an x64 or ARM64EC process AMD64, by an ARM64 process ARM64.
+#if defined(_M_ARM64)
+constexpr uint16_t kModuleMachine = IMAGE_FILE_MACHINE_ARM64;
+#elif defined(_M_X64)
+constexpr uint16_t kModuleMachine = IMAGE_FILE_MACHINE_AMD64;
+#elif defined(_M_IX86)
+constexpr uint16_t kModuleMachine = IMAGE_FILE_MACHINE_I386;
+#else
+#error "unsupported client architecture"
+#endif
+// The OS native machine (IsWow64Process2); false if it can't be determined.
+bool QueryNativeMachine(uint16_t* machine);
+// Locates the directory of the native payload for a client DLL in
+// `module_dir`. A client of the native architecture uses its own directory;
+// any other client (x86 on x64, x64 or ARM64EC on ARM64) uses the sibling
+// `<parent>\<native-arch>`. Only x64 and ARM64 payloads exist: any other native
+// machine (32-bit Windows) fails, and there is no fallback.
+bool ResolveNativePayloadDirectory(const std::wstring& module_dir,
+                                   uint16_t module_machine,
+                                   uint16_t native_machine,
+                                   std::wstring* out);
 bool DeriveEndpoint(const std::vector<uint8_t>& sid,
                     const std::array<uint8_t, 32>& plugin_set_id,
                     BrokerMode mode,
