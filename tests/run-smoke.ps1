@@ -10,9 +10,9 @@
 # (utf8 round-trip, global property set/get, HostFunction call, JSError catch).
 #
 # -UseV8Sandbox additionally validates the sandbox package surface: it sets
-# /p:UseV8Sandbox=true (the package .targets add the sbox include dir +
-# sbox.dll.lib and copy v8jsisb.dll / sbox.dll / v8host.exe) and the EXE then
-# drives v8jsisb.dll through the JSI C++ API and links + loads sbox.dll. Use it
+# /p:UseV8Sandbox=true (the package .targets add the v8host include dir +
+# v8host.dll.lib and copy v8jsisb.dll / sbox.exe / v8host.dll) and the EXE then
+# drives v8jsisb.dll through JSI and runs a session through the client API. Use it
 # only when the restored package actually carries the sandbox binaries.
 #
 # Exit codes:

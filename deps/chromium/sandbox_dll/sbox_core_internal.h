@@ -113,13 +113,13 @@ typedef struct SboxPolicy {
 // read from one documented PEB field, which keeps the scheme independent of
 // where the image loads in either process.
 
-// --- broker role (used by the host, e.g. test_app.exe) ---
+// --- broker role (used by sbox.exe) ---
 // Spawn `target_exe` as a locked-down sandbox target per `policy`, wire the
 // broker<->target IPC channel, relay the bootstrap, run it to completion, and
 // return the target's exit code (0 = the target reported success).
 SBOX_CORE_API int sbox_broker_run(const wchar_t* target_exe, const SboxPolicy* policy);
 
-// Opaque handles (defined inside sbox.dll).
+// Opaque handles (defined inside the sbox core).
 typedef struct SboxTarget SboxTarget;
 
 // --- WebView2-style host<->target message channel (fire-and-forget, duplex) ---
@@ -193,7 +193,7 @@ SBOX_CORE_API int sbox_target_drain_messages(SboxTarget* target, SboxMessageCb c
 // the channel was not mapped.
 SBOX_CORE_API void* sbox_target_close_event(SboxTarget* target);
 
-// --- target role (used by the app-defined target EXE, e.g. v8host.exe) ---
+// --- target role (used by the sbox.exe worker) ---
 
 // Adopt the broker's same-image seed (written into this image's sandbox globals
 // while the process was suspended), init the sandbox target services, and stand

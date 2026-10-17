@@ -3,6 +3,9 @@
     <V8Platform Condition="'$(V8Platform)' == ''">$(Platform)</V8Platform>
     <!-- Fix platform name (win32 should be x86) -->
     <V8Platform Condition="'$(V8Platform)' == 'Win32'">x86</V8Platform>
+    <UseV8Sandbox Condition="'$(UseV8Sandbox)' == ''">False</UseV8Sandbox>
+    <V8JsiRuntimeIdentifier Condition="'$(V8JsiRuntimeIdentifier)' == '' AND '$(Platform)' == 'ARM64EC'">win-arm64</V8JsiRuntimeIdentifier>
+    <V8JsiRuntimeIdentifier Condition="'$(V8JsiRuntimeIdentifier)' == ''">win-$(V8Platform.ToLowerInvariant())</V8JsiRuntimeIdentifier>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <Link>
@@ -14,6 +17,24 @@
       <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
   </ItemDefinitionGroup>
+  <!-- The sandbox client is a normal import, never delay-loaded. Its payload
+       is staged under build\native\<rid>, independently of the legacy engine. -->
+  <ItemDefinitionGroup Condition="'$(UseV8Sandbox)' == 'True'">
+    <Link>
+      <AdditionalLibraryDirectories>$(MSBuildThisFileDirectory)$(V8JsiRuntimeIdentifier);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>v8host.dll.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)include\v8host;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup Condition="'$(UseV8Sandbox)' == 'True'">
+    <ReferenceCopyLocalPaths Include="$(MSBuildThisFileDirectory)$(V8JsiRuntimeIdentifier)\sbox.exe" />
+    <ReferenceCopyLocalPaths Include="$(MSBuildThisFileDirectory)$(V8JsiRuntimeIdentifier)\v8host.dll" />
+    <ReferenceCopyLocalPaths Include="$(MSBuildThisFileDirectory)$(V8JsiRuntimeIdentifier)\v8jsisb.dll" />
+    <None Include="$(MSBuildThisFileDirectory)$(V8JsiRuntimeIdentifier)\sbox.exe;$(MSBuildThisFileDirectory)$(V8JsiRuntimeIdentifier)\v8host.dll;$(MSBuildThisFileDirectory)$(V8JsiRuntimeIdentifier)\v8jsisb.dll"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
   <ItemGroup Condition="'$(V8JsiNoDLLCopy)' == ''">
     <ReferenceCopyLocalPaths Include="$(MSBuildThisFileDirectory)..\..\lib\win32\$(Configuration)\$(V8Platform)\v8jsi.dll" />
     <ReferenceCopyLocalPaths Include="$(MSBuildThisFileDirectory)..\..\lib\win32\$(Configuration)\$(V8Platform)\v8jsi.dll.pdb" />

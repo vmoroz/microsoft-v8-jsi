@@ -1,4 +1,4 @@
-// sbox.dll — the Chromium sandbox engine behind a generic, V8-agnostic C ABI.
+// The sbox core — the Chromium sandbox behind a generic, V8-agnostic C ABI.
 // One signed DLL, loaded by two different binaries: a broker host
 // (sbox_broker_*) and an app-defined target EXE (sbox_target_*). Contains NO
 // knowledge of v8jsi, JavaScript, jitless, or any guest engine — the target EXE
@@ -51,7 +51,7 @@
 #include "sbox_trust_transition_test_private.h"
 #endif
 
-// Hosted (decoupled-DLL) mode hooks. We are inside sbox.dll (linked with the
+// Hosted (decoupled-DLL) mode hooks. We are inside the sbox core (linked with the
 // sandbox engine), so we reference these vendored globals directly.
 namespace sandbox {
 extern bool g_sbox_hosted_mode;                  // sandbox_policy_base.cc
@@ -126,7 +126,7 @@ bool ValidPolicyExpectation(const SboxTrustTransitionPolicyExpectation& policy) 
 }
 #endif
 
-// Broker diagnostics: mirror to stdout (console harnesses like test_app) and to
+// Broker diagnostics: mirror to stdout (console test harnesses) and to
 // the debugger via OutputDebugString, so broker failures are visible from GUI
 // hosts that have no console. Capture with DebugView/DBWIN.
 void BrokerLog(const char* fmt, ...) {
@@ -393,7 +393,7 @@ bool ValidatePolicy(const wchar_t* target_exe, const SboxPolicy* policy) {
   return true;
 }
 
-// Base + SizeOfImage of our own sbox.dll in this process (diagnostics + the
+// Base + SizeOfImage of our own sbox.exe in this process (diagnostics + the
 // optional forced-relocation base-independence probe).
 uintptr_t MyDllBase() {
   return reinterpret_cast<uintptr_t>(CURRENT_MODULE());
@@ -407,7 +407,7 @@ DWORD MyDllSizeOfImage() {
   if (dos->e_magic != IMAGE_DOS_SIGNATURE)
     return 0;
   // v8-jsi: native IMAGE_NT_HEADERS (PE32 on x86, PE32+ on x64) — this reads
-  // our own sbox.dll image, always the build arch. (Was hardcoded ...64.)
+  // our own sbox.exe image, always the build arch. (Was hardcoded ...64.)
   auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
   if (nt->Signature != IMAGE_NT_SIGNATURE)
     return 0;
@@ -419,7 +419,7 @@ DWORD MyDllSizeOfImage() {
 // The old relay PE-parsed the suspended child's EXE export table to locate an
 // exported g_sbox_bootstrap, then WriteProcessMemory'd a bootstrap struct the
 // child copied into the sandbox globals. That existed ONLY because the broker
-// and target were DIFFERENT images (the target's sbox.dll was not yet mapped),
+// and target were DIFFERENT images (the target's sbox core was not yet mapped),
 // so the broker could not name the target's sandbox globals.
 //
 // In the single-image topology the broker and worker are the SAME image with
@@ -711,7 +711,7 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
   }
 
   // Hosted mode: the broker can't push into the suspended child's unmapped
-  // sbox.dll. Create the shared IPC section here (target->Init adopts it); after
+  // sbox.exe. Create the shared IPC section here (target->Init adopts it); after
   // the spawn we duplicate it + the message-channel handles into the child and
   // seed the values directly at their shared RVAs (same-image handoff).
   sandbox::g_sbox_hosted_mode = true;
@@ -926,7 +926,7 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
   }
 #endif
 
-  // Base-independence probe (see security note): force the child's sbox.dll to
+  // Base-independence probe (see security note): force the child's sbox.exe to
   // relocate when SBOX_FORCE_RELOCATE is set.
   if (::GetEnvironmentVariableW(L"SBOX_FORCE_RELOCATE", nullptr, 0) > 0) {
     uintptr_t host_base = MyDllBase();
@@ -1282,7 +1282,7 @@ SBOX_CORE_API int sbox_target_lower_token(SboxTarget* target) {
     return -1;
   // Install the ntdll interceptions while still privileged: ACG (applied by
   // LowerToken) forbids patching executable ntdll pages afterward. The broker
-  // can't install these remotely (our sbox.dll is a different binary, unmapped
+  // can't install these remotely (our sbox core is a different binary, unmapped
   // while we were suspended), so we patch our own.
   // The hosted public policy serializes file rules. An empty policy section
   // means the broker requested no file interceptions.

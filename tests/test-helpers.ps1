@@ -109,7 +109,7 @@ function Get-MSBuild {
 }
 
 # Build consumer.vcxproj against the restored package. -UseV8Sandbox opts into
-# the sandbox surface (sbox include + sbox.dll.lib, v8jsisb.dll/sbox.dll copied,
+# the sandbox surface (v8host include + v8host.dll.lib, all three binaries copied,
 # SMOKE_SANDBOX defined). Returns the path to the produced v8jsi_smoke.exe.
 function Build-Consumer {
     param(

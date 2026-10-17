@@ -1,6 +1,6 @@
 // sbox_harden.h — header-only DLL-load hardening helpers shared by the app
-// binaries (test_app.exe, v8host.exe). The sandbox engine is a swappable on-disk
-// DLL, so a planted sbox.dll would replace the broker. These helpers restrict
+// binaries (sbox.exe, v8host.dll). The engine is a swappable on-disk
+// DLL, so a planted v8host.dll would replace the plugin. These helpers restrict
 // the loader search path and verify Authenticode signatures.
 #ifndef SANDBOX_DLL_SBOX_HARDEN_H_
 #define SANDBOX_DLL_SBOX_HARDEN_H_

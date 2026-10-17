@@ -1,7 +1,7 @@
 // sbox_trust_transition_main.cc — the instrumented single-image trust-transition
 // test. ONE binary that is BOTH the sandbox broker/case-runner and the sandbox
 // worker/fault-harness, selected by argv, statically linking the same sandbox
-// core as sbox.dll (via sbox_dll.cc). It folds the former two-image suite (a
+// core as sbox.exe (via sbox_dll.cc). It folds the former two-image suite (a
 // separate case-runner EXE + a fault-injection target EXE joined by the retired
 // export-table relay) onto the same-image seed:
 //

@@ -1,5 +1,5 @@
 // msg_channel.h — the duplex message channel laid over a shared section. Used
-// only inside sbox.dll (both broker and target run the same DLL, so the layout
+// only inside the sbox core (broker and target run the same image, so the layout
 // is identical in both). Two single-producer/single-consumer slot rings:
 //   t2b: target -> broker     b2t: broker -> target
 // Each direction has an auto-reset event the PRODUCER signals after a post; the
