@@ -69,7 +69,38 @@ bool IsBareFilename(const std::string& name) {
   return true;
 }
 
+// Reads a u32 count (<= max) and that many payload-relative path strings.
+bool ReadRelativePaths(Reader& reader, uint32_t max, std::vector<std::string>* out) {
+  uint32_t count = 0;
+  if (!reader.GetU32(&count) || count > max)
+    return false;
+  out->resize(count);
+  for (std::string& path : *out) {
+    if (!reader.GetString(&path) || !IsPayloadRelativePath(path))
+      return false;
+  }
+  return true;
+}
+
 }  // namespace
+
+bool IsPayloadRelativePath(const std::string& path) {
+  if (path.empty() || path.front() == '/' || path.front() == '\\' ||
+      path.find(':') != std::string::npos)
+    return false;
+  size_t start = 0;
+  for (;;) {
+    const size_t end = path.find_first_of("/\\", start);
+    const std::string part =
+        path.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    if (part.empty() || part == "." || part == ".." || part.back() == '.' ||
+        part.back() == ' ')
+      return false;
+    if (end == std::string::npos)
+      return true;
+    start = end + 1;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // V8HostWorkerProfileV1
@@ -132,12 +163,92 @@ bool V8HostWorkerProfileV1::Decode(const uint8_t* data,
 }
 
 // ---------------------------------------------------------------------------
-// V8HostSpawnConfigV1
+// V8HostWorkerProfileV2
+// ---------------------------------------------------------------------------
+std::vector<uint8_t> V8HostWorkerProfileV2::Encode() const {
+  Writer var;
+  var.PutString(engine_dll);
+  var.PutU32(static_cast<uint32_t>(snapshot_paths.size()));
+  for (const std::string& path : snapshot_paths)
+    var.PutString(path);
+
+  Writer writer;
+  writer.PutU16(kWorkerProfileV2SchemaVersion);
+  writer.PutU16(kWorkerProfileV2FixedSize);
+  writer.PutU32(kWorkerProfileV2FixedSize + static_cast<uint32_t>(var.size()));
+  writer.PutU32(jitless ? 1u : 0u);
+  writer.PutU32(max_runtimes);
+  writer.PutBytes(var.buffer());
+  return writer.buffer();
+}
+
+bool V8HostWorkerProfileV2::Decode(const uint8_t* data,
+                                   size_t size,
+                                   V8HostWorkerProfileV2* out) {
+  Reader reader(data, size);
+  V8HostWorkerProfileV2 p;
+  uint16_t fixed_size = 0;
+  if (!ReadHeader(reader, size, kWorkerProfileV2SchemaVersion,
+                  kWorkerProfileV2FixedSize, kWorkerProfileMaxSize, &fixed_size))
+    return false;
+  uint32_t jitless_raw = 0;
+  bool jitless_bool = false;
+  if (!reader.GetU32(&jitless_raw) || !DecodeBool(jitless_raw, &jitless_bool))
+    return false;
+  p.jitless = jitless_bool ? 1u : 0u;
+  if (!reader.GetU32(&p.max_runtimes) || p.max_runtimes == 0 ||
+      p.max_runtimes > kWorkerProfileMaxRuntimes)
+    return false;
+  if (!reader.Skip(fixed_size - kWorkerProfileV2FixedSize))
+    return false;
+  if (!reader.GetString(&p.engine_dll) || !IsBareFilename(p.engine_dll))
+    return false;
+  if (!ReadRelativePaths(reader, kWorkerProfileMaxSnapshots, &p.snapshot_paths))
+    return false;
+  if (!reader.AtEnd())
+    return false;
+  *out = std::move(p);
+  return true;
+}
+
+bool DecodeWorkerProfile(const uint8_t* data, size_t size, V8HostWorkerProfile* out) {
+  if (data == nullptr || size < sizeof(uint16_t))
+    return false;
+  const uint16_t schema = static_cast<uint16_t>(data[0] | (data[1] << 8));
+  V8HostWorkerProfile profile;
+  if (schema == kWorkerProfileSchemaVersion) {
+    V8HostWorkerProfileV1 v1;
+    if (!V8HostWorkerProfileV1::Decode(data, size, &v1))
+      return false;
+    profile.jitless = v1.jitless != 0;
+    profile.engine_dll = std::move(v1.engine_dll);
+    if (!v1.snapshot_path.empty())
+      profile.snapshot_paths.push_back(std::move(v1.snapshot_path));
+  } else if (schema == kWorkerProfileV2SchemaVersion) {
+    V8HostWorkerProfileV2 v2;
+    if (!V8HostWorkerProfileV2::Decode(data, size, &v2))
+      return false;
+    profile.jitless = v2.jitless != 0;
+    profile.max_runtimes = v2.max_runtimes;
+    profile.engine_dll = std::move(v2.engine_dll);
+    profile.snapshot_paths = std::move(v2.snapshot_paths);
+    profile.snapshots_relative = true;
+    profile.precreate = false;
+  } else {
+    return false;
+  }
+  *out = std::move(profile);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// V8HostSpawnConfigV1 (schema 1 for sessions, schema 2 for explicit workers)
 // ---------------------------------------------------------------------------
 std::vector<uint8_t> V8HostSpawnConfigV1::Encode() const {
   // Encode the variable section first so total_size is known before the fixed
   // header is stamped. Encode trusts the caller's struct; the decoder is the
   // enforcement point for counts, booleans, strings, and cross-field rules.
+  const bool explicit_worker = max_runtimes != 0;
   Writer var;
   var.PutString(app_container_profile);
   for (const V8HostSpawnFileRule& rule : file_rules) {
@@ -148,13 +259,20 @@ std::vector<uint8_t> V8HostSpawnConfigV1::Encode() const {
     var.PutString(capability);
   var.PutString(engine_dll);
   var.PutString(snapshot_path);
+  if (explicit_worker) {
+    var.PutU32(static_cast<uint32_t>(snapshot_paths.size()));
+    for (const std::string& path : snapshot_paths)
+      var.PutString(path);
+  }
 
-  const uint32_t total_size =
-      kSpawnConfigFixedSize + static_cast<uint32_t>(var.size());
+  const uint16_t fixed_size =
+      explicit_worker ? kSpawnConfigV2FixedSize : kSpawnConfigFixedSize;
+  const uint32_t total_size = fixed_size + static_cast<uint32_t>(var.size());
 
   Writer writer;
-  writer.PutU16(kSpawnConfigSchemaVersion);
-  writer.PutU16(kSpawnConfigFixedSize);
+  writer.PutU16(explicit_worker ? kSpawnConfigV2SchemaVersion
+                                : kSpawnConfigSchemaVersion);
+  writer.PutU16(fixed_size);
   writer.PutU32(total_size);
   writer.PutU32(static_cast<uint32_t>(tier));
   writer.PutU32(static_cast<uint32_t>(integrity));
@@ -167,6 +285,8 @@ std::vector<uint8_t> V8HostSpawnConfigV1::Encode() const {
   writer.PutU32(static_cast<uint32_t>(effective_tier));
   writer.PutU32(static_cast<uint32_t>(file_rules.size()));
   writer.PutU32(static_cast<uint32_t>(capabilities.size()));
+  if (explicit_worker)
+    writer.PutU32(max_runtimes);
   writer.PutBytes(var.buffer());
   return writer.buffer();
 }
@@ -177,9 +297,17 @@ bool V8HostSpawnConfigV1::Decode(const uint8_t* data,
   Reader reader(data, size);
   V8HostSpawnConfigV1 p;
 
+  if (data == nullptr || size < sizeof(uint16_t))
+    return false;
+  const bool explicit_worker =
+      static_cast<uint16_t>(data[0] | (data[1] << 8)) == kSpawnConfigV2SchemaVersion;
+  const uint16_t known_fixed_size =
+      explicit_worker ? kSpawnConfigV2FixedSize : kSpawnConfigFixedSize;
   uint16_t fixed_size = 0;
-  if (!ReadHeader(reader, size, kSpawnConfigSchemaVersion, kSpawnConfigFixedSize,
-                  kSpawnConfigMaxSize, &fixed_size))
+  if (!ReadHeader(reader, size,
+                  explicit_worker ? kSpawnConfigV2SchemaVersion
+                                  : kSpawnConfigSchemaVersion,
+                  known_fixed_size, kSpawnConfigMaxSize, &fixed_size))
     return false;
 
   // Enum/token fields are transported as-is; the config builder validates them
@@ -210,10 +338,14 @@ bool V8HostSpawnConfigV1::Decode(const uint8_t* data,
   if (file_rule_count > protocol::kMaxFileRules ||
       capability_count > protocol::kMaxCapabilities)
     return false;
+  if (explicit_worker &&
+      (!reader.GetU32(&p.max_runtimes) || p.max_runtimes == 0 ||
+       p.max_runtimes > kWorkerProfileMaxRuntimes))
+    return false;
 
   // Forward-compat: skip any additive fixed fields to reach the variable
   // section, which starts at fixed_size.
-  if (!reader.Skip(fixed_size - kSpawnConfigFixedSize))
+  if (!reader.Skip(fixed_size - known_fixed_size))
     return false;
 
   if (!reader.GetString(&p.app_container_profile))
@@ -234,6 +366,12 @@ bool V8HostSpawnConfigV1::Decode(const uint8_t* data,
   if (!reader.GetString(&p.engine_dll))
     return false;
   if (!reader.GetString(&p.snapshot_path))
+    return false;
+  // An explicit worker names its snapshots in its own list, never in the
+  // session's single snapshot_path.
+  if (explicit_worker &&
+      (!p.snapshot_path.empty() ||
+       !ReadRelativePaths(reader, kWorkerProfileMaxSnapshots, &p.snapshot_paths)))
     return false;
 
   // Cross-field policy rules (design §8.5), fail-closed.

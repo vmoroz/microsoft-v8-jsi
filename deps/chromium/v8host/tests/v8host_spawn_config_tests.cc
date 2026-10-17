@@ -32,6 +32,7 @@ using v8host::test::TestCase;
 using v8host::V8HostSpawnConfigV1;
 using v8host::V8HostSpawnFileRule;
 using v8host::V8HostWorkerProfileV1;
+using v8host::V8HostWorkerProfileV2;
 
 #define CHECK(cond, msg) \
   do {                   \
@@ -115,7 +116,8 @@ bool SameSpawnConfig(const V8HostSpawnConfigV1& a,
       a.low_privilege_app_container != b.low_privilege_app_container ||
       a.app_container_profile != b.app_container_profile ||
       a.effective_tier != b.effective_tier || a.engine_dll != b.engine_dll ||
-      a.snapshot_path != b.snapshot_path)
+      a.snapshot_path != b.snapshot_path || a.max_runtimes != b.max_runtimes ||
+      a.snapshot_paths != b.snapshot_paths)
     return false;
   if (a.file_rules.size() != b.file_rules.size() ||
       a.capabilities != b.capabilities)
@@ -803,6 +805,206 @@ bool ApplyLowersNonDefaultTokens(std::string* detail) {
   return true;
 }
 
+bool SameWorkerProfileV2(const V8HostWorkerProfileV2& a,
+                         const V8HostWorkerProfileV2& b) {
+  return a.jitless == b.jitless && a.max_runtimes == b.max_runtimes &&
+         a.engine_dll == b.engine_dll && a.snapshot_paths == b.snapshot_paths;
+}
+
+void PatchTotalSize(std::vector<uint8_t>& bytes) {
+  const uint32_t total = static_cast<uint32_t>(bytes.size());
+  for (size_t i = 0; i < 4; ++i)
+    bytes[4 + i] = static_cast<uint8_t>(total >> (8 * i));
+}
+
+bool WorkerV2CanonicalAndBounds(std::string* detail) {
+  V8HostWorkerProfileV2 p;
+  p.jitless = 1;
+  p.max_runtimes = 2;
+  p.engine_dll = "v8jsisb.dll";
+  p.snapshot_paths = {"snap\\a.bin"};
+  // 16 fixed + (4 + 11) engine + 4 count + (4 + 10) snapshot = 49.
+  const uint8_t canonical[] = {
+      0x02, 0x00, 0x10, 0x00, 0x31, 0x00, 0x00, 0x00,
+      0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+      0x0B, 0x00, 0x00, 0x00,
+      0x76, 0x38, 0x6A, 0x73, 0x69, 0x73, 0x62, 0x2E, 0x64, 0x6C, 0x6C,
+      0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00,
+      0x73, 0x6E, 0x61, 0x70, 0x5C, 0x61, 0x2E, 0x62, 0x69, 0x6E};
+  CHECK(CheckBytes("worker-v2", p.Encode(), canonical, sizeof(canonical), detail),
+        detail->c_str());
+  V8HostWorkerProfileV2 out;
+  CHECK(V8HostWorkerProfileV2::Decode(canonical, sizeof(canonical), &out) &&
+            SameWorkerProfileV2(p, out), "canonical V2 decode mismatch");
+  auto decode = [&](const std::vector<uint8_t>& bytes) {
+    return V8HostWorkerProfileV2::Decode(bytes.data(), bytes.size(), &out);
+  };
+  auto accepts = [&](const V8HostWorkerProfileV2& value) {
+    return decode(value.Encode());
+  };
+  for (uint32_t count : {0u, 8u, 9u}) {
+    auto value = p;
+    value.snapshot_paths.assign(count, "snap\\a.bin");
+    CHECK(accepts(value) == (count <= 8), "V2 snapshot count bounds");
+    if (count <= 8)
+      CHECK(SameWorkerProfileV2(value, out), "V2 snapshot count round-trip");
+  }
+  for (uint32_t max : {0u, 1u, 16u, 17u}) {
+    auto value = p;
+    value.max_runtimes = max;
+    CHECK(accepts(value) == (max == 1 || max == 16), "V2 runtime count bounds");
+    if (max == 1 || max == 16)
+      CHECK(SameWorkerProfileV2(value, out), "V2 runtime count round-trip");
+  }
+  auto bytes = p.Encode();
+  bytes[0] = 3;
+  CHECK(!decode(bytes), "V2 bad schema accepted");
+  bytes = p.Encode();
+  bytes[2] = 15;
+  CHECK(!decode(bytes), "V2 short fixed section accepted");
+  bytes = p.Encode();
+  bytes[4] ^= 1;
+  CHECK(!decode(bytes), "V2 total mismatch accepted");
+  bytes = p.Encode();
+  bytes[8] = 2;
+  CHECK(!decode(bytes), "V2 non-boolean jitless accepted");
+  bytes = p.Encode();
+  for (size_t n = 0; n < bytes.size(); ++n)
+    CHECK(!V8HostWorkerProfileV2::Decode(bytes.data(), n, &out),
+          "V2 truncated prefix accepted");
+  bytes.push_back(0);
+  PatchTotalSize(bytes);
+  CHECK(!decode(bytes), "V2 trailing byte accepted");
+
+  auto large = p;
+  large.snapshot_paths = {""};
+  const size_t overhead = large.Encode().size();
+  large.snapshot_paths[0].assign(4096 - overhead, 's');
+  CHECK(large.snapshot_paths[0].size() <= v8host::protocol::kMaxStringBytes,
+        "boundary fixture exceeds string limit");
+  bytes = large.Encode();
+  CHECK(bytes.size() == 4096 && decode(bytes) && SameWorkerProfileV2(large, out),
+        "V2 exactly 4096 rejected");
+  large.snapshot_paths[0].push_back('s');
+  bytes = large.Encode();
+  CHECK(bytes.size() == 4097 && !decode(bytes), "V2 4097 accepted");
+
+  for (const std::string path :
+       {std::string(1, char(0x80)), std::string("a\0b", 3)}) {
+    auto value = p;
+    value.snapshot_paths = {path};
+    CHECK(!accepts(value), "V2 invalid UTF8/NUL snapshot accepted");
+  }
+  for (const char* engine : {"sub\\v8.dll", "C:v8.dll", "", "."}) {
+    auto value = p;
+    value.engine_dll = engine;
+    CHECK(!accepts(value), "V2 non-bare engine accepted");
+  }
+  for (const char* path :
+       {"C:\\x", "\\x", "/x", "a\\..\\b", "a\\.\\b", "a.", "a ", "a\\\\b"}) {
+    auto value = p;
+    value.snapshot_paths = {path};
+    CHECK(!accepts(value), std::string("V2 non-relative snapshot accepted: ") + path);
+  }
+  bytes = p.Encode();
+  bytes.insert(bytes.begin() + 16, {0xAA, 0xBB, 0xCC, 0xDD});
+  bytes[2] = 20;
+  PatchTotalSize(bytes);
+  CHECK(decode(bytes) && SameWorkerProfileV2(p, out), "V2 forward-compat mismatch");
+  return true;
+}
+
+bool WorkerDecodeCommonProfile(std::string* detail) {
+  v8host::V8HostWorkerProfile out;
+  for (bool snapshot : {false, true}) {
+    auto p = SampleWorkerProfile();
+    if (!snapshot)
+      p.snapshot_path.clear();
+    const auto bytes = p.Encode();
+    CHECK(v8host::DecodeWorkerProfile(bytes.data(), bytes.size(), &out),
+          "common V1 decode");
+    const std::vector<std::string> snapshots =
+        snapshot ? std::vector<std::string>{p.snapshot_path} : std::vector<std::string>{};
+    CHECK(out.jitless == (p.jitless != 0) && out.engine_dll == p.engine_dll &&
+              out.max_runtimes == 1 && out.precreate && !out.snapshots_relative &&
+              out.snapshot_paths == snapshots, "common V1 fields");
+  }
+  V8HostWorkerProfileV2 p;
+  p.jitless = 0;
+  p.max_runtimes = 4;
+  p.engine_dll = "v8jsi.dll";
+  p.snapshot_paths = {"snap\\a.bin", "snap\\b.bin"};
+  auto bytes = p.Encode();
+  CHECK(v8host::DecodeWorkerProfile(bytes.data(), bytes.size(), &out) &&
+            !out.jitless && out.engine_dll == p.engine_dll &&
+            out.max_runtimes == p.max_runtimes && !out.precreate &&
+            out.snapshots_relative && out.snapshot_paths == p.snapshot_paths,
+        "common V2 fields");
+  bytes[0] = 3;
+  CHECK(!v8host::DecodeWorkerProfile(bytes.data(), bytes.size(), &out),
+        "common unknown schema accepted");
+  return true;
+}
+
+bool SpawnExplicitWorkerSchema2(std::string* detail) {
+  auto s = CanonicalSpawnConfig();
+  s.max_runtimes = 4;
+  s.snapshot_paths = {"snap\\a.bin", "snap\\b.bin"};
+  auto bytes = s.Encode();
+  CHECK(bytes[0] == 2 && bytes[1] == 0 && bytes[2] == 56 && bytes[3] == 0 &&
+            bytes[52] == 4 && bytes[53] == 0 && bytes[54] == 0 && bytes[55] == 0,
+        "spawn schema2 layout");
+  V8HostSpawnConfigV1 out;
+  auto decode = [&](const std::vector<uint8_t>& blob) {
+    return V8HostSpawnConfigV1::Decode(blob.data(), blob.size(), &out);
+  };
+  CHECK(decode(bytes) && SameSpawnConfig(s, out), "spawn schema2 round-trip");
+  auto session = s;
+  session.max_runtimes = 0;
+  CHECK(CheckBytes("session unchanged", session.Encode(), kSpawnConfigVector,
+                   sizeof(kSpawnConfigVector), detail), detail->c_str());
+  for (uint8_t max : {uint8_t{0}, uint8_t{17}}) {
+    auto bad = bytes;
+    bad[52] = max;
+    CHECK(!decode(bad), "spawn schema2 invalid max accepted");
+  }
+  auto bad = s;
+  bad.snapshot_path = "session.bin";
+  CHECK(!decode(bad.Encode()), "spawn schema2 session snapshot accepted");
+  bad = s;
+  bad.snapshot_paths.assign(9, "snap.bin");
+  CHECK(!decode(bad.Encode()), "spawn schema2 nine snapshots accepted");
+  bad = s;
+  bad.snapshot_paths = {"a\\..\\b"};
+  CHECK(!decode(bad.Encode()), "spawn schema2 non-relative snapshot accepted");
+  return true;
+}
+
+bool ApplyExplicitWorkerProfileV2(std::string* detail) {
+  auto s = SampleSpawnConfig();
+  s.max_runtimes = 3;
+  s.snapshot_path.clear();
+  s.snapshot_paths = {"snap\\a.bin"};
+  const sbox_config_api api = MakeConfigApi();
+  sbox_config_s cfg;
+  CHECK(v8host::ApplySpawnConfig(s, &api, &cfg) && !cfg.invalid,
+        "apply explicit worker failed");
+  const auto* data = reinterpret_cast<const uint8_t*>(cfg.plugin_data.data());
+  V8HostWorkerProfileV2 out;
+  CHECK(V8HostWorkerProfileV2::Decode(data, cfg.plugin_data.size(), &out) &&
+            out.jitless == 1 && out.max_runtimes == s.max_runtimes &&
+            out.engine_dll == s.engine_dll && out.snapshot_paths == s.snapshot_paths,
+        "apply explicit V2 profile mismatch");
+  v8host::V8HostWorkerProfile common;
+  CHECK(v8host::DecodeWorkerProfile(data, cfg.plugin_data.size(), &common) &&
+            common.jitless && common.max_runtimes == s.max_runtimes &&
+            common.engine_dll == s.engine_dll &&
+            common.snapshot_paths == s.snapshot_paths &&
+            common.snapshots_relative && !common.precreate,
+        "apply common profile mismatch");
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -837,6 +1039,10 @@ int main(int argc, char** argv) {
       {"apply", "fails-closed-on-bad-setter", ApplyFailsClosedOnBadSetter},
       {"apply", "null-args", ApplyNullArgs},
       {"apply", "lowers-non-default-tokens", ApplyLowersNonDefaultTokens},
+      {"codec-worker-v2", "canonical-and-bounds", WorkerV2CanonicalAndBounds},
+      {"codec-worker-v2", "decode-common-profile", WorkerDecodeCommonProfile},
+      {"codec-spawn", "explicit-worker-schema2", SpawnExplicitWorkerSchema2},
+      {"apply", "explicit-worker-profile-v2", ApplyExplicitWorkerProfileV2},
   };
   return v8host::test::RunTests(argc, argv, tests);
 }

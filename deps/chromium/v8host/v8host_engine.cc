@@ -9,19 +9,25 @@
 //
 //   configure  BROKER        : decode the V8HostSpawnConfigV1 (session envelope +
 //                              effective worker profile), drive every sbox config
-//                              setter, and encode the V8HostWorkerProfileV1
-//                              (engine DLL, jitless, optional snapshot) into
-//                              opaque plugin_data.
+//                              setter, and encode the worker profile (V1 for a
+//                              session, V2 for an explicit worker) into opaque
+//                              plugin_data.
 //   warmup     PRE-lockdown  : decode plugin_data, load the engine DLL, set
-//                              --jitless, (optional) startup snapshot, read the
-//                              guest JS, create the JSI runtime, install `host`.
+//                              --jitless, read the startup snapshots and the
+//                              guest JS, and set V8 up with a throwaway runtime
+//                              on this thread. A V1 (session) worker also
+//                              creates its one runtime here, on its own thread.
 //                              All codegen/patching happens HERE — ACG forbids it
 //                              afterward.
 //   (sbox.exe lowers the token here: ACG armed)
-//   run        POST-lockdown : evaluate the guest (interpreted under jitless, safe
-//                              post-ACG), then own the JS thread in the message
-//                              loop until the host closes the channel.
-//   shutdown                 : tear down the runtime + engine handle.
+//   run        POST-lockdown : prove ACG, then own the channel: this thread is the
+//                              only one that drains or posts. It routes each
+//                              envelope to its runtime slot, creates and closes
+//                              runtimes on demand (each on its own thread), and
+//                              posts their output in order until the host closes
+//                              the channel. Then it joins the runtime threads
+//                              (1 s in total) and disposes the V8 platform.
+//   shutdown                 : tear down the runtimes + engine handle.
 //
 // IMPORTANT: this drives v8jsi through the **JSI C++ API** (facebook::jsi via
 // JsiAbiRuntime), NOT the raw ABI-safe C interface. The C ABI is the binary-
@@ -44,6 +50,8 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -78,7 +86,6 @@ sbox_worker g_worker = nullptr;          // the worker run context (opaque)
 const sbox_worker_api* g_api = nullptr;  // worker services (message channel)
 
 HMODULE g_engine = nullptr;                // the loaded engine DLL
-Runtime* g_rt = nullptr;                   // owned; deleted in shutdown
 std::string g_guest_src;                   // guest source, read pre-lockdown
 bool g_use_guest_file = false;             // custom guest vs. built-in demo
 
@@ -260,18 +267,18 @@ struct Perf {
 };
 
 Perf g_perf;
-LONGLONG g_first_post_qpc = 0;
+std::atomic<LONGLONG> g_first_post_qpc{0};
 inline void MarkFirstPost() {
-  if (g_first_post_qpc == 0)
-    g_first_post_qpc = g_perf.now();
+  LONGLONG expected = 0;
+  g_first_post_qpc.compare_exchange_strong(expected, g_perf.now());
 }
 
 //==========================================================================
 // Foreground task runner (wired into the JSI config via the C ABI seam).
 //
 // V8 may post foreground tasks (from background workers, the inspector, etc.).
-// We own the JS thread, so the task runner just enqueues onto a thread-safe
-// queue and wakes the loop; the loop runs them on the JS thread.
+// Each runtime owns its thread, so its task runner just enqueues onto a
+// thread-safe queue and wakes that thread; the thread runs them.
 //==========================================================================
 
 struct CTask {
@@ -284,12 +291,8 @@ struct CTask {
 struct TaskQueue {
   CRITICAL_SECTION cs;
   std::vector<CTask> tasks;
-  HANDLE wake = nullptr;  // auto-reset; signaled when a task is posted
+  HANDLE wake = nullptr;  // auto-reset, not owned; signaled when a task is posted
 };
-
-// Heap-allocated in warmup, freed in shutdown; held as a pointer so there is no
-// exit-time destructor racing the runtime teardown.
-TaskQueue* g_tasks = nullptr;
 
 // Called by the DLL (possibly on a background thread) to post a foreground task.
 void JSI_ABI_CDECL PostTaskCb(void* runner_data, void* task_data,
@@ -303,9 +306,9 @@ void JSI_ABI_CDECL PostTaskCb(void* runner_data, void* task_data,
   ::SetEvent(q->wake);
 }
 
-// Called when the runtime is destroyed. runner_data points at g_tasks (process
-// lifetime) so we don't free it — but fire the delete cb of any task still
-// queued so nothing leaks.
+// Called when the runtime is destroyed. runner_data points at a queue that
+// outlives the runtime, so we don't free it — but fire the delete cb of any
+// task still queued so nothing leaks.
 void JSI_ABI_CDECL TaskRunnerDeleteCb(void* /*delete_data*/, void* runner_data) {
   auto* q = static_cast<TaskQueue*>(runner_data);
   ::EnterCriticalSection(&q->cs);
@@ -316,7 +319,7 @@ void JSI_ABI_CDECL TaskRunnerDeleteCb(void* /*delete_data*/, void* runner_data) 
   ::LeaveCriticalSection(&q->cs);
 }
 
-// Run (and free) all queued foreground tasks on the JS thread.
+// Run (and free) all queued foreground tasks on the runtime's thread.
 void RunQueuedTasks(TaskQueue* q) {
   std::vector<CTask> local;
   ::EnterCriticalSection(&q->cs);
@@ -330,17 +333,20 @@ void RunQueuedTasks(TaskQueue* q) {
   }
 }
 
-// Resolved v8jsi config setters (called inside the configure callback, which
-// runs synchronously during v8_jsi_abi_runtime_create). Set before create.
+// Resolved v8jsi entry points, set in warmup before the first runtime.
 v8_jsi_abi_config_set_task_runner_fn g_set_task_runner = nullptr;
 v8_jsi_abi_config_set_explicit_microtask_policy_fn g_set_microtask = nullptr;
 v8_jsi_abi_config_set_startup_snapshot_fn g_set_snapshot = nullptr;
+v8_jsi_abi_runtime_create_fn g_runtime_create = nullptr;
+// Optional: stops V8's platform threads once every runtime is gone.
+using DisposePlatformFn = int(__cdecl*)(void);
+DisposePlatformFn g_dispose_platform = nullptr;
 
-// Optional startup-snapshot blob (V8HOST_SNAPSHOT), read pre-lockdown. Held for
-// the process lifetime so the bytes outlive the runtime; passed to the config
-// with a NULL deleter (this DLL owns them, not the runtime).
-std::string g_snapshot_blob;
-bool g_have_snapshot = false;
+// The worker profile and its startup snapshots, read pre-lockdown. Each blob is
+// kept for the process lifetime so it outlives every runtime created from it; a
+// runtime borrows it through the config with a NULL deleter.
+v8host::V8HostWorkerProfile g_profile;
+std::vector<std::string> g_snapshots;
 
 // Whether ACG must be in force post-lockdown. Stashed in warmup from the bound
 // worker profile's jitless tier: untrusted (jitless) => ACG enforced; trusted
@@ -348,112 +354,263 @@ bool g_have_snapshot = false;
 // is not failed for (correctly) being allowed to allocate executable memory.
 bool g_expect_acg = true;
 
-// Per-run dispatch state (mutated only on the JS thread). A coordinator START
-// envelope makes a run active; the dev-ambient path (the `sbox.exe --broker`
-// smoke) keeps this 0 so guest output posts bare and inbound bare frames reach
-// host.onmessage exactly as before. g_run_complete_requested is set by the
-// neutral host.complete() and consumed by the run loop to emit a single
-// RESULT(kCompleted).
-uint32_t g_active_run_id = 0;
-bool g_run_complete_requested = false;
+struct RuntimeConfig {
+  TaskQueue* tasks = nullptr;
+  const std::string* snapshot = nullptr;
+};
 
-jsi_status JSI_ABI_CDECL ConfigureRuntime(void* /*user_data*/, jsi_config cfg) {
+jsi_status JSI_ABI_CDECL ConfigureRuntime(void* user_data, jsi_config cfg) {
+  const auto* config = static_cast<const RuntimeConfig*>(user_data);
   // A failing setter poisons the config, so runtime creation reports it; the
   // individual statuses need no separate check here.
   if (g_set_task_runner)
-    g_set_task_runner(cfg, &PostTaskCb, g_tasks, &TaskRunnerDeleteCb, nullptr);
-  // Explicit microtask policy: promise jobs run only when we drain them on the
-  // JS thread (after each loop turn), giving the host deterministic control.
+    g_set_task_runner(cfg, &PostTaskCb, config->tasks, &TaskRunnerDeleteCb, nullptr);
+  // Explicit microtask policy: promise jobs run only when the runtime's thread
+  // drains them (after each turn), giving the host deterministic control.
   if (g_set_microtask)
     g_set_microtask(cfg, true);
-  // If a startup snapshot was supplied, hand the engine the blob so the isolate
-  // is created from it. NULL deleter: g_snapshot_blob (process-lifetime) owns
-  // the bytes.
-  if (g_have_snapshot && g_set_snapshot)
-    g_set_snapshot(cfg, reinterpret_cast<const uint8_t*>(g_snapshot_blob.data()),
-                   g_snapshot_blob.size(), nullptr, nullptr);
+  // A chosen snapshot creates the isolate from the worker's preloaded blob.
+  if (config->snapshot && g_set_snapshot)
+    g_set_snapshot(cfg, reinterpret_cast<const uint8_t*>(config->snapshot->data()),
+                   config->snapshot->size(), nullptr, nullptr);
   return jsi_status_ok;
 }
 
-//==========================================================================
-// Private run-envelope plumbing (design §10). The worker channel carries opaque
-// string/binary frames; a coordinator-driven run multiplexes per-run control
-// through the neutral run-envelope codec that rides those frames. The guest can
-// never set env_type: the engine (trusted) wraps all guest output as RELAY and
-// emits RESULT/RUN_ERROR itself. The dev-ambient path (no active run) stays bare.
-//==========================================================================
-
-// Post an encoded envelope frame on the worker channel. The carrier kind is
-// binary; the coordinator decodes any string/binary frame as an envelope
-// (design §8.3), so the carrier kind is not itself semantic.
-sbox_status PostEnvelope(const v8host::RunEnvelope& env) {
-  const std::vector<uint8_t> frame = v8host::EncodeRunEnvelope(env);
-  return g_api->post_message(g_worker, sbox_msg_kind_binary, frame.data(),
-                             frame.size());
+// Throws (the JSI C++ API does); callers catch.
+std::unique_ptr<Runtime> CreateRuntime(RuntimeConfig* config) {
+  return jsi::abi::makeJsiAbiRuntime(g_runtime_create, &ConfigureRuntime, config);
 }
 
+//==========================================================================
+// Runtime slots. A worker hosts up to max_runtimes runtimes, each in a fixed
+// slot (the envelope's slot field) on its own thread. The main thread owns the
+// table and is the only thread that touches the channel: it routes each inbound
+// frame into its slot's inbox and posts each slot's outbox in order. A runtime
+// thread touches only its own slot, under that slot's lock.
+//==========================================================================
+
+// Runtime threads get the container main thread's stack reserve.
+constexpr SIZE_T kRuntimeStackReserve = 1u << 20;
+// Guest output frames a runtime may have waiting for the main thread before
+// host.postMessage blocks.
+constexpr uint32_t kGuestOutboxWindow = v8host::kRelayCreditWindow;
+// One deadline for joining every runtime thread at shutdown.
+constexpr DWORD kRuntimeJoinBudgetMs = 1000;
+// The worker's exit code when a runtime thread outlives that deadline (it
+// follows the container's worker exit codes, 10..17).
+constexpr UINT kRunawayExitCode = 18;
+
+struct OutFrame {
+  sbox_msg_kind kind = sbox_msg_kind_binary;
+  std::vector<uint8_t> bytes;
+  bool guest = false;  // guest output counts toward kGuestOutboxWindow
+};
+
+struct InboxItem {
+  enum class Kind { kFrame, kEvalGuest, kTestBatch };
+  Kind kind = Kind::kFrame;
+  sbox_msg_kind frame_kind = sbox_msg_kind_binary;
+  std::vector<uint8_t> bytes;
+  void* test = nullptr;
+};
+
+enum class SlotState { kEmpty, kRunning, kExited };
+
+struct Slot {
+  uint16_t index = 0;
+  // Main-thread state.
+  SlotState state = SlotState::kEmpty;
+  HANDLE thread = nullptr;
+  bool host_closed = false;  // CLOSE_RUNTIME routed: RUNTIME_CLOSED reports ok
+  bool used = false;  // has held a runtime: late frames may cross RUNTIME_CLOSED
+  // Set before the thread starts; read-only while it runs.
+  int32_t snapshot_index = -1;
+  bool precreated = false;
+  // Shared with the runtime thread, under cs.
+  CRITICAL_SECTION cs;
+  HANDLE wake = nullptr;   // auto-reset: inbox item, task, or close
+  HANDLE space = nullptr;  // auto-reset: outbox space, a cancel, or close
+  HANDLE ready = nullptr;  // manual-reset: the runtime exists
+  TaskQueue tasks;
+  std::deque<InboxItem> inbox;
+  std::deque<OutFrame> outbox;
+  uint32_t outbox_guest = 0;
+  uint32_t credit_owed = 0;
+  uint32_t cancel_run_id = 0;  // the latest CANCEL routed to this slot
+  bool closing = false;
+  bool failed = false;       // creation failed, or the thread failed
+  bool test_direct = false;  // testing: no main thread drains the outbox
+  // Runtime-thread counters, read by the main thread after the join.
+  int ambient_strings = 0, ambient_binaries = 0;
+};
+
+std::array<Slot*, v8host::kMaxRuntimeSlots> g_slots{};
+size_t g_slot_count = 0;
+HANDLE g_main_wake = nullptr;  // auto-reset: some slot has output, credit, or ended
+
+void Wake(HANDLE event) {
+  if (event)
+    ::SetEvent(event);
+}
+
+void PushInbox(Slot& s, InboxItem&& item) {
+  ::EnterCriticalSection(&s.cs);
+  s.inbox.push_back(std::move(item));
+  ::LeaveCriticalSection(&s.cs);
+  Wake(s.wake);
+}
+
+void EnqueueOutput(Slot& s, OutFrame&& frame) {
+  ::EnterCriticalSection(&s.cs);
+  s.outbox.push_back(std::move(frame));
+  ::LeaveCriticalSection(&s.cs);
+  Wake(g_main_wake);
+}
+
+// Queue guest output. While the runtime already has a full window waiting for
+// the main thread this blocks; a cancel of `run_id` or a close drops the frame.
+void EnqueueGuestOutput(Slot& s, OutFrame&& frame, uint32_t run_id) {
+  frame.guest = true;
+  ::EnterCriticalSection(&s.cs);
+  while (!s.test_direct && s.outbox_guest >= kGuestOutboxWindow) {
+    if (s.closing || (run_id != 0 && s.cancel_run_id == run_id)) {
+      ::LeaveCriticalSection(&s.cs);
+      return;
+    }
+    ::LeaveCriticalSection(&s.cs);
+    ::WaitForSingleObject(s.space, INFINITE);
+    ::EnterCriticalSection(&s.cs);
+  }
+  s.outbox.push_back(std::move(frame));
+  ++s.outbox_guest;
+  ::LeaveCriticalSection(&s.cs);
+  Wake(g_main_wake);
+}
+
+// One inbound RELAY was delivered or dropped: the main thread owes its credit.
+void ReturnCredit(Slot& s) {
+  ::EnterCriticalSection(&s.cs);
+  ++s.credit_owed;
+  ::LeaveCriticalSection(&s.cs);
+  Wake(g_main_wake);
+}
+
+OutFrame EnvelopeFrame(const v8host::RunEnvelope& env) {
+  OutFrame frame;
+  frame.bytes = v8host::EncodeRunEnvelope(env);
+  return frame;
+}
+
+bool IsRelayFrame(const std::vector<uint8_t>& frame) {
+  return frame.size() > 5 &&
+         frame[4] == static_cast<uint8_t>(v8host::RunEnvelopeType::kRelay) &&
+         frame[5] == 0;
+}
+
+//==========================================================================
+// Per-runtime run state, owned by the runtime's thread (design §10.3-§10.4).
+// A coordinator START envelope makes a run active; the dev-ambient path (the
+// `sbox.exe --broker` smoke) keeps active_run_id 0 so guest output posts bare
+// and inbound bare frames reach host.onmessage exactly as before.
+// complete_requested is set by the neutral host.complete() and consumed by the
+// loop to emit a single RESULT(kCompleted). pending_starts is the admitted-but-
+// not-yet-begun START FIFO (the activation bridge); cancel/error are set while
+// servicing the active run and drive its terminal.
+//==========================================================================
+constexpr size_t kMaxActivationBridgeFrames = 256;
+struct PendingStart {
+  v8host::RunEnvelope start;
+  std::deque<std::vector<uint8_t>> frames;
+  size_t bytes = 0;
+  bool overflow = false;
+};
+struct RunCtx {
+  Slot* slot = nullptr;
+  Runtime* rt = nullptr;
+  uint32_t active_run_id = 0;
+  bool complete_requested = false;
+  bool failed = false;  // fatal: the runtime can't continue
+  std::vector<PendingStart> pending_starts;
+  size_t bridge_bytes = 0, bridge_frames = 0;
+  bool replaying = false;
+  bool cancel_active = false;  // CANCEL seen for the active run
+  bool run_error = false;      // uncaught JS error in the active run
+};
+
 // Route guest output (host.postMessage / postMessageBinary / a host.complete
-// value). During an active run it is wrapped as a RELAY envelope scoped to that
-// run; dev-ambient it is posted bare, preserving the generic smoke.
-sbox_status PostGuestOutput(sbox_msg_kind kind, const void* data, size_t len) {
-  if (g_active_run_id == 0)
-    return g_api->post_message(g_worker, kind, data, len);
-  v8host::RunEnvelope env;
-  env.type = v8host::RunEnvelopeType::kRelay;
-  env.run_id = g_active_run_id;
-  env.relay_kind = static_cast<int32_t>(kind);
+// value) into the slot's outbox. During an active run it is wrapped as a RELAY
+// envelope scoped to that run and slot; dev-ambient it is posted bare,
+// preserving the generic smoke. Returns false only for a frame the channel can
+// never carry.
+bool PostGuestOutput(RunCtx* c, sbox_msg_kind kind, const void* data, size_t len) {
+  OutFrame frame;
   const auto* p = static_cast<const uint8_t*>(data);
-  env.payload.assign(p, p + len);
-  return PostEnvelope(env);
+  if (c->active_run_id == 0) {
+    frame.kind = kind;
+    frame.bytes.assign(p, p + len);
+  } else {
+    v8host::RunEnvelope env;
+    env.type = v8host::RunEnvelopeType::kRelay;
+    env.slot = c->slot->index;
+    env.run_id = c->active_run_id;
+    env.relay_kind = static_cast<int32_t>(kind);
+    env.payload.assign(p, p + len);
+    frame = EnvelopeFrame(env);
+  }
+  if (frame.bytes.size() > v8host::protocol::kMaxFramePayload)
+    return false;
+  EnqueueGuestOutput(*c->slot, std::move(frame), c->active_run_id);
+  return true;
 }
 
 // Terminal emitters (worker -> broker). RESULT carries only the disposition (no
 // guest bytes, design §4.2); RUN_ERROR carries a status plus a bounded, redacted
 // diagnostic — the specific JS error text is logged host-side only, never on the
 // wire.
-void EmitRunResult(uint32_t run_id, v8host::RunEnvelopeDisposition disposition) {
+void EmitRunResult(RunCtx* c, uint32_t run_id,
+                   v8host::RunEnvelopeDisposition disposition) {
   v8host::RunEnvelope env;
   env.type = v8host::RunEnvelopeType::kResult;
+  env.slot = c->slot->index;
   env.run_id = run_id;
   env.disposition = disposition;
-  PostEnvelope(env);
+  EnqueueOutput(*c->slot, EnvelopeFrame(env));
 }
 
-void EmitRunError(uint32_t run_id) {
+void EmitRunError(RunCtx* c, uint32_t run_id) {
   v8host::RunEnvelope env;
   env.type = v8host::RunEnvelopeType::kRunError;
+  env.slot = c->slot->index;
   env.run_id = run_id;
   env.status_code =
       static_cast<uint32_t>(v8host::protocol::StatusCode::ERROR_INTERNAL);
   env.message = "guest run failed";  // redacted; detail stays in the host log
-  PostEnvelope(env);
+  EnqueueOutput(*c->slot, EnvelopeFrame(env));
 }
 
 //==========================================================================
 // The `host` JS object and the inbound-message bridge (JSI C++ API).
 //==========================================================================
 
-// Install host.postMessage(string) / host.postMessageBinary(ArrayBuffer) and
-// attach `host` to the global. The host functions route to the container's
-// message channel through the sbox_worker_api pointers (g_api), never the
-// sandbox core. RAII manages every jsi pointer's lifetime — nothing leaks.
-void InstallHostObject(Runtime& rt) {
+// Install host.postMessage(string) / host.postMessageBinary(ArrayBuffer) /
+// host.complete() and attach `host` to the global. Output goes to the runtime's
+// slot outbox; only the main thread touches the channel. RAII manages every jsi
+// pointer's lifetime — nothing leaks.
+void InstallHostObject(Runtime& rt, RunCtx* c) {
   Object host(rt);
 
   host.setProperty(
       rt, "postMessage",
       Function::createFromHostFunction(
           rt, PropNameID::forAscii(rt, "postMessage"), 1,
-          [](Runtime& rt, const Value&, const Value* args,
-             size_t count) -> Value {
+          [c](Runtime& rt, const Value&, const Value* args,
+              size_t count) -> Value {
             MarkFirstPost();
             if (count >= 1 && args[0].isString()) {
               std::string s = args[0].getString(rt).utf8(rt);
-              const sbox_status result =
-                  PostGuestOutput(sbox_msg_kind_string, s.data(), s.size());
-              if (result != sbox_status_ok) {
+              if (!PostGuestOutput(c, sbox_msg_kind_string, s.data(), s.size())) {
                 throw JSError(rt, "host.postMessage failed: result=" +
-                                     std::to_string(static_cast<int>(result)));
+                                     std::to_string(static_cast<int>(sbox_status_failed)));
               }
             }
             return Value::undefined();
@@ -463,18 +620,16 @@ void InstallHostObject(Runtime& rt) {
       rt, "postMessageBinary",
       Function::createFromHostFunction(
           rt, PropNameID::forAscii(rt, "postMessageBinary"), 1,
-          [](Runtime& rt, const Value&, const Value* args,
-             size_t count) -> Value {
+          [c](Runtime& rt, const Value&, const Value* args,
+              size_t count) -> Value {
             MarkFirstPost();
             if (count >= 1 && args[0].isObject()) {
               Object o = args[0].getObject(rt);
               if (o.isArrayBuffer(rt)) {
                 ArrayBuffer ab = o.getArrayBuffer(rt);
-                const sbox_status result =
-                    PostGuestOutput(sbox_msg_kind_binary, ab.data(rt), ab.size(rt));
-                if (result != sbox_status_ok) {
+                if (!PostGuestOutput(c, sbox_msg_kind_binary, ab.data(rt), ab.size(rt))) {
                   throw JSError(rt, "host.postMessageBinary failed: result=" +
-                                       std::to_string(static_cast<int>(result)));
+                                       std::to_string(static_cast<int>(sbox_status_failed)));
                 }
               }
             }
@@ -490,21 +645,21 @@ void InstallHostObject(Runtime& rt) {
       rt, "complete",
       Function::createFromHostFunction(
           rt, PropNameID::forAscii(rt, "complete"), 1,
-          [](Runtime& rt, const Value&, const Value* args,
-             size_t count) -> Value {
+          [c](Runtime& rt, const Value&, const Value* args,
+              size_t count) -> Value {
             if (count >= 1) {
               if (args[0].isString()) {
                 std::string s = args[0].getString(rt).utf8(rt);
-                PostGuestOutput(sbox_msg_kind_string, s.data(), s.size());
+                PostGuestOutput(c, sbox_msg_kind_string, s.data(), s.size());
               } else if (args[0].isObject()) {
                 Object o = args[0].getObject(rt);
                 if (o.isArrayBuffer(rt)) {
                   ArrayBuffer ab = o.getArrayBuffer(rt);
-                  PostGuestOutput(sbox_msg_kind_binary, ab.data(rt), ab.size(rt));
+                  PostGuestOutput(c, sbox_msg_kind_binary, ab.data(rt), ab.size(rt));
                 }
               }
             }
-            g_run_complete_requested = true;
+            c->complete_requested = true;
             return Value::undefined();
           }));
 
@@ -512,7 +667,7 @@ void InstallHostObject(Runtime& rt) {
 }
 
 // Deliver one inbound frame to JS host.onmessage (string -> JS string,
-// binary -> JS ArrayBuffer). Runs on the JS thread (the loop IS the JS thread).
+// binary -> JS ArrayBuffer). Runs on the runtime's thread.
 void DeliverToJs(Runtime& rt, sbox_msg_kind kind, const void* data,
                  size_t len) {
   Value host_v = rt.global().getProperty(rt, "host");
@@ -565,39 +720,15 @@ void ResetHostHandlers(Runtime& rt) {
     host_v.getObject(rt).setProperty(rt, "onmessage", Value::undefined());
 }
 
-// Run-loop context: the runtime, the dev-ambient scorecard, a fatal-failure
-// flag, and the per-run dispatch state (design §10.3-§10.4). pending_starts is
-// the admitted-but-not-yet-begun START FIFO; the loop begins one run at a time
-// (serialized over the single JS thread). cancel/error are set while servicing
-// the active run and drive its terminal.
-constexpr size_t kMaxActivationBridgeFrames = 256;
-struct PendingStart {
-  v8host::RunEnvelope start;
-  std::deque<std::vector<uint8_t>> frames;
-  size_t bytes = 0;
-  bool overflow = false;
-};
-struct RunLoopCtx {
-  Runtime* rt = nullptr;
-  int strings = 0;   // dev-ambient bare frames delivered to host.onmessage
-  int binaries = 0;
-  bool failed = false;  // fatal engine failure (dev-ambient path)
-  std::vector<PendingStart> pending_starts;
-  size_t bridge_bytes = 0, bridge_frames = 0;
-  bool replaying = false;
-  bool cancel_active = false;  // CANCEL seen for the active run
-  bool run_error = false;      // uncaught JS error in the active run
-};
-
 // Deliver a bare dev-ambient frame to host.onmessage (string/binary), counting
 // it for the scorecard. Fatal on an invalid kind or a thrown handler, exactly as
 // before the run-dispatch rework.
-void DeliverAmbient(RunLoopCtx* c, sbox_msg_kind kind, const void* data,
+void DeliverAmbient(RunCtx* c, sbox_msg_kind kind, const void* data,
                     size_t len) {
   if (kind == sbox_msg_kind_string)
-    ++c->strings;
+    ++c->slot->ambient_strings;
   else if (kind == sbox_msg_kind_binary)
-    ++c->binaries;
+    ++c->slot->ambient_binaries;
   else {
     printf("[v8host] invalid inbound message kind=%d\n", kind);
     c->failed = true;
@@ -614,13 +745,11 @@ void DeliverAmbient(RunLoopCtx* c, sbox_msg_kind kind, const void* data,
   }
 }
 
-// Invoked by the container's drain_messages (C code) — exceptions must NOT cross
-// back into C, so catch everything here. Branches each frame (design §10.3): a
-// bare frame (no envelope magic) is the dev-ambient path; an envelope is a
-// coordinator-driven START/RELAY/CANCEL.
-void SBOX_CDECL OnInbound(void* ctx, sbox_msg_kind kind, const void* data,
-                         size_t len) {
-  auto* c = static_cast<RunLoopCtx*>(ctx);
+// Handle one frame the main thread routed to this runtime: a bare frame (no
+// envelope magic) is the dev-ambient path; an envelope is a coordinator-driven
+// START/RELAY/CANCEL. Every RELAY envelope returns exactly one credit when it is
+// delivered or dropped.
+void HandleFrame(RunCtx* c, sbox_msg_kind kind, const void* data, size_t len) {
   if (c->failed)
     return;
   const auto* bytes = static_cast<const uint8_t*>(data);
@@ -635,8 +764,9 @@ void SBOX_CDECL OnInbound(void* ctx, sbox_msg_kind kind, const void* data,
     printf("[v8host] dropping malformed run envelope (%zu bytes)\n", len);
     return;  // fail-closed: never act on an undecodable control frame
   }
-  if (!c->replaying && env.run_id != g_active_run_id &&
-      (env.type == v8host::RunEnvelopeType::kRelay || env.type == v8host::RunEnvelopeType::kCancel)) {
+  const bool relay = env.type == v8host::RunEnvelopeType::kRelay;
+  if (!c->replaying && env.run_id != c->active_run_id &&
+      (relay || env.type == v8host::RunEnvelopeType::kCancel)) {
     auto pending = std::find_if(c->pending_starts.begin(), c->pending_starts.end(),
         [&](const PendingStart &entry) { return entry.start.run_id == env.run_id; });
     if (pending != c->pending_starts.end()) {
@@ -646,14 +776,21 @@ void SBOX_CDECL OnInbound(void* ctx, sbox_msg_kind kind, const void* data,
           pending->overflow = true;
           c->bridge_bytes -= pending->bytes;
           c->bridge_frames -= pending->frames.size();
+          for (const auto& held : pending->frames)
+            if (IsRelayFrame(held))
+              ReturnCredit(*c->slot);
           pending->bytes = 0;
           pending->frames.clear();
+          if (relay)
+            ReturnCredit(*c->slot);
         } else {
           pending->frames.emplace_back(bytes, bytes + len);
           pending->bytes += len;
           c->bridge_bytes += len;
           ++c->bridge_frames;
         }
+      } else if (relay) {
+        ReturnCredit(*c->slot);
       }
       return;
     }
@@ -662,18 +799,19 @@ void SBOX_CDECL OnInbound(void* ctx, sbox_msg_kind kind, const void* data,
     case v8host::RunEnvelopeType::kStart:
       if (c->pending_starts.size() >= v8host::protocol::kMaxInFlightRunsPerSession) {
         c->failed = true;
-      } else if (env.run_id != g_active_run_id && std::none_of(c->pending_starts.begin(), c->pending_starts.end(),
+      } else if (env.run_id != c->active_run_id && std::none_of(c->pending_starts.begin(), c->pending_starts.end(),
                  [&](const PendingStart &pending) { return pending.start.run_id == env.run_id; })) {
         c->pending_starts.push_back({std::move(env)});
       }
       break;
     case v8host::RunEnvelopeType::kRelay: {
       // Late and unknown relays have no dispatch authority.
-      const bool servicing = g_active_run_id != 0 &&
-                             env.run_id == g_active_run_id && !c->cancel_active &&
-                             !c->run_error && !g_run_complete_requested;
+      const bool servicing = c->active_run_id != 0 &&
+                             env.run_id == c->active_run_id && !c->cancel_active &&
+                             !c->run_error && !c->complete_requested;
       if (!servicing) {
         printf("[v8host] dropping relay for inactive run id=%u\n", env.run_id);
+        ReturnCredit(*c->slot);
         break;
       }
       const sbox_msg_kind rk =
@@ -689,44 +827,46 @@ void SBOX_CDECL OnInbound(void* ctx, sbox_msg_kind kind, const void* data,
         printf("[v8host] run onmessage threw (unknown)\n");
         c->run_error = true;
       }
+      ReturnCredit(*c->slot);
       break;
     }
     case v8host::RunEnvelopeType::kCancel:
-      if (g_active_run_id != 0 && env.run_id == g_active_run_id)
+      if (c->active_run_id != 0 && env.run_id == c->active_run_id)
         c->cancel_active = true;
       break;
-    case v8host::RunEnvelopeType::kResult:
-    case v8host::RunEnvelopeType::kRunError:
-      // Outbound-only (engine -> broker); a worker never receives these.
+    default:
+      // The main thread routes only START, RELAY, and CANCEL here.
       printf("[v8host] dropping unexpected inbound envelope type=%u\n",
              static_cast<unsigned>(env.type));
       break;
   }
 }
 
-// Reset the per-run flags + active id once a run reaches a terminal, so the loop
-// can dispatch the next pending START.
-void FinishRun(RunLoopCtx* c) {
-  g_active_run_id = 0;
-  g_run_complete_requested = false;
+// Reset the per-run flags + active id once a run reaches a terminal, so the
+// runtime can begin the next pending START.
+void FinishRun(RunCtx* c) {
+  c->active_run_id = 0;
+  c->complete_requested = false;
   c->cancel_active = false;
   c->run_error = false;
 }
 
 // Emit the active run's terminal if one is due (priority: uncaught error >
-// explicit complete > cancel). No-op in the dev-ambient path (no active run).
-void ServiceActiveRunTerminal(RunLoopCtx* c) {
-  if (g_active_run_id == 0)
+// explicit complete > cancel). The active-run state is cleared first, so the
+// next START never sees a stale run. No-op in the dev-ambient path.
+void ServiceActiveRunTerminal(RunCtx* c) {
+  const uint32_t id = c->active_run_id;
+  if (id == 0)
     return;
   if (c->run_error) {
-    EmitRunError(g_active_run_id);
     FinishRun(c);
-  } else if (g_run_complete_requested) {
-    EmitRunResult(g_active_run_id, v8host::RunEnvelopeDisposition::kCompleted);
+    EmitRunError(c, id);
+  } else if (c->complete_requested) {
     FinishRun(c);
+    EmitRunResult(c, id, v8host::RunEnvelopeDisposition::kCompleted);
   } else if (c->cancel_active) {
-    EmitRunResult(g_active_run_id, v8host::RunEnvelopeDisposition::kCancelled);
     FinishRun(c);
+    EmitRunResult(c, id, v8host::RunEnvelopeDisposition::kCancelled);
   }
 }
 
@@ -735,11 +875,12 @@ void ServiceActiveRunTerminal(RunLoopCtx* c) {
 // detect immediate completion — host.complete() during eval, a top-level return
 // with no onmessage handler, or an uncaught error (RUN_ERROR). A run that
 // installs a handler stays active for subsequent RELAY/CANCEL.
-void BeginRun(Runtime& rt, const v8host::RunEnvelope& start, RunLoopCtx* c) {
-  g_run_complete_requested = false;
+void BeginRun(const v8host::RunEnvelope& start, RunCtx* c) {
+  Runtime& rt = *c->rt;
+  c->complete_requested = false;
   c->cancel_active = false;
   c->run_error = false;
-  g_active_run_id = start.run_id;
+  c->active_run_id = start.run_id;
 
   bool completed = false;
   try {
@@ -749,7 +890,7 @@ void BeginRun(Runtime& rt, const v8host::RunEnvelope& start, RunLoopCtx* c) {
     auto prepared = rt.prepareJavaScript(buf, "run.js");
     rt.evaluatePreparedJavaScript(prepared);
     rt.drainMicrotasks();
-    completed = g_run_complete_requested || !HasOnMessageHandler(rt);
+    completed = c->complete_requested || !HasOnMessageHandler(rt);
   } catch (const JSError& e) {
     printf("[v8host] run JS error: %s\n", e.getMessage().c_str());
     c->run_error = true;
@@ -762,26 +903,26 @@ void BeginRun(Runtime& rt, const v8host::RunEnvelope& start, RunLoopCtx* c) {
   }
 
   if (completed)
-    g_run_complete_requested = true;
+    c->complete_requested = true;
 }
 
-void ServicePendingStarts(RunLoopCtx *c, bool closing) {
+void ServicePendingStarts(RunCtx *c, bool closing) {
   if (closing || c->failed) {
     c->pending_starts.clear();
     c->bridge_bytes = c->bridge_frames = 0;
     return;
   }
-  while (g_active_run_id == 0 && !c->pending_starts.empty()) {
+  while (c->active_run_id == 0 && !c->pending_starts.empty()) {
     PendingStart pending = std::move(c->pending_starts.front());
     c->pending_starts.erase(c->pending_starts.begin());
     c->bridge_bytes -= pending.bytes;
     c->bridge_frames -= pending.frames.size();
-    BeginRun(*c->rt, pending.start, c);
+    BeginRun(pending.start, c);
     if (pending.overflow)
       c->run_error = true;
     c->replaying = true;
     for (auto &frame : pending.frames)
-      OnInbound(c, sbox_msg_kind_binary, frame.data(), frame.size());
+      HandleFrame(c, sbox_msg_kind_binary, frame.data(), frame.size());
     c->replaying = false;
     c->rt->drainMicrotasks();
     ServiceActiveRunTerminal(c);
@@ -798,34 +939,508 @@ const char* kDemoJs =
     "  else { var a = new Uint8Array(m); a[0] = 0x42; host.postMessageBinary(m); }"
     "};";
 
+// Evaluate a V1 worker's guest (the built-in demo or V8HOST_GUEST_JS) on runtime
+// 1, before any envelope, as the single JS thread did after lockdown.
+void EvalGuest(RunCtx* c) {
+  Runtime& rt = *c->rt;
+  const LONGLONG t_start = g_perf.now();
+  try {
+    auto guest_buf = std::make_shared<StringBuffer>(g_guest_src);
+    const char* guest_url = g_use_guest_file ? "guest.js" : "user.js";
+    auto prepared = rt.prepareJavaScript(guest_buf, guest_url);
+    const LONGLONG t_parsed = g_perf.now();
+    g_perf.emit("parse", t_start, t_parsed);
+    rt.evaluatePreparedJavaScript(prepared);
+    const LONGLONG t_executed = g_perf.now();
+    g_perf.emit("execute", t_parsed, t_executed);
+    printf("[v8host] %s JS evaluated = OK\n", g_use_guest_file ? "guest" : "user");
+    rt.drainMicrotasks();
+    const LONGLONG first_post = g_first_post_qpc.load();
+    if (g_perf.on) {
+      if (first_post >= t_executed)
+        g_perf.emit("kickoff", t_executed, first_post);
+      else if (first_post != 0)
+        printf("[v8host][perf] %-14s = (during execute, synchronous)\n",
+               "kickoff");
+    }
+  } catch (const JSError& e) {
+    printf("[v8host] JS error: %s\n", e.getMessage().c_str());
+    c->failed = true;
+  } catch (const std::exception& e) {
+    printf("[v8host] exception: %s\n", e.what());
+    c->failed = true;
+  } catch (...) {
+    printf("[v8host] exception (unknown)\n");
+    c->failed = true;
+  }
+}
+
+#if defined(V8HOST_ENGINE_TESTING)
+// A batch the test thread hands to runtime 1, run as one fresh run context.
+struct TestBatch {
+  const std::vector<v8host::RunEnvelope>* batch = nullptr;
+  bool closing = false;
+  size_t peak_bytes = 0, peak_frames = 0, remaining = 0;
+  bool ok = false;
+  HANDLE done = nullptr;
+};
+
+void ResetRunState(RunCtx* c) {
+  FinishRun(c);
+  c->pending_starts.clear();
+  c->bridge_bytes = c->bridge_frames = 0;
+  c->replaying = false;
+  c->failed = false;
+}
+
+void RunTestBatch(RunCtx* c, TestBatch* t) {
+  ResetRunState(c);
+  for (const auto& env : *t->batch) {
+    auto bytes = v8host::EncodeRunEnvelope(env);
+    HandleFrame(c, sbox_msg_kind_binary, bytes.data(), bytes.size());
+    t->peak_bytes = (std::max)(t->peak_bytes, c->bridge_bytes);
+    t->peak_frames = (std::max)(t->peak_frames, c->bridge_frames);
+  }
+  ServiceActiveRunTerminal(c);
+  ServicePendingStarts(c, t->closing);
+  t->remaining = c->bridge_bytes + c->bridge_frames;
+  t->ok = !c->failed;
+  ResetRunState(c);
+}
+#endif
+
+// A runtime's thread: create the runtime (precreated runtime 1 in warmup, or a
+// CREATE_RUNTIME after lockdown), then serve the slot's inbox — one START at a
+// time, its relays and cancels, and V8's foreground tasks — until the slot
+// closes or the runtime fails. The runtime never outlives this thread.
+DWORD WINAPI RuntimeThread(void* param) {
+  Slot& s = *static_cast<Slot*>(param);
+  RunCtx ctx;
+  ctx.slot = &s;
+  RuntimeConfig config;
+  config.tasks = &s.tasks;
+  if (s.snapshot_index >= 0)
+    config.snapshot = &g_snapshots[static_cast<size_t>(s.snapshot_index)];
+  std::unique_ptr<Runtime> rt;
+  const LONGLONG t_create = g_perf.now();
+  try {
+    rt = CreateRuntime(&config);
+    if (rt)
+      InstallHostObject(*rt, &ctx);
+  } catch (const JSError& e) {
+    printf("[v8host] slot %u: runtime setup JS error: %s\n", s.index,
+           e.getMessage().c_str());
+    rt.reset();
+  } catch (const std::exception& e) {
+    printf("[v8host] slot %u: runtime setup exception: %s\n", s.index, e.what());
+    rt.reset();
+  } catch (...) {
+    rt.reset();
+  }
+  if (!rt) {
+    printf("[v8host] slot %u: runtime creation failed\n", s.index);
+    ::EnterCriticalSection(&s.cs);
+    s.failed = true;
+    ::LeaveCriticalSection(&s.cs);
+    return 1;
+  }
+  ctx.rt = rt.get();
+  if (s.precreated) {
+    g_perf.emit("runtime-create", t_create, g_perf.now());
+    printf("[v8host] v8jsi runtime created (warmup, pre-lockdown)\n");
+  } else {
+    printf("[v8host] slot %u: runtime created (snapshot %d)\n", s.index,
+           s.snapshot_index);
+    v8host::RunEnvelope ready;
+    ready.type = v8host::RunEnvelopeType::kRuntimeReady;
+    ready.slot = s.index;
+    EnqueueOutput(s, EnvelopeFrame(ready));
+  }
+  ::SetEvent(s.ready);
+
+  for (;;) {
+    ::WaitForSingleObject(s.wake, INFINITE);
+    RunQueuedTasks(&s.tasks);
+    std::deque<InboxItem> items;
+    ::EnterCriticalSection(&s.cs);
+    items.swap(s.inbox);
+    const bool closing = s.closing;
+    ::LeaveCriticalSection(&s.cs);
+    for (auto& item : items) {
+      if (ctx.failed)
+        break;
+      switch (item.kind) {
+        case InboxItem::Kind::kFrame:
+          HandleFrame(&ctx, item.frame_kind, item.bytes.data(), item.bytes.size());
+          break;
+        case InboxItem::Kind::kEvalGuest:
+          EvalGuest(&ctx);
+          break;
+        case InboxItem::Kind::kTestBatch:
+#if defined(V8HOST_ENGINE_TESTING)
+          RunTestBatch(&ctx, static_cast<TestBatch*>(item.test));
+          ::SetEvent(static_cast<TestBatch*>(item.test)->done);
+#endif
+          break;
+      }
+    }
+    if (!ctx.failed) {
+      try {
+        rt->drainMicrotasks();
+      } catch (const std::exception& e) {
+        printf("[v8host] slot %u: microtask failure: %s\n", s.index, e.what());
+        ctx.failed = true;
+      }
+      ServiceActiveRunTerminal(&ctx);
+      ServicePendingStarts(&ctx, closing);
+    }
+    if (closing || ctx.failed)
+      break;
+  }
+  // A close ends the active run as cancelled; a failure reports through
+  // RUNTIME_CLOSED instead.
+  if (!ctx.failed && ctx.active_run_id != 0) {
+    const uint32_t id = ctx.active_run_id;
+    FinishRun(&ctx);
+    EmitRunResult(&ctx, id, v8host::RunEnvelopeDisposition::kCancelled);
+  }
+  rt.reset();
+  ::EnterCriticalSection(&s.cs);
+  s.failed = s.failed || ctx.failed;
+  ::LeaveCriticalSection(&s.cs);
+  Wake(g_main_wake);
+  return 0;
+}
+
+// Starts the runtime thread for an empty slot (main thread only).
+bool StartSlot(Slot& s, int32_t snapshot_index, bool precreated) {
+  s.snapshot_index = snapshot_index;
+  s.precreated = precreated;
+  s.host_closed = false;
+  s.used = true;
+  ::EnterCriticalSection(&s.cs);
+  s.inbox.clear();
+  s.outbox.clear();
+  s.outbox_guest = 0;
+  s.credit_owed = 0;
+  s.cancel_run_id = 0;
+  s.closing = false;
+  s.failed = false;
+  s.ambient_strings = s.ambient_binaries = 0;
+  ::LeaveCriticalSection(&s.cs);
+  ::ResetEvent(s.ready);
+  s.thread = ::CreateThread(nullptr, kRuntimeStackReserve, &RuntimeThread, &s,
+                            STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+  if (!s.thread) {
+    printf("[v8host] slot %u: runtime thread failed to start: %lu\n", s.index,
+           ::GetLastError());
+    s.failed = true;
+    s.state = SlotState::kExited;
+    return false;
+  }
+  s.state = SlotState::kRunning;
+  return true;
+}
+
+// Closes every live runtime and joins its thread, with one deadline for all.
+// Returns false if a thread is still running (JS that never yields).
+bool QuiesceSlots(DWORD budget_ms) {
+  for (size_t i = 0; i < g_slot_count; ++i) {
+    Slot* s = g_slots[i];
+    if (!s || !s->thread)
+      continue;
+    ::EnterCriticalSection(&s->cs);
+    s->closing = true;
+    ::LeaveCriticalSection(&s->cs);
+    Wake(s->wake);
+    Wake(s->space);
+  }
+  const ULONGLONG deadline = ::GetTickCount64() + budget_ms;
+  bool joined = true;
+  for (size_t i = 0; i < g_slot_count; ++i) {
+    Slot* s = g_slots[i];
+    if (!s || !s->thread)
+      continue;
+    const ULONGLONG now = ::GetTickCount64();
+    const DWORD left = now >= deadline ? 0 : static_cast<DWORD>(deadline - now);
+    if (::WaitForSingleObject(s->thread, left) != WAIT_OBJECT_0) {
+      joined = false;
+      continue;
+    }
+    ::CloseHandle(s->thread);
+    s->thread = nullptr;
+    s->state = SlotState::kExited;
+  }
+  return joined;
+}
+
+struct MainCtx {
+  bool fatal = false;
+};
+
+void Violation(MainCtx* m, const char* why, unsigned slot) {
+  printf("[v8host] protocol violation: %s (slot %u)\n", why, slot);
+  m->fatal = true;
+}
+
+// The main thread's drain callback: route each inbound frame to its runtime
+// slot. Called by the container's drain_messages (C code) — nothing here
+// throws. A CREATE_RUNTIME for an occupied slot or any slot past max_runtimes
+// is a protocol violation that ends the worker, as is a non-create frame for
+// a slot that never held a runtime. Frames for a slot whose runtime has closed
+// are dropped: the coordinator may send them before it sees RUNTIME_CLOSED.
+void SBOX_CDECL RouteInbound(void* ctx, sbox_msg_kind kind, const void* data,
+                             size_t len) {
+  auto* m = static_cast<MainCtx*>(ctx);
+  if (m->fatal)
+    return;
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  InboxItem item;
+  item.frame_kind = kind;
+
+  if (!v8host::IsRunEnvelope(bytes, len)) {
+    // Dev-ambient bare frames go to runtime 1, which only V1 workers have.
+    Slot* s = g_slot_count ? g_slots[0] : nullptr;
+    if (!g_profile.precreate || !s || s->state != SlotState::kRunning) {
+      printf("[v8host] dropping bare frame (%zu bytes): no runtime 1\n", len);
+      return;
+    }
+    item.bytes.assign(bytes, bytes + len);
+    PushInbox(*s, std::move(item));
+    return;
+  }
+
+  v8host::RunEnvelope env;
+  if (!v8host::DecodeRunEnvelope(bytes, len, &env)) {
+    printf("[v8host] dropping malformed run envelope (%zu bytes)\n", len);
+    return;  // fail-closed: never act on an undecodable control frame
+  }
+  if (env.slot >= g_slot_count)
+    return Violation(m, "slot past max_runtimes", env.slot);
+  Slot& s = *g_slots[env.slot];
+  if (s.state == SlotState::kEmpty && env.type != v8host::RunEnvelopeType::kCreateRuntime) {
+    if (!s.used)
+      return Violation(m, "frame for an empty slot", env.slot);
+    return;
+  }
+  switch (env.type) {
+    case v8host::RunEnvelopeType::kCreateRuntime:
+      if (s.state != SlotState::kEmpty)
+        return Violation(m, "create on an occupied slot", env.slot);
+      if (env.snapshot_index >= static_cast<int32_t>(g_snapshots.size()))
+        return Violation(m, "create with an unknown snapshot", env.slot);
+      StartSlot(s, env.snapshot_index, /*precreated=*/false);
+      return;
+    case v8host::RunEnvelopeType::kCloseRuntime:
+      if (s.host_closed)
+        return;
+      s.host_closed = true;
+      ::EnterCriticalSection(&s.cs);
+      s.closing = true;
+      ::LeaveCriticalSection(&s.cs);
+      Wake(s.wake);
+      Wake(s.space);
+      return;
+    case v8host::RunEnvelopeType::kStart:
+    case v8host::RunEnvelopeType::kRelay:
+    case v8host::RunEnvelopeType::kCancel:
+      if (s.state != SlotState::kRunning || s.host_closed)
+        return;
+      if (env.type == v8host::RunEnvelopeType::kCancel) {
+        ::EnterCriticalSection(&s.cs);
+        s.cancel_run_id = env.run_id;
+        ::LeaveCriticalSection(&s.cs);
+        Wake(s.space);
+      }
+      item.bytes.assign(bytes, bytes + len);
+      PushInbox(s, std::move(item));
+      return;
+    default:
+      // Outbound-only (engine -> broker); a worker never receives these.
+      printf("[v8host] dropping unexpected inbound envelope type=%u\n",
+             static_cast<unsigned>(env.type));
+      return;
+  }
+}
+
+bool Post(sbox_msg_kind kind, const std::vector<uint8_t>& bytes) {
+  return g_api->post_message(g_worker, kind, bytes.data(), bytes.size()) ==
+         sbox_status_ok;
+}
+
+void ResetSlot(Slot& s) {
+  ::EnterCriticalSection(&s.cs);
+  s.inbox.clear();
+  s.outbox.clear();
+  s.outbox_guest = 0;
+  s.credit_owed = 0;
+  ::LeaveCriticalSection(&s.cs);
+  s.state = SlotState::kEmpty;
+  s.host_closed = false;
+}
+
+// Posts each slot's output in order, round-robin across slots, plus any owed
+// CREDIT and, once an ended runtime's output has drained, its RUNTIME_CLOSED
+// (always the slot's last frame). A full ring keeps the head for the next turn.
+// Returns true if anything is still waiting.
+bool PumpOutbound(size_t* cursor) {
+  bool ring_full = false;
+  for (bool progress = true; progress && !ring_full;) {
+    progress = false;
+    for (size_t n = 0; n < g_slot_count && !ring_full; ++n) {
+      Slot& s = *g_slots[(*cursor + n) % g_slot_count];
+      if (s.state == SlotState::kEmpty)
+        continue;
+      ::EnterCriticalSection(&s.cs);
+      if (s.credit_owed) {
+        v8host::RunEnvelope credit;
+        credit.type = v8host::RunEnvelopeType::kCredit;
+        credit.slot = s.index;
+        credit.credit = (std::min)(s.credit_owed, v8host::kRelayCreditWindow);
+        if (Post(sbox_msg_kind_binary, v8host::EncodeRunEnvelope(credit))) {
+          s.credit_owed -= credit.credit;
+          progress = true;
+        } else {
+          ring_full = true;
+        }
+      }
+      if (!ring_full && !s.outbox.empty()) {
+        const OutFrame& frame = s.outbox.front();
+        if (Post(frame.kind, frame.bytes)) {
+          if (frame.guest) {
+            --s.outbox_guest;
+            ::SetEvent(s.space);
+          }
+          s.outbox.pop_front();
+          progress = true;
+        } else {
+          ring_full = true;
+        }
+      }
+      const bool drained = s.outbox.empty() && s.credit_owed == 0;
+      ::LeaveCriticalSection(&s.cs);
+      if (!ring_full && drained && s.state == SlotState::kExited &&
+          !g_profile.precreate) {
+        v8host::RunEnvelope closed;
+        closed.type = v8host::RunEnvelopeType::kRuntimeClosed;
+        closed.slot = s.index;
+        closed.status_code = s.host_closed ? 0 : v8host::kRuntimeClosedFailed;
+        if (Post(sbox_msg_kind_binary, v8host::EncodeRunEnvelope(closed))) {
+          printf("[v8host] slot %u: runtime closed (%s)\n", s.index,
+                 closed.status_code ? "failed" : "ok");
+          ResetSlot(s);
+          progress = true;
+        } else {
+          ring_full = true;
+        }
+      }
+    }
+    if (g_slot_count)
+      *cursor = (*cursor + 1) % g_slot_count;
+  }
+  for (size_t i = 0; i < g_slot_count; ++i) {
+    Slot& s = *g_slots[i];
+    if (s.state == SlotState::kEmpty)
+      continue;
+    ::EnterCriticalSection(&s.cs);
+    const bool waiting = !s.outbox.empty() || s.credit_owed != 0;
+    ::LeaveCriticalSection(&s.cs);
+    if (waiting || (s.state == SlotState::kExited && !g_profile.precreate))
+      return true;
+  }
+  return false;
+}
+
+void FreeSlots() {
+  for (size_t i = 0; i < g_slots.size(); ++i) {
+    Slot* s = g_slots[i];
+    if (!s)
+      continue;
+    for (HANDLE h : {s->wake, s->space, s->ready})
+      if (h)
+        ::CloseHandle(h);
+    ::DeleteCriticalSection(&s->tasks.cs);
+    ::DeleteCriticalSection(&s->cs);
+    delete s;
+    g_slots[i] = nullptr;
+  }
+  g_slot_count = 0;
+}
+
 }  // namespace
 
 #if defined(V8HOST_ENGINE_TESTING)
+// Exercise the production main-thread codec/router without changing this
+// process's mitigation policy or entering the channel wait loop.
+bool V8HostEngineTestRoute(const std::vector<v8host::RunEnvelope>& batch) {
+  MainCtx m;
+  for (const auto& env : batch) {
+    const auto bytes = v8host::EncodeRunEnvelope(env);
+    RouteInbound(&m, sbox_msg_kind_binary, bytes.data(), bytes.size());
+  }
+  return !m.fatal;
+}
+
+// Wait for one runtime transition, then perform the main thread's outbound
+// drain (including RUNTIME_CLOSED and ResetSlot after a thread has exited).
+bool V8HostEngineTestWaitSlot(uint16_t index, bool closed) {
+  if (index >= g_slot_count)
+    return false;
+  Slot& s = *g_slots[index];
+  if (!s.thread || ::WaitForSingleObject(closed ? s.thread : s.ready, 5000) != WAIT_OBJECT_0)
+    return false;
+  if (closed) {
+    ::CloseHandle(s.thread);
+    s.thread = nullptr;
+    s.state = SlotState::kExited;
+  }
+  size_t cursor = index;
+  PumpOutbound(&cursor);
+  return s.state == (closed ? SlotState::kEmpty : SlotState::kRunning);
+}
+
+// Runs one batch on runtime 1's thread as a fresh run context, then stands in
+// for the main thread and posts the slot's output in order (no CREDIT).
 bool V8HostEngineTestBatch(const std::vector<v8host::RunEnvelope> &batch, bool closing,
                            size_t *peak_bytes, size_t *peak_frames, size_t *remaining) {
-  if (!g_rt)
+  Slot* s = g_slot_count ? g_slots[0] : nullptr;
+  if (!s || s->state != SlotState::kRunning)
     return false;
-  RunLoopCtx context{g_rt};
-  *peak_bytes = *peak_frames = 0;
-  for (const auto &env : batch) {
-    auto bytes = v8host::EncodeRunEnvelope(env);
-    OnInbound(&context, sbox_msg_kind_binary, bytes.data(), bytes.size());
-    *peak_bytes = (std::max)(*peak_bytes, context.bridge_bytes);
-    *peak_frames = (std::max)(*peak_frames, context.bridge_frames);
-  }
-  ServiceActiveRunTerminal(&context);
-  ServicePendingStarts(&context, closing);
-  *remaining = context.bridge_bytes + context.bridge_frames;
-  bool ok = !context.failed;
-  FinishRun(&context);
-  return ok;
+  TestBatch t;
+  t.batch = &batch;
+  t.closing = closing;
+  t.done = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!t.done)
+    return false;
+  ::EnterCriticalSection(&s->cs);
+  s->test_direct = true;
+  ::LeaveCriticalSection(&s->cs);
+  InboxItem item;
+  item.kind = InboxItem::Kind::kTestBatch;
+  item.test = &t;
+  PushInbox(*s, std::move(item));
+  ::WaitForSingleObject(t.done, INFINITE);
+  ::CloseHandle(t.done);
+  std::deque<OutFrame> output;
+  ::EnterCriticalSection(&s->cs);
+  output.swap(s->outbox);
+  s->outbox_guest = 0;
+  s->credit_owed = 0;
+  ::LeaveCriticalSection(&s->cs);
+  for (const auto& frame : output)
+    g_api->post_message(g_worker, frame.kind, frame.bytes.data(), frame.bytes.size());
+  *peak_bytes = t.peak_bytes;
+  *peak_frames = t.peak_frames;
+  *remaining = t.remaining;
+  return t.ok;
 }
 #endif
 
 //==========================================================================
-// PRE-lockdown. Load the engine, create the JSI runtime, install the `host`
-// object. ACG forbids codegen/patching after this returns, so ALL engine setup
-// (DLL load, --jitless, snapshot deserialize, runtime create) happens here.
+// PRE-lockdown. Load the engine, read the snapshots, and set V8 up with a
+// throwaway runtime on this thread. A V1 worker also creates its one runtime,
+// on its own thread. ACG forbids codegen/patching after this returns, so ALL
+// engine setup (DLL load, --jitless, snapshot reads, V8 setup) happens here.
 // Returns sbox_status_ok on success, non-zero (fail-closed) otherwise.
 //==========================================================================
 sbox_status SBOX_CDECL V8HostEngineWarmup(sbox_worker w,
@@ -836,79 +1451,86 @@ sbox_status SBOX_CDECL V8HostEngineWarmup(sbox_worker w,
   g_api = api;
   g_perf.init();
   const LONGLONG t_entry = g_perf.now();
-
-  // Foreground task queue (the engine may post tasks; the run loop drains them).
-  // Allocated here so it outlives warmup and is torn down in shutdown.
-  g_tasks = new TaskQueue();
-  ::InitializeCriticalSection(&g_tasks->cs);
-  g_tasks->wake = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset
+  g_main_wake = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset
+  if (!g_main_wake)
+    return sbox_status_failed;
 
   // The broker's configure() encoded the bound worker profile (engine DLL +
-  // jitless + optional startup snapshot) into the opaque plugin_data; decode it
-  // here. The SAME configure() armed ACG to match the jitless choice.
-  v8host::V8HostWorkerProfileV1 prof;
+  // jitless + snapshots, and for an explicit worker its runtime cap) into the
+  // opaque plugin_data; decode it here. The SAME configure() armed ACG to match
+  // the jitless choice.
   {
     const void* pd = nullptr;
     size_t pd_len = 0;
     if (api->get_plugin_data(w, &pd, &pd_len) != sbox_status_ok || !pd || pd_len == 0 ||
-        !v8host::V8HostWorkerProfileV1::Decode(
-            static_cast<const uint8_t*>(pd), pd_len, &prof)) {
+        !v8host::DecodeWorkerProfile(static_cast<const uint8_t*>(pd), pd_len,
+                                     &g_profile)) {
       printf("[v8host] warmup: missing/invalid worker profile plugin_data\n");
       return sbox_status_failed;
     }
   }
-  const bool jitless = prof.jitless != 0;
+  const bool jitless = g_profile.jitless;
   g_expect_acg = jitless;  // untrusted (jitless) => ACG enforced post-lockdown
-  std::wstring engine_dll = Utf8ToWide(prof.engine_dll);
+  std::wstring engine_dll = Utf8ToWide(g_profile.engine_dll);
   printf("[v8host] tier = %s\n",
          jitless ? "Untrusted (jitless + ACG)" : "Trusted (JIT, ACG off)");
   if (engine_dll.empty()) {
     printf("[v8host] warmup: empty engine DLL in run profile\n");
     return sbox_status_failed;
   }
+  if (!g_profile.precreate)
+    printf("[v8host] worker: up to %u runtimes, %zu snapshots\n",
+           g_profile.max_runtimes, g_profile.snapshot_paths.size());
 
-  // Startup snapshot from the run profile (read NOW, pre-lockdown). A bound
-  // profile with a non-empty snapshot_path REQUIRES that snapshot: an unreadable
-  // path is fatal (fail-closed, design §8.6), never a silent normal-runtime
-  // fallback. An empty snapshot_path means no snapshot was requested.
-  const std::wstring snapshot_path = Utf8ToWide(prof.snapshot_path);
-  if (!snapshot_path.empty()) {
-    if (ReadFileBytes(snapshot_path, g_snapshot_blob)) {
-      g_have_snapshot = true;
-      printf("[v8host] startup snapshot from %ls (%zu bytes)\n",
-             snapshot_path.c_str(), g_snapshot_blob.size());
-    } else {
+  // Startup snapshots from the profile (read NOW, pre-lockdown). Every bound
+  // snapshot is required: an unreadable one is fatal (fail-closed, design
+  // §8.6), never a silent normal-runtime fallback. An explicit worker's paths
+  // are relative to the payload directory.
+  for (const std::string& bound : g_profile.snapshot_paths) {
+    std::wstring path = Utf8ToWide(bound);
+    if (g_profile.snapshots_relative && !path.empty()) {
+      std::replace(path.begin(), path.end(), L'/', L'\\');
+      path = sbox_harden::ExeDir() + path;
+    }
+    std::string blob;
+    if (path.empty() || !ReadFileBytes(path, blob)) {
       printf("[v8host] warmup: bound startup snapshot %ls could not be read; "
-             "failing closed\n", snapshot_path.c_str());
+             "failing closed\n", path.c_str());
       return sbox_status_failed;
     }
+    printf("[v8host] startup snapshot from %ls (%zu bytes)\n", path.c_str(),
+           blob.size());
+    g_snapshots.push_back(std::move(blob));
   }
 
   // A supplied guest selects custom-guest mode, not the built-in demo. Read it
   // NOW (pre-lockdown) — once the token is lowered the payload can no longer open
-  // arbitrary files. This stays a neutral JS host: it installs the `host` object
-  // and evaluates whatever guest it is handed. A requested but unreadable guest
-  // is an input error; never replace it with the demo.
-  std::wstring guest_js_path;
-  if (!ReadGuestPath(guest_js_path)) {
-    printf("[v8host] stage=guest-input environment query failed: error=%lu\n",
-           ::GetLastError());
-    return sbox_status_failed;
-  }
-  g_use_guest_file = !guest_js_path.empty();
-  if (g_use_guest_file) {
-    if (!ReadFileBytes(guest_js_path, g_guest_src)) {
-      printf("[v8host] stage=guest-input cannot read %ls: error=%lu\n",
-             guest_js_path.c_str(), ::GetLastError());
+  // arbitrary files. Only runtime 1 of a V1 worker evaluates it. This stays a
+  // neutral JS host: it installs the `host` object and evaluates whatever guest
+  // it is handed. A requested but unreadable guest is an input error; never
+  // replace it with the demo.
+  if (g_profile.precreate) {
+    std::wstring guest_js_path;
+    if (!ReadGuestPath(guest_js_path)) {
+      printf("[v8host] stage=guest-input environment query failed: error=%lu\n",
+             ::GetLastError());
       return sbox_status_failed;
     }
-    printf("[v8host] guest JS from %ls (%zu bytes)\n", guest_js_path.c_str(),
-           g_guest_src.size());
-  } else {
-    g_guest_src = kDemoJs;
+    g_use_guest_file = !guest_js_path.empty();
+    if (g_use_guest_file) {
+      if (!ReadFileBytes(guest_js_path, g_guest_src)) {
+        printf("[v8host] stage=guest-input cannot read %ls: error=%lu\n",
+               guest_js_path.c_str(), ::GetLastError());
+        return sbox_status_failed;
+      }
+      printf("[v8host] guest JS from %ls (%zu bytes)\n", guest_js_path.c_str(),
+             g_guest_src.size());
+    } else {
+      g_guest_src = kDemoJs;
+    }
+    printf("[v8host] mode = %s\n",
+           g_use_guest_file ? "custom guest" : "demo self-test");
   }
-  printf("[v8host] mode = %s\n",
-         g_use_guest_file ? "custom guest" : "demo self-test");
 
   // Load the engine by FULL PATH (our own application directory) — never a bare
   // name (which would honor the search path / allow planting). The container
@@ -948,74 +1570,121 @@ sbox_status SBOX_CDECL V8HostEngineWarmup(sbox_worker w,
            flag_argc == 1 ? "recognized" : "NOT recognized");
   }
 
-  // If a startup snapshot was supplied, pre-check it against THIS engine now —
-  // the process-global --jitless (if any) is set, so the version tag matches
-  // what the blob was built with. A stale or cross-engine blob is dropped here
-  // and we continue WITHOUT a snapshot rather than feed V8 an incompatible blob.
-  if (g_have_snapshot) {
+  // Pre-check every snapshot against THIS engine now — the process-global
+  // --jitless (if any) is set, so the version tag matches what the blob was
+  // built with. A stale or cross-engine blob fails warmup rather than feeding V8
+  // an incompatible blob, and so does an engine that cannot check at all.
+  if (!g_snapshots.empty()) {
     auto p_compat = reinterpret_cast<v8_jsi_abi_snapshot_check_fn>(
         ::GetProcAddress(guest, "v8_jsi_abi_snapshot_check"));
     auto p_compat_str = reinterpret_cast<v8_jsi_abi_snapshot_compat_to_string_fn>(
         ::GetProcAddress(guest, "v8_jsi_abi_snapshot_compat_to_string"));
-    if (p_compat) {
-      const v8_jsi_abi_snapshot_compat code =
-          p_compat(reinterpret_cast<const uint8_t*>(g_snapshot_blob.data()),
-                   g_snapshot_blob.size());
+    if (!p_compat) {
+      printf("[v8host] warmup: engine cannot check startup snapshots; failing "
+             "closed\n");
+      return sbox_status_failed;
+    }
+    for (const std::string& blob : g_snapshots) {
+      const v8_jsi_abi_snapshot_compat code = p_compat(
+          reinterpret_cast<const uint8_t*>(blob.data()), blob.size());
       if (code != v8_jsi_abi_snapshot_compat_ok) {
         const char* why = p_compat_str ? p_compat_str(code) : "incompatible";
         printf("[v8host] warmup: bound startup snapshot rejected (%s); failing "
                "closed\n", why);
-        g_snapshot_blob.clear();
-        g_snapshot_blob.shrink_to_fit();
         return sbox_status_failed;
       }
-      printf("[v8host] startup snapshot compatible with engine\n");
     }
+    printf("[v8host] startup snapshot compatible with engine\n");
   }
 
-  // Resolve the config setters the configure callback uses, then create the
-  // runtime through the JSI C++ API (JsiAbiRuntime injects our JSI_ABI_VERSION).
+  // Resolve the config setters the configure callback uses and the runtime
+  // factory (JsiAbiRuntime injects our JSI_ABI_VERSION).
   {
     RESOLVE(guest, v8_jsi_abi_config_set_task_runner);
     RESOLVE(guest, v8_jsi_abi_config_set_explicit_microtask_policy);
     g_set_task_runner = p_v8_jsi_abi_config_set_task_runner;
     g_set_microtask = p_v8_jsi_abi_config_set_explicit_microtask_policy;
-    if (g_have_snapshot) {
+    if (!g_snapshots.empty()) {
       RESOLVE(guest, v8_jsi_abi_config_set_startup_snapshot);
       g_set_snapshot = p_v8_jsi_abi_config_set_startup_snapshot;
     }
+    RESOLVE(guest, v8_jsi_abi_runtime_create);
+    g_runtime_create = p_v8_jsi_abi_runtime_create;
+    g_dispose_platform = reinterpret_cast<DisposePlatformFn>(
+        ::GetProcAddress(guest, "v8_node_api_dispose_platform"));
   }
-  RESOLVE(guest, v8_jsi_abi_runtime_create);
 
-  // makeJsiAbiRuntime + InstallHostObject use the throwing JSI C++ API; catch
-  // everything so no exception crosses the extern "C" boundary (fail-closed).
-  try {
-    std::unique_ptr<Runtime> rt_owner = jsi::abi::makeJsiAbiRuntime(
-        p_v8_jsi_abi_runtime_create, &ConfigureRuntime, nullptr);
-    if (!rt_owner) {
+  // Set V8 up on THIS thread, pre-lockdown: a throwaway runtime, created with
+  // the runtime config and destroyed, runs V8's process-wide setup (platform,
+  // flags, sandbox reservation) once under this thread's initial token. Every
+  // later runtime, on its own thread, finds it done.
+  {
+    const LONGLONG t_setup = g_perf.now();
+    HANDLE scratch_wake = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    TaskQueue scratch;
+    ::InitializeCriticalSection(&scratch.cs);
+    scratch.wake = scratch_wake;
+    RuntimeConfig config;
+    config.tasks = &scratch;
+    bool created = false;
+    try {
+      created = scratch_wake && CreateRuntime(&config) != nullptr;
+    } catch (const JSError& e) {
+      printf("[v8host] warmup JS error: %s\n", e.getMessage().c_str());
+    } catch (const std::exception& e) {
+      printf("[v8host] warmup exception: %s\n", e.what());
+    } catch (...) {
+    }
+    ::DeleteCriticalSection(&scratch.cs);
+    if (scratch_wake)
+      ::CloseHandle(scratch_wake);
+    if (!created) {
       printf("[v8host] makeJsiAbiRuntime failed\n");
       return sbox_status_failed;
     }
-    g_rt = rt_owner.release();  // ownership moves to g_rt; deleted in shutdown
-    const LONGLONG t_runtime_created = g_perf.now();
-    g_perf.emit("runtime-create", t_engine_loaded, t_runtime_created);
-    printf("[v8host] v8jsi runtime created (warmup, pre-lockdown)\n");
-    InstallHostObject(*g_rt);
-  } catch (const JSError& e) {
-    printf("[v8host] warmup JS error: %s\n", e.getMessage().c_str());
-    return sbox_status_failed;
-  } catch (const std::exception& e) {
-    printf("[v8host] warmup exception: %s\n", e.what());
-    return sbox_status_failed;
+    g_perf.emit("v8-setup", t_setup, g_perf.now());
+  }
+
+  // The runtime table: one slot per runtime the worker may host.
+  g_slot_count = g_profile.max_runtimes;
+  for (size_t i = 0; i < g_slot_count; ++i) {
+    Slot* s = new (std::nothrow) Slot();
+    if (!s)
+      return sbox_status_failed;
+    s->index = static_cast<uint16_t>(i);
+    ::InitializeCriticalSection(&s->cs);
+    ::InitializeCriticalSection(&s->tasks.cs);
+    s->wake = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    s->space = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    s->ready = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    s->tasks.wake = s->wake;
+    g_slots[i] = s;
+    if (!s->wake || !s->space || !s->ready)
+      return sbox_status_failed;
+  }
+
+  // A V1 (session or dev) worker creates its one runtime now, before lockdown,
+  // on its own thread, so a session keeps today's ordering. An explicit worker
+  // has no runtime until CREATE_RUNTIME, after lockdown.
+  if (g_profile.precreate) {
+    Slot& s = *g_slots[0];
+    if (!StartSlot(s, g_snapshots.empty() ? -1 : 0, /*precreated=*/true))
+      return sbox_status_failed;
+    HANDLE waits[2] = {s.ready, s.thread};
+    if (::WaitForMultipleObjects(2, waits, FALSE, INFINITE) != WAIT_OBJECT_0) {
+      printf("[v8host] makeJsiAbiRuntime failed\n");
+      return sbox_status_failed;
+    }
   }
   return sbox_status_ok;
 }
 
 //==========================================================================
 // POST-lockdown. ACG MUST now be in force. Prove it with a FAILED executable
-// allocation (observable kernel state), then evaluate the guest (interpreted
-// under jitless, safe post-ACG) and own the JS thread in the message loop until
-// the host closes the channel. Returns sbox_status_ok on clean completion.
+// allocation (observable kernel state) before servicing any envelope, then own
+// the channel until the host closes it: route inbound frames to their runtime
+// slots, create and close runtimes, and post each runtime's output. Returns
+// sbox_status_ok on clean completion.
 //==========================================================================
 sbox_status SBOX_CDECL V8HostEngineRun(sbox_worker worker,
                                       const sbox_worker_api* api) {
@@ -1039,106 +1708,124 @@ sbox_status SBOX_CDECL V8HostEngineRun(sbox_worker worker,
   if (!g_expect_acg && !exec_post)
     return sbox_status_failed;  // trusted but executable alloc blocked -> inconsistent
 
-  if (!g_rt) {
+  if (!g_slot_count ||
+      (g_profile.precreate && g_slots[0]->state != SlotState::kRunning)) {
     printf("[v8host] run: no runtime (warmup did not complete)\n");
     return sbox_status_failed;
   }
-  Runtime& rt = *g_rt;
 
-  const LONGLONG t_run_entry = g_perf.now();
-  bool js_ok = false;
-  bool host_closed = false;
-  RunLoopCtx dctx{&rt};
-  try {
-    auto guest_buf = std::make_shared<StringBuffer>(g_guest_src);
-    const char* guest_url = g_use_guest_file ? "guest.js" : "user.js";
-    auto prepared = rt.prepareJavaScript(guest_buf, guest_url);
-    const LONGLONG t_parsed = g_perf.now();
-    g_perf.emit("parse", t_run_entry, t_parsed);
-    rt.evaluatePreparedJavaScript(prepared);
-    const LONGLONG t_executed = g_perf.now();
-    g_perf.emit("execute", t_parsed, t_executed);
-    printf("[v8host] %s JS evaluated = OK\n", g_use_guest_file ? "guest" : "user");
-    rt.drainMicrotasks();
-    if (g_perf.on) {
-      if (g_first_post_qpc >= t_executed)
-        g_perf.emit("kickoff", t_executed, g_first_post_qpc);
-      else if (g_first_post_qpc != 0)
-        printf("[v8host][perf] %-14s = (during execute, synchronous)\n",
-               "kickoff");
-    }
-
-    // Event loop — owns the JS thread. Wait on inbound messages, engine-posted
-    // foreground tasks, and the host close signal. Messaging goes through the
-    // container's sbox_worker_api, never the sandbox core.
-    HANDLE inbound = static_cast<HANDLE>(g_api->inbound_event(g_worker));
-    HANDLE close_evt = static_cast<HANDLE>(g_api->close_event(g_worker));
-    if (!inbound || !close_evt) {
-      printf("[v8host] run: channel handles missing\n");
-      return sbox_status_failed;
-    }
-    HANDLE waits[3] = {inbound, g_tasks->wake, close_evt};
-    printf("[v8host] entering JS message loop (until host closes channel)\n");
-    for (;;) {
-      DWORD w = ::WaitForMultipleObjects(3, waits, FALSE, INFINITE);
-      const bool closing = w == WAIT_OBJECT_0 + 2;
-      if (closing || w == WAIT_OBJECT_0) {
-        g_api->drain_messages(g_worker, &OnInbound, &dctx);
-      } else if (w == WAIT_OBJECT_0 + 1) {  // engine-posted foreground task(s)
-        RunQueuedTasks(g_tasks);
-      } else {
-        printf("[v8host] message loop wait failed: wait=%lu error=%lu\n", w,
-               w == WAIT_FAILED ? ::GetLastError() : ERROR_INVALID_FUNCTION);
-        break;
-      }
-      if (dctx.failed)
-        break;
-      rt.drainMicrotasks();
-      ServiceActiveRunTerminal(&dctx);
-      ServicePendingStarts(&dctx, closing);
-      if (closing) {
-        host_closed = true;
-        break;
-      }
-    }
-    js_ok = host_closed && !dctx.failed;
-    printf("[v8host] JS loop exited: onmessage delivered %d string + %d binary\n",
-           dctx.strings, dctx.binaries);
-  } catch (const JSError& e) {
-    printf("[v8host] JS error: %s\n", e.getMessage().c_str());
-  } catch (const std::exception& e) {
-    printf("[v8host] exception: %s\n", e.what());
+  // The message loop — this thread is the only one that drains or posts. It
+  // waits on inbound messages, the host close signal, runtime output, and the
+  // runtime threads. Messaging goes through the container's sbox_worker_api,
+  // never the sandbox core.
+  HANDLE inbound = static_cast<HANDLE>(g_api->inbound_event(g_worker));
+  HANDLE close_evt = static_cast<HANDLE>(g_api->close_event(g_worker));
+  if (!inbound || !close_evt) {
+    printf("[v8host] run: channel handles missing\n");
+    return sbox_status_failed;
+  }
+  // Runtime 1 of a V1 worker evaluates the guest before any envelope.
+  if (g_profile.precreate) {
+    InboxItem eval;
+    eval.kind = InboxItem::Kind::kEvalGuest;
+    PushInbox(*g_slots[0], std::move(eval));
   }
 
+  MainCtx m;
+  bool host_closed = false;
+  bool pending = false;
+  size_t cursor = 0;
+  printf("[v8host] entering JS message loop (until host closes channel)\n");
+  for (;;) {
+    HANDLE waits[3 + v8host::kMaxRuntimeSlots] = {inbound, close_evt, g_main_wake};
+    DWORD count = 3;
+    for (size_t i = 0; i < g_slot_count; ++i)
+      if (g_slots[i]->thread)
+        waits[count++] = g_slots[i]->thread;
+    const DWORD w = ::WaitForMultipleObjects(count, waits, FALSE, pending ? 1 : INFINITE);
+    if (w == WAIT_FAILED) {
+      printf("[v8host] message loop wait failed: wait=%lu error=%lu\n", w,
+             ::GetLastError());
+      break;
+    }
+    const bool closing = w == WAIT_OBJECT_0 + 1;
+    if (closing || w == WAIT_OBJECT_0)
+      g_api->drain_messages(g_worker, &RouteInbound, &m);
+    // Join every runtime thread that ended. Runtime 1 of a V1 worker ends only
+    // on failure, which ends the worker.
+    for (size_t i = 0; i < g_slot_count; ++i) {
+      Slot& s = *g_slots[i];
+      if (!s.thread || ::WaitForSingleObject(s.thread, 0) != WAIT_OBJECT_0)
+        continue;
+      ::CloseHandle(s.thread);
+      s.thread = nullptr;
+      s.state = SlotState::kExited;
+      if (g_profile.precreate)
+        m.fatal = true;
+    }
+    if (m.fatal)
+      break;
+    pending = PumpOutbound(&cursor);
+    if (closing) {
+      host_closed = true;
+      break;
+    }
+  }
+
+  // Close every runtime and join the threads, with one deadline for all.
+  const bool joined = QuiesceSlots(kRuntimeJoinBudgetMs);
+  const Slot* first = g_slots[0];
+  const bool runtime_failed = g_profile.precreate && first->failed;
+  const bool js_ok = host_closed && !m.fatal && !runtime_failed;
+  printf("[v8host] JS loop exited: onmessage delivered %d string + %d binary\n",
+         first->ambient_strings, first->ambient_binaries);
   printf("[v8host] RESULT: %s\n",
          js_ok ? "PASS - untrusted JS exchanges WebView2-style messages "
                  "(postMessage/onmessage) under lockdown (jitless + ACG) via "
                  "the JSI C++ API over a generic, V8-agnostic container"
                : "FAIL");
+  if (!joined) {
+    // JS that never yields still runs inside the engine: unloading it or
+    // running its process-exit teardown under that thread is unsafe.
+    printf("[v8host] runtime threads did not stop within %lu ms; exiting\n",
+           kRuntimeJoinBudgetMs);
+    ::fflush(stdout);
+    ::TerminateProcess(::GetCurrentProcess(), kRunawayExitCode);
+  }
+  // Every runtime is gone: stop V8's platform threads now, outside the loader
+  // lock, so process exit never tears them down during DLL detach.
+  if (g_dispose_platform)
+    g_dispose_platform();
   return js_ok ? sbox_status_ok : sbox_status_failed;
 }
 
 //==========================================================================
-// Tear down the runtime BEFORE the task queue it references (the runtime's
-// destruction fires TaskRunnerDeleteCb, which touches g_tasks), then free the
-// engine handle.
+// Tear down the runtimes (each runtime's destruction fires TaskRunnerDeleteCb on
+// its slot's queue, so the slots outlive them), then free the engine handle.
 //==========================================================================
 void SBOX_CDECL V8HostEngineShutdown(sbox_worker /*w*/) {
-  if (g_rt) {
-    delete g_rt;
-    g_rt = nullptr;
+  if (QuiesceSlots(kRuntimeJoinBudgetMs)) {
+    FreeSlots();
+    if (g_engine) {
+      ::FreeLibrary(g_engine);
+      g_engine = nullptr;
+    }
+  } else {
+    // Never unload the engine under a thread that still runs JS in it.
+    printf("[v8host] shutdown: runtime threads still running\n");
   }
-  if (g_tasks) {
-    if (g_tasks->wake)
-      ::CloseHandle(g_tasks->wake);
-    ::DeleteCriticalSection(&g_tasks->cs);
-    delete g_tasks;
-    g_tasks = nullptr;
+  if (g_main_wake) {
+    ::CloseHandle(g_main_wake);
+    g_main_wake = nullptr;
   }
-  if (g_engine) {
-    ::FreeLibrary(g_engine);
-    g_engine = nullptr;
-  }
+  g_snapshots.clear();
+  g_profile = v8host::V8HostWorkerProfile();
+  g_set_task_runner = nullptr;
+  g_set_microtask = nullptr;
+  g_set_snapshot = nullptr;
+  g_runtime_create = nullptr;
+  g_dispose_platform = nullptr;
+  g_expect_acg = true;
   printf("[v8host] shutdown\n");
 }
 

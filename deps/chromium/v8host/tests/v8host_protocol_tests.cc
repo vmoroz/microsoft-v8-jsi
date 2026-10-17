@@ -582,6 +582,35 @@ bool WorkerRuntimeRejects(std::string* detail) {
     return !DecodeCreateWorkerPayload(b.data(), b.size(), &worker) && worker.max_runtimes == 123;
   };
   const auto frames = WorkerRuntimeFrames();
+  {
+    std::vector<uint8_t> body(frames[0].begin() + 32, frames[0].end());
+    Reader prefix(body.data(), body.size());
+    uint16_t schema = 0, fixed = 0;
+    uint32_t session_size = 0;
+    if (!prefix.GetU16(&schema) || !prefix.GetU16(&fixed) ||
+        !prefix.GetU32(&session_size))
+      return Fail(detail, "worker session header");
+    auto overlap = body;
+    PatchU32(overlap, 4, session_size + 4);
+    if (!reject_worker(overlap))
+      return Fail(detail, "worker session overlaps trailer");
+
+    CreateWorkerPayload expected;
+    if (!DecodeCreateWorkerPayload(body.data(), body.size(), &expected))
+      return Fail(detail, "worker forward-compat baseline");
+    // CREATE_SESSION permits additive fixed fields. The worker trailer starts
+    // at the enlarged session total_size, not at its old offset.
+    body.insert(body.begin() + fixed, {0xAA, 0xBB, 0xCC, 0xDD});
+    body[2] = static_cast<uint8_t>(fixed + 4);
+    body[3] = static_cast<uint8_t>((fixed + 4) >> 8);
+    PatchU32(body, 4, session_size + 4);
+    if (!DecodeCreateWorkerPayload(body.data(), body.size(), &worker) ||
+        worker.max_runtimes != expected.max_runtimes ||
+        worker.flags != expected.flags || worker.engine_dll != expected.engine_dll ||
+        worker.snapshot_paths != expected.snapshot_paths ||
+        worker.session.app_container_profile != expected.session.app_container_profile)
+      return Fail(detail, "worker forward-compat session/trailer offset");
+  }
   for (size_t which : {0u, 2u, 5u}) {
     const auto& f = frames[which];
     std::vector<uint8_t> body(f.begin() + 32, f.end());

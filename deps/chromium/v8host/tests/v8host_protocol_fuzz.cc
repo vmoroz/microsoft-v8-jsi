@@ -354,12 +354,14 @@ void ExerciseDecoders(const uint8_t* data, size_t size) {
       }
       case MessageType::CREATE_WORKER: {
         CreateWorkerPayload p;
-        DecodeCreateWorkerPayload(payload, payload_size, &p);
+        if (DecodeCreateWorkerPayload(payload, payload_size, &p))
+          ValidateCreateWorkerPayload(p);
         break;
       }
       case MessageType::CREATE_RUNTIME: {
         CreateRuntimePayload p;
-        DecodeCreateRuntimePayload(payload, payload_size, &p);
+        if (DecodeCreateRuntimePayload(payload, payload_size, &p))
+          ValidateCreateRuntimePayload(p, kMaxWorkerSnapshots);
         break;
       }
       case MessageType::RUNTIME_CLOSED: {
@@ -402,9 +404,11 @@ void ExerciseDecoders(const uint8_t* data, size_t size) {
   StartRunPayload srp;
   DecodeStartRunPayload(data, size, &srp);
   CreateWorkerPayload added0;
-  DecodeCreateWorkerPayload(data, size, &added0);
+  if (DecodeCreateWorkerPayload(data, size, &added0))
+    ValidateCreateWorkerPayload(added0);
   CreateRuntimePayload added1;
-  DecodeCreateRuntimePayload(data, size, &added1);
+  if (DecodeCreateRuntimePayload(data, size, &added1))
+    ValidateCreateRuntimePayload(added1, kMaxWorkerSnapshots);
   RuntimeClosedPayload added2;
   DecodeRuntimeClosedPayload(data, size, &added2);
   StartupReadyPayload added3;

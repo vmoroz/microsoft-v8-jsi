@@ -783,6 +783,191 @@ bool ConcurrentPostVsClose(std::string* detail) {
   return true;
 }
 
+struct BrokerRecorder {
+  std::vector<char> kinds;
+  std::vector<v8host_status> statuses;
+  std::vector<void*> handles;
+  size_t bytes = 0;
+  bool wrong_thread = false;
+  std::function<void()> during;
+  void Record(char kind, void* handle, v8host_status status) {
+    kinds.push_back(kind);
+    handles.push_back(handle);
+    statuses.push_back(status);
+    wrong_thread |= ::GetCurrentThreadId() != G().callback_thread_id();
+    if (during) during();
+  }
+};
+
+void V8HOST_CDECL BrokerState(void* p, v8host_broker b,
+                            v8host_broker_state, v8host_status s) {
+  static_cast<BrokerRecorder*>(p)->Record('b', b, s);
+}
+void V8HOST_CDECL WorkerState(void* p, v8host_worker w,
+                            v8host_worker_state, v8host_status s) {
+  static_cast<BrokerRecorder*>(p)->Record('w', w, s);
+}
+void V8HOST_CDECL RuntimeState(void* p, v8host_runtime r,
+                             v8host_runtime_state, v8host_status s) {
+  static_cast<BrokerRecorder*>(p)->Record('r', r, s);
+}
+void V8HOST_CDECL BrokerRelay(void* p, v8host_run r, v8host_message_kind,
+                            const void*, size_t size) {
+  auto* rec = static_cast<BrokerRecorder*>(p);
+  rec->bytes += size;
+  rec->Record('m', r, v8host_status_ok);
+}
+
+struct BrokerFixture {
+  BrokerRecorder record;
+  SessionDispatch* dispatch = nullptr;
+  int releases = 0;
+  int posts = 0;
+  BrokerFixture() {
+    v8host_broker_callbacks table = V8HOST_BROKER_CALLBACKS_INIT;
+    table.user_data = &record;
+    table.on_broker_state = BrokerState;
+    table.on_worker_state = WorkerState;
+    table.on_runtime_state = RuntimeState;
+    table.on_relay_message = BrokerRelay;
+    dispatch = SessionDispatch::CreateBroker(
+        &G(), reinterpret_cast<v8host_broker>(1), table);
+  }
+  ~BrokerFixture() {
+    if (dispatch) dispatch->CloseAndRelease();
+    DrainRemaining();
+  }
+  v8host_status Post(uint32_t worker, uint32_t runtime,
+                     v8host::client::PostOverflow* overflow,
+                     const void* bytes = nullptr, size_t size = 0) {
+    SessionDispatch::BrokerPost post;
+    post.kind = size ? SessionDispatch::EventKind::kRelay :
+                runtime ? SessionDispatch::EventKind::kRuntimeState :
+                          SessionDispatch::EventKind::kWorkerState;
+    post.worker_id = worker;
+    post.runtime_id = runtime;
+    post.object = reinterpret_cast<void*>(static_cast<uintptr_t>(runtime ? runtime : worker));
+    post.run = FakeRun(runtime);
+    post.data = bytes;
+    post.size = size;
+    post.holder = &releases;
+    post.release = [](void* p) { ++*static_cast<int*>(p); };
+    ++posts;
+    return dispatch->PostBroker(std::move(post), overflow);
+  }
+};
+
+bool BrokerRuntimeBoundary(std::string* detail) {
+  using v8host::client::PostOverflow;
+  for (bool overflow : {false, true}) {
+    BrokerFixture f;
+    if (!f.dispatch) return Fail(detail, "broker dispatch create");
+    PostOverflow effect;
+    for (unsigned i = 0; i != 256; ++i)
+      if (f.Post(1, 2, &effect) != v8host_status_ok || effect != PostOverflow::kNone)
+        return Fail(detail, "runtime cap rejected <=256");
+    if (f.Post(1, 3, &effect) != v8host_status_ok) return Fail(detail, "sibling post");
+    if (overflow &&
+        (f.Post(1, 2, &effect) != v8host_status_callback_backpressure ||
+         effect != PostOverflow::kRuntime || f.releases != 256))
+      return Fail(detail, "257th runtime post did not drop/release exactly its 256 predecessors");
+    DrainRemaining();
+    if (f.record.kinds.size() != (overflow ? 2u : 257u) ||
+        f.releases != f.posts || f.record.wrong_thread)
+      return Fail(detail, "runtime cap delivery/reference balance");
+    if (overflow &&
+        (f.record.handles[0] != reinterpret_cast<void*>(3) ||
+         f.record.statuses[1] != v8host_status_callback_backpressure))
+      return Fail(detail, "runtime terminal supersession affected sibling");
+  }
+  return true;
+}
+
+bool BrokerEventBoundary(std::string* detail) {
+  using v8host::client::PostOverflow;
+  for (bool overflow : {false, true}) {
+    BrokerFixture f;
+    PostOverflow effect;
+    for (unsigned i = 0; i != 4096; ++i)
+      if (f.Post(1, 0, &effect) != v8host_status_ok || effect != PostOverflow::kNone)
+        return Fail(detail, "worker events did not count to exactly 4096");
+    if (overflow) {
+      if (f.Post(2, 0, &effect) != v8host_status_callback_backpressure ||
+          effect != PostOverflow::kBroker || f.releases != f.posts)
+        return Fail(detail, "4097th event did not clear all holders");
+      if (f.Post(3, 0, &effect) != v8host_status_callback_backpressure ||
+          effect != PostOverflow::kNone || f.releases != f.posts)
+        return Fail(detail, "broker overflow did not remain sticky/release rejected holder");
+    }
+    DrainRemaining();
+    if (f.record.kinds.size() != (overflow ? 1u : 4096u) ||
+        f.releases != f.posts || f.record.wrong_thread ||
+        (overflow && (f.record.kinds[0] != 'b' ||
+                      f.record.statuses[0] != v8host_status_callback_backpressure)))
+      return Fail(detail, "global event cap callback/reference balance");
+  }
+  return true;
+}
+
+bool BrokerByteBoundary(std::string* detail) {
+  using v8host::client::PostOverflow;
+  const std::string data(1u << 20, 'x');
+  for (bool overflow : {false, true}) {
+    BrokerFixture f;
+    PostOverflow effect;
+    for (unsigned i = 0; i != 16; ++i)
+      if (f.Post(1, i + 1, &effect, data.data(), data.size()) != v8host_status_ok)
+        return Fail(detail, "exact 16 MiB copied-byte cap");
+    if (overflow &&
+        (f.Post(2, 17, &effect, "x", 1) != v8host_status_callback_backpressure ||
+         effect != PostOverflow::kBroker || f.releases != f.posts))
+      return Fail(detail, "16 MiB + 1 did not release all copied events");
+    DrainRemaining();
+    if (f.releases != f.posts || f.record.wrong_thread ||
+        f.record.bytes != (overflow ? 0u : 16u << 20) ||
+        f.record.kinds.size() != (overflow ? 1u : 16u))
+      return Fail(detail, "byte cap delivery/reference balance");
+    if (!overflow &&
+        f.Post(1, 1, &effect, data.data(), data.size()) != v8host_status_ok)
+      return Fail(detail, "drain failed to return copied-byte credit");
+  }
+  return true;
+}
+
+bool BrokerLifetimeAccounting(std::string* detail) {
+  using v8host::client::PostOverflow;
+  const int baseline = SessionDispatch::live_count();
+  {
+    BrokerFixture f;
+    PostOverflow effect;
+    const std::string data(1u << 20, 'x');
+    for (unsigned i = 0; i != 16; ++i)
+      if (f.Post(i < 8 ? 1 : 2, i + 1, &effect, data.data(), data.size()) != v8host_status_ok)
+        return Fail(detail, "lifetime fill");
+    f.dispatch->Suppress(0, 1);
+    if (f.releases != 1) return Fail(detail, "runtime suppression reference");
+    if (f.Post(1, 1, &effect, data.data(), data.size()) != v8host_status_ok)
+      return Fail(detail, "runtime suppression did not return bytes/count");
+    f.dispatch->Suppress(1, 0);
+    if (f.releases != 9) return Fail(detail, "worker suppression descendant references");
+    for (unsigned i = 0; i != 8; ++i)
+      if (f.Post(1, i + 1, &effect, data.data(), data.size()) != v8host_status_ok)
+        return Fail(detail, "worker suppression did not return bytes/count");
+    f.record.during = [&] {
+      // This must be outside the queue lock, with the current event still held.
+      if (f.releases != 9) f.record.wrong_thread = true;
+      auto* dispatch = f.dispatch;
+      f.dispatch = nullptr;
+      dispatch->CloseAndRelease();
+    };
+    DrainRemaining();
+    if (f.record.kinds.size() != 1 || f.releases != f.posts || f.record.wrong_thread)
+      return Fail(detail, "reentrant close lifetime/current event/drop accounting");
+  }
+  return SessionDispatch::live_count() == baseline ||
+      Fail(detail, "broker drain reference leaked after close");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -807,6 +992,10 @@ int main(int argc, char** argv) {
       {"close", "suppression-nonblocking", CloseSuppression},
       {"close", "from-callback-stress", CloseFromCallbackStress},
       {"concurrency", "post-vs-close", ConcurrentPostVsClose},
+      {"broker", "runtime-cap-boundary", BrokerRuntimeBoundary},
+      {"broker", "event-cap-boundary", BrokerEventBoundary},
+      {"broker", "copied-byte-boundary", BrokerByteBoundary},
+      {"broker", "lifetime-accounting", BrokerLifetimeAccounting},
   };
 
   // `--all` (or no filter) runs everything; RunTests also honors --suite/--case.

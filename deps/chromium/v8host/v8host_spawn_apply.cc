@@ -96,14 +96,26 @@ bool ApplySpawnConfig(const V8HostSpawnConfigV1& spawn,
   if (api->allow_engine_dll(cfg, AsSboxChar16(engine)) != sbox_status_ok)
     return false;
 
-  // Encode the bound worker profile (jitless + effective engine + snapshot) into
-  // the opaque plugin_data the worker decodes in warmup. set_plugin_data enforces
-  // the 4 KiB ceiling and poisons the builder if exceeded.
-  V8HostWorkerProfileV1 profile;
-  profile.jitless = jitless ? 1u : 0u;
-  profile.engine_dll = spawn.engine_dll;
-  profile.snapshot_path = spawn.snapshot_path;
-  const std::vector<uint8_t> blob = profile.Encode();
+  // Encode the bound worker profile into the opaque plugin_data the worker
+  // decodes in warmup: V1 (jitless + engine + one snapshot) for a session, V2
+  // (plus the runtime cap and the snapshot list) for an explicit worker.
+  // set_plugin_data enforces the 4 KiB ceiling and poisons the builder if
+  // exceeded.
+  std::vector<uint8_t> blob;
+  if (spawn.max_runtimes == 0) {
+    V8HostWorkerProfileV1 profile;
+    profile.jitless = jitless ? 1u : 0u;
+    profile.engine_dll = spawn.engine_dll;
+    profile.snapshot_path = spawn.snapshot_path;
+    blob = profile.Encode();
+  } else {
+    V8HostWorkerProfileV2 profile;
+    profile.jitless = jitless ? 1u : 0u;
+    profile.max_runtimes = spawn.max_runtimes;
+    profile.engine_dll = spawn.engine_dll;
+    profile.snapshot_paths = spawn.snapshot_paths;
+    blob = profile.Encode();
+  }
   if (api->set_plugin_data(cfg, blob.data(), blob.size()) != sbox_status_ok)
     return false;
   return true;

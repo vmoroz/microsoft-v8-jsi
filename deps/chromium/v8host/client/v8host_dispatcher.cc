@@ -279,6 +279,156 @@ SessionDispatch* SessionDispatch::Create(Dispatcher* dispatcher,
   return session;
 }
 
+SessionDispatch* SessionDispatch::CreateBroker(Dispatcher* dispatcher,
+                                               v8host_broker_s* broker,
+                                               const v8host_broker_callbacks& table) {
+  SessionDispatch* dispatch = Create(dispatcher, nullptr, 0);
+  if (dispatch == nullptr)
+    return nullptr;
+  dispatch->broker_ = broker;
+  dispatch->broker_table_ = table;
+  return dispatch;
+}
+
+SessionDispatch::Event& SessionDispatch::Event::operator=(Event&& other) noexcept {
+  if (this != &other) {
+    Drop();
+    kind = other.kind;
+    table = other.table;
+    run = other.run;
+    object = other.object;
+    code = other.code;
+    status = other.status;
+    data = std::move(other.data);
+    worker_id = other.worker_id;
+    runtime_id = other.runtime_id;
+    holder = other.holder;
+    release = other.release;
+    other.holder = nullptr;
+    other.release = nullptr;
+  }
+  return *this;
+}
+
+void SessionDispatch::Event::Drop() {
+  if (release != nullptr && holder != nullptr)
+    release(holder);
+  holder = nullptr;
+  release = nullptr;
+}
+
+void SessionDispatch::Account(const Event& event, int delta) {
+  if (broker_ == nullptr)
+    return;
+  if (event.runtime_id != 0) {
+    size_t& count = runtime_counts_[event.runtime_id];
+    count += delta;
+    if (count == 0)
+      runtime_counts_.erase(event.runtime_id);
+  }
+  queued_bytes_ += delta > 0 ? event.data.size() : 0;
+  queued_bytes_ -= delta < 0 ? event.data.size() : 0;
+}
+
+template <typename Predicate>
+void SessionDispatch::EraseLocked(Predicate&& matches) {
+  for (auto it = queue_.begin(); it != queue_.end();) {
+    if (matches(*it)) {
+      Account(*it, -1);
+      it = queue_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void SessionDispatch::ClearLocked() {
+  queue_.clear();
+  runtime_counts_.clear();
+  queued_bytes_ = 0;
+}
+
+v8host_status SessionDispatch::PostBroker(BrokerPost&& post, PostOverflow* overflow) {
+  *overflow = PostOverflow::kNone;
+  Event event;
+  event.kind = post.kind;
+  event.run = post.run;
+  event.object = post.object;
+  event.code = post.code;
+  event.status = post.status;
+  if (post.size > 0)
+    event.data.assign(static_cast<const uint8_t*>(post.data),
+                      static_cast<const uint8_t*>(post.data) + post.size);
+  event.worker_id = post.worker_id;
+  event.runtime_id = post.runtime_id;
+  event.holder = post.holder;
+  event.release = post.release;
+  post.holder = nullptr;
+  v8host_status result = v8host_status_ok;
+  bool need_post = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_)
+      return v8host_status_invalid_state;
+    if (backpressure_failed_)
+      return v8host_status_callback_backpressure;
+    if (queue_.size() >= kBrokerQueueCapacity ||
+        event.data.size() > kBrokerQueueBytes - queued_bytes_) {
+      // The app thread isn't draining: fail the broker once and stickily. Its
+      // disconnected terminal supersedes every pending child terminal.
+      backpressure_failed_ = true;
+      ClearLocked();
+      Event terminal;
+      terminal.kind = EventKind::kBrokerState;
+      terminal.code = v8host_broker_state_disconnected;
+      terminal.status = v8host_status_callback_backpressure;
+      queue_.push_back(std::move(terminal));
+      *overflow = PostOverflow::kBroker;
+      result = v8host_status_callback_backpressure;
+    } else if (event.runtime_id != 0 &&
+               runtime_counts_[event.runtime_id] >= kRuntimeQueueCapacity) {
+      // The runtime's closed terminal supersedes its pending events, and keeps
+      // the overflowing event's reference to the runtime.
+      const uint32_t runtime_id = event.runtime_id;
+      EraseLocked([&](const Event& queued) { return queued.runtime_id == runtime_id; });
+      Event terminal;
+      terminal.kind = EventKind::kRuntimeState;
+      terminal.object = event.object;
+      terminal.code = v8host_runtime_state_closed;
+      terminal.status = v8host_status_callback_backpressure;
+      terminal.worker_id = event.worker_id;
+      terminal.runtime_id = runtime_id;
+      terminal.holder = event.holder;
+      terminal.release = event.release;
+      event.holder = nullptr;
+      event.release = nullptr;
+      Account(terminal, +1);
+      queue_.push_back(std::move(terminal));
+      *overflow = PostOverflow::kRuntime;
+      result = v8host_status_callback_backpressure;
+    } else {
+      if (post.terminal && post.arbiter != nullptr && !post.arbiter->TryClaimTerminal())
+        return v8host_status_run_terminal;
+      Account(event, +1);
+      queue_.push_back(std::move(event));
+    }
+    need_post = EnsureScheduledLocked();
+  }
+  if (need_post && !dispatcher_->PostDrain(this)) {
+    OnPostFailed();
+    return v8host_status_internal_error;
+  }
+  return result;
+}
+
+void SessionDispatch::Suppress(uint32_t worker_id, uint32_t runtime_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  EraseLocked([&](const Event& queued) {
+    return runtime_id != 0 ? queued.runtime_id == runtime_id
+                           : queued.worker_id == worker_id;
+  });
+}
+
 SessionDispatch::SessionDispatch(Dispatcher* dispatcher,
                                  uint64_t id,
                                  v8host_session_s* handle,
@@ -404,7 +554,7 @@ v8host_status SessionDispatch::Enqueue(Event&& event,
       // this path) -- the session failure subsumes the run's terminal, and
       // backpressure_failed_ is sticky so no second terminal is ever delivered.
       backpressure_failed_ = true;
-      queue_.clear();
+      ClearLocked();
       Event terminal;
       terminal.kind = EventKind::kSessionState;
       terminal.table = current_table_;
@@ -447,7 +597,7 @@ void SessionDispatch::OnPostFailed() {
     std::lock_guard<std::mutex> lock(mutex_);
     scheduled_ = false;
     backpressure_failed_ = true;
-    queue_.clear();
+    ClearLocked();
   }
   Release();  // balance the AddRef taken in EnsureScheduledLocked
 }
@@ -473,6 +623,7 @@ void SessionDispatch::DrainLoop() {
       }
       event = std::move(queue_.front());
       queue_.pop_front();
+      Account(event, -1);
     }
     // No lock held: the callback may reenter (post/set_callbacks/close).
     Invoke(event);
@@ -480,6 +631,41 @@ void SessionDispatch::DrainLoop() {
 }
 
 void SessionDispatch::Invoke(const Event& event) {
+  if (broker_ != nullptr) {
+    const v8host_broker_callbacks& t = broker_table_;
+    switch (event.kind) {
+      case EventKind::kBrokerState:
+        if (t.on_broker_state)
+          t.on_broker_state(t.user_data, broker_,
+                            static_cast<v8host_broker_state>(event.code), event.status);
+        break;
+      case EventKind::kWorkerState:
+        if (t.on_worker_state)
+          t.on_worker_state(t.user_data, static_cast<v8host_worker>(event.object),
+                            static_cast<v8host_worker_state>(event.code), event.status);
+        break;
+      case EventKind::kRuntimeState:
+        if (t.on_runtime_state)
+          t.on_runtime_state(t.user_data, static_cast<v8host_runtime>(event.object),
+                             static_cast<v8host_runtime_state>(event.code), event.status);
+        break;
+      case EventKind::kRunEvent:
+        if (t.on_run_event)
+          t.on_run_event(t.user_data, event.run,
+                         static_cast<v8host_run_event>(event.code), event.status);
+        break;
+      case EventKind::kRelay:
+        if (t.on_relay_message)
+          t.on_relay_message(t.user_data, event.run,
+                             static_cast<v8host_message_kind>(event.code),
+                             event.data.empty() ? nullptr : event.data.data(),
+                             event.data.size());
+        break;
+      default:
+        break;
+    }
+    return;
+  }
   switch (event.kind) {
     case EventKind::kSessionState:
       if (event.table.on_session_state) {
@@ -508,6 +694,8 @@ void SessionDispatch::Invoke(const Event& event) {
       if (event.table.on_broker_disconnect)
         event.table.on_broker_disconnect(event.table.user_data);
       break;
+    default:
+      break;
   }
 }
 
@@ -521,7 +709,7 @@ void SessionDispatch::CloseAndRelease() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     closed_ = true;
-    queue_.clear();  // suppress pending, not-yet-delivered callbacks
+    ClearLocked();  // suppress pending, not-yet-delivered callbacks
   }
   // Drop the creator's reference. If a drain is in progress it holds its own
   // reference, so destruction is deferred until that callback unwinds.

@@ -9,8 +9,9 @@ entry (see [`sbox.h`](../sandbox_dll/sbox.h), `SBOX_ABI_VERSION` 8), which retur
 the `sbox_plugin_api` vtable of those functions. The DLL also exports the
 `v8host_*` client API for hosts that drive `sbox.exe` (see
 [`v8host_client.h`](../../../src/public/v8host_client.h), `V8HOST_ABI_VERSION`
-2): `v8host_initialize`, the session and run functions, and the
-`v8host_config_*` / `v8host_run_config_*` setters (29 exports in all). It links the JSI C++ API (`jsi_cpp`) but **never
+3): `v8host_initialize`, the session shortcut and run functions, the
+broker/worker/runtime topology (`v8host_broker_*`, `v8host_worker_*`,
+`v8host_runtime_*`), and their builder setters (62 exports in all). It links the JSI C++ API (`jsi_cpp`) but **never
 the sandbox core** — it reaches the message channel only through the
 `sbox_worker_api` function pointers the container hands it.
 
@@ -27,19 +28,34 @@ the `LowerToken` boundary and exposed as the plugin vtable:
   into the opaque `plugin_data` the container carries to the worker. The tier and
   engine are overridable for testing via `SBOX_TIER` / `V8HOST_ENGINE_DLL` /
   `V8HOST_SNAPSHOT` in the broker's environment.
-- **`warmup` (pre-lockdown):** decodes `plugin_data`, loads the engine DLL by full
-  path from the app dir (`v8jsisb.dll` jitless for Untrusted, `v8jsi.dll` for
-  Trusted), sets `--jitless` when the profile says so, optionally loads and
-  prechecks the startup snapshot, reads the guest JS, creates the JSI runtime
-  (`makeJsiAbiRuntime` over `v8_jsi_abi_runtime_create`), and installs the `host` object.
-  All codegen (engine load, snapshot deserialize, runtime create) happens
+- **`warmup` (pre-lockdown):** decodes `plugin_data` (a V1 session profile or a
+  V2 worker profile), loads the engine DLL by full path from the app dir
+  (`v8jsisb.dll` jitless for Untrusted, `v8jsi.dll` for Trusted), sets
+  `--jitless` when the profile says so, loads and prechecks the startup
+  snapshots (a snapshot without the compatibility export fails closed), reads
+  the guest JS, and sets V8 up with a throwaway JSI runtime on the main thread
+  (`makeJsiAbiRuntime` over `v8_jsi_abi_runtime_create`). A V1 session worker
+  also creates its one runtime (slot 0) on its own thread here.
+  All codegen (engine load, snapshot deserialize, V8 setup) happens
   **here**, because ACG forbids it after `lower_token`.
 - **`run` (post-lockdown):** proves ACG is in force with a blocked executable
-  allocation, evaluates the guest (interpreted under jitless, so safe post-ACG),
-  then owns the JS thread in the WebView2-style message loop
+  allocation, then the main thread is the only reader and writer of the
+  channel. It routes inbound frames by the run envelope's runtime slot, creates
+  a runtime for each `CREATE_RUNTIME` (V2 workers create runtimes only on
+  request, up to `max_runtimes`), posts each slot's outbound frames round-robin,
+  and returns relay credit (window 8). Each runtime has its own thread (1 MiB
+  stack reserve) and task queue: it evaluates the guest (interpreted under
+  jitless, so safe post-ACG) and runs the WebView2-style message loop
   (`host.postMessage` / `host.postMessageBinary` → the channel; inbound frames →
-  `host.onmessage`) until the broker closes the channel.
-- **`shutdown`:** tears down the runtime and the engine handle.
+  `host.onmessage`). `host.postMessage` blocks at 8 queued guest frames. A
+  frame for a slot past `max_runtimes` or for a slot that never held a
+  runtime, or a `CREATE_RUNTIME` for an occupied slot, ends the worker; late
+  frames for a slot whose runtime has closed are dropped. `RUNTIME_CLOSED` is sent after the slot's thread has
+  joined and its outbound frames have drained.
+- **`shutdown`:** joins every runtime thread within one shared 1 s wait. If a
+  runtime is stuck, the worker ends itself with exit code 18; otherwise it
+  disposes the engine's V8 platform (`v8_node_api_dispose_platform`, when the
+  engine exports it) and releases the engine handle.
 
 ## Engine host behavior
 
@@ -78,3 +94,20 @@ runtime created (warmup, pre-lockdown)`, `LowerToken survived`,
 `exec-alloc(post)=BLOCKED (ACG in force) (err=1655)`, the guest `JS evaluated =
 OK`, the broker's `worker reply = "js echo: ping from broker"` (real guest JS
 executed under lockdown), and `worker_exit=0 ... -> PASS`.
+
+## Public topology tests
+
+`v8host_broker_tests.exe --suite=topology,security,boundary,failure` exercises
+the DLL's public broker, worker, and runtime API in owned child processes from
+the build output directory. The cases query ACG after worker security readiness
+and before the first runtime open, run isolated JS globals behind explicit
+message barriers, check live worker PIDs, run an explicit LPAC worker, and
+verify ordered worker/broker loss and replacement without replay.
+
+The boundary and failure compositions cover shared worker admission, runtime
+and run caps, closing-slot replacement, lifetime admission, shared relay and
+mailbox bounds, local/global callback backpressure, refused creates, queued
+parent close, and runaway cancellation. Parallelism uses started callbacks and
+guest messages before releasing the barrier, not wall-time ratios. Intentional
+worker termination and runaway shutdown retain their raw exit diagnostics;
+only the exact expected diagnostic is allowed, once, in each owning case.

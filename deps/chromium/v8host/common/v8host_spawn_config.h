@@ -79,6 +79,56 @@ struct V8HostWorkerProfileV1 {
   static bool Decode(const uint8_t* data, size_t size, V8HostWorkerProfileV1* out);
 };
 
+// ---------------------------------------------------------------------------
+// V8HostWorkerProfileV2 — an explicit worker's plugin_data blob (<= 4 KiB).
+//
+//   offset size field
+//   0      2    schema_version (u16 LE, == 2)
+//   2      2    fixed_size     (u16 LE, == 16 for v2)
+//   4      4    total_size     (u32 LE, == whole blob size)
+//   8      4    jitless        (u32 LE, 0 or 1)
+//   12     4    max_runtimes   (u32 LE, 1..16)
+//   16     ..   engine_dll     (string: bare filename)
+//   ..     4    snapshot_count (u32 LE, 0..8)
+//   ..     ..   snapshot_path[snapshot_count] (string: payload-relative)
+//
+// Snapshot paths stay relative to the payload directory; the engine joins them
+// to it, as it does engine_dll. Bounds and framing match V1.
+// ---------------------------------------------------------------------------
+inline constexpr uint16_t kWorkerProfileV2SchemaVersion = 2;
+inline constexpr uint16_t kWorkerProfileV2FixedSize = 16;
+inline constexpr uint32_t kWorkerProfileMaxRuntimes = 16;
+inline constexpr uint32_t kWorkerProfileMaxSnapshots = 8;
+
+struct V8HostWorkerProfileV2 {
+  uint32_t jitless = 0;
+  uint32_t max_runtimes = 1;
+  std::string engine_dll;
+  std::vector<std::string> snapshot_paths;
+
+  std::vector<uint8_t> Encode() const;
+  static bool Decode(const uint8_t* data, size_t size, V8HostWorkerProfileV2* out);
+};
+
+// The engine's single view of either profile schema. V1 decodes to one runtime
+// that warmup precreates, with zero or one absolute snapshot path; V2 to its
+// own runtime cap and payload-relative snapshots, with no runtime at lockdown.
+struct V8HostWorkerProfile {
+  bool jitless = true;
+  uint32_t max_runtimes = 1;
+  std::string engine_dll;
+  std::vector<std::string> snapshot_paths;
+  bool snapshots_relative = false;
+  bool precreate = true;
+};
+
+// Decode a V1 or V2 blob (selected by schema_version) into the common profile.
+bool DecodeWorkerProfile(const uint8_t* data, size_t size, V8HostWorkerProfile* out);
+
+// True iff `path` is a non-empty payload-relative path: no drive, colon, or
+// leading separator, and no empty, ".", "..", or dot/space-terminated part.
+bool IsPayloadRelativePath(const std::string& path);
+
 // One file-access rule in the spawn config: a read-only flag plus an opaque
 // path/pattern string (patterns may contain separators/colons; the config
 // builder normalizes them, so the codec only enforces strict UTF-8 / no NUL).
@@ -121,9 +171,16 @@ struct V8HostSpawnFileRule {
 // on; LPAC implies AppContainer. engine_dll is a bare payload-dir filename;
 // snapshot_path may be empty. `fixed_size`/`total_size` discipline mirrors
 // V8HostWorkerProfileV1.
+//
+// Schema 2 (an explicit worker) is the same layout with fixed_size 56: a u32
+// max_runtimes (1..16) at offset 52, an empty snapshot_path, and then
+// snapshot_count (u32, <= 8) payload-relative snapshot paths after it. A
+// session always encodes schema 1, so its bytes don't change.
 // ---------------------------------------------------------------------------
 inline constexpr uint16_t kSpawnConfigSchemaVersion = 1;
 inline constexpr uint16_t kSpawnConfigFixedSize = 52;
+inline constexpr uint16_t kSpawnConfigV2SchemaVersion = 2;
+inline constexpr uint16_t kSpawnConfigV2FixedSize = 56;
 inline constexpr uint32_t kSpawnConfigMaxSize = 64 * 1024;  // configure_data cap
 
 struct V8HostSpawnConfigV1 {
@@ -143,6 +200,10 @@ struct V8HostSpawnConfigV1 {
   int32_t effective_tier = 0;
   std::string engine_dll;     // bare app-dir filename (UTF-8)
   std::string snapshot_path;  // optional (UTF-8), empty = none
+  // Explicit workers only (schema 2): 1..16 selects V8HostWorkerProfileV2; 0
+  // is a session (schema 1, V8HostWorkerProfileV1).
+  uint32_t max_runtimes = 0;
+  std::vector<std::string> snapshot_paths;  // payload-relative
 
   // Encode to the bounded LE payload above. Trusts the caller's fields.
   std::vector<uint8_t> Encode() const;

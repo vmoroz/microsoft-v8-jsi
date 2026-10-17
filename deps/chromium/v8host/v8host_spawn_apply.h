@@ -17,8 +17,9 @@ namespace v8host {
 
 // Drive every applicable sbox_config_api setter from `spawn`: ACG, integrity,
 // tokens, each file rule, AppContainer, each capability, and the effective
-// engine-DLL allow; then encode the bound V8HostWorkerProfileV1 and set it as the
-// opaque plugin_data. Every setter status is checked.
+// engine-DLL allow; then encode the bound worker profile (V1 for a session, V2
+// for an explicit worker) and set it as the opaque plugin_data. Every setter
+// status is checked.
 //
 // Returns false (fail closed; the caller must not spawn) if `api`/`cfg` is null,
 // any setter rejects its input, the effective tier and the armed ACG are

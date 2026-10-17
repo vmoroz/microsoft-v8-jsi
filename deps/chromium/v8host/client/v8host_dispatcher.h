@@ -56,6 +56,17 @@ void FailNextCallbackCopyForTesting();
 // consumer to a small, fixed footprint.
 inline constexpr size_t kSessionQueueCapacity = 256;
 
+// Broker-mode caps (design §6.4): each runtime, counting its runs and its own
+// state events, may have kRuntimeQueueCapacity queued callbacks; the whole
+// broker kBrokerQueueCapacity events and kBrokerQueueBytes of copied relay
+// bytes.
+inline constexpr size_t kRuntimeQueueCapacity = 256;
+inline constexpr size_t kBrokerQueueCapacity = 4096;
+inline constexpr size_t kBrokerQueueBytes = 16u << 20;
+
+// What a broker-mode post did besides queuing its event.
+enum class PostOverflow : uint8_t { kNone, kRuntime, kBroker };
+
 class SessionDispatch;
 class RunTerminalArbiter;
 
@@ -223,6 +234,54 @@ class SessionDispatch {
                                  v8host_session_s* handle,
                                  int32_t failed_state);
 
+  // Creates a broker's dispatch: one FIFO for every event of the broker, its
+  // workers, runtimes, and runs, in a single global order, delivered through
+  // the broker's table (copied here, fixed for the broker's life).
+  static SessionDispatch* CreateBroker(Dispatcher* dispatcher,
+                                       v8host_broker_s* broker,
+                                       const v8host_broker_callbacks& table);
+
+  enum class EventKind : uint8_t {
+    kSessionState,
+    kRunEvent,
+    kRelay,
+    kDisconnect,
+    kBrokerState,
+    kWorkerState,
+    kRuntimeState,
+  };
+
+  // A broker-mode event. `object` is the worker or runtime a state event names
+  // (and, for run and relay events, the run's runtime). worker_id/runtime_id
+  // key the per-runtime cap and close suppression. The event keeps `holder`
+  // alive until it is delivered or dropped, then calls release(holder).
+  struct BrokerPost {
+    EventKind kind = EventKind::kBrokerState;
+    void* object = nullptr;
+    v8host_run_s* run = nullptr;
+    int32_t code = 0;
+    v8host_status status = v8host_status_ok;
+    const void* data = nullptr;
+    size_t size = 0;
+    uint32_t worker_id = 0, runtime_id = 0;
+    bool terminal = false;
+    RunTerminalArbiter* arbiter = nullptr;
+    void* holder = nullptr;
+    void (*release)(void*) = nullptr;
+  };
+
+  // Queues a broker-mode event; the caller holds the broker's lock. Returns as
+  // the session posts do. On a runtime's overflow its pending events are
+  // dropped and one runtime closed(callback_backpressure) is queued; on the
+  // broker's overflow everything is dropped and one
+  // disconnected(callback_backpressure) is queued, and later posts fail.
+  // *overflow says which happened.
+  v8host_status PostBroker(BrokerPost&& post, PostOverflow* overflow);
+
+  // Drops every queued event of a closed runtime (runtime_id != 0) or of a
+  // closed worker and all its runtimes and runs.
+  void Suppress(uint32_t worker_id, uint32_t runtime_id);
+
   SessionDispatch(const SessionDispatch&) = delete;
   SessionDispatch& operator=(const SessionDispatch&) = delete;
 
@@ -295,20 +354,23 @@ class SessionDispatch {
                          size_t len);
   v8host_status PostDisconnect();
 
-  enum class EventKind : uint8_t {
-    kSessionState,
-    kRunEvent,
-    kRelay,
-    kDisconnect,
-  };
-
   struct Event {
     EventKind kind = EventKind::kSessionState;
     v8host_callbacks table{};  // snapshot captured at post time (zero = decline)
     v8host_run_s* run = nullptr;
+    void* object = nullptr;  // broker mode: the worker or runtime named
     int32_t code = 0;  // session state / run event / relay kind
     v8host_status status = v8host_status_ok;
     std::vector<uint8_t> data;  // owned copy of a relay payload
+    uint32_t worker_id = 0, runtime_id = 0;
+    void* holder = nullptr;
+    void (*release)(void*) = nullptr;
+
+    Event() = default;
+    Event(Event&& other) noexcept { *this = std::move(other); }
+    Event& operator=(Event&& other) noexcept;
+    ~Event() { Drop(); }
+    void Drop();
   };
 
   SessionDispatch(Dispatcher* dispatcher,
@@ -324,11 +386,21 @@ class SessionDispatch {
   void OnPostFailed();
   void DrainLoop();
   void Invoke(const Event& event);
+  // Broker-mode accounting for an event entering (+1) or leaving (-1) queue_.
+  void Account(const Event& event, int delta);
+  template <typename Predicate>
+  void EraseLocked(Predicate&& matches);
+  void ClearLocked();
 
   Dispatcher* const dispatcher_;
   const uint64_t id_;
   v8host_session_s* const handle_;
   const int32_t failed_state_;
+  // Broker mode (null broker_ for a session).
+  v8host_broker_s* broker_ = nullptr;
+  v8host_broker_callbacks broker_table_{};
+  std::unordered_map<uint32_t, size_t> runtime_counts_;
+  size_t queued_bytes_ = 0;
 
   std::atomic<int> refcount_{1};
 

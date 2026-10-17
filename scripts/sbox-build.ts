@@ -649,9 +649,9 @@ interface SandboxBinary {
 const sandboxBinaries: SandboxBinary[] = [
   // sbox.exe budget: <= 2 MiB (measured ~1.76 MiB; floor at the Hybrid CRT).
   { file: "sbox.exe", maxBytes: 2 * 1024 * 1024 },
-  // v8host.dll budget: <= 640 KiB (measured 581,632 bytes): plugin + engine
+  // v8host.dll budget: <= 704 KiB (measured 692,736 bytes): plugin + engine
   // glue + coordinator router + client; the engine DLL is loaded at runtime.
-  { file: "v8host.dll", maxBytes: 640 * 1024 },
+  { file: "v8host.dll", maxBytes: 704 * 1024 },
 ];
 
 // Gate 2: Hybrid CRT. No sandbox binary may import vcruntime140 / msvcp140;

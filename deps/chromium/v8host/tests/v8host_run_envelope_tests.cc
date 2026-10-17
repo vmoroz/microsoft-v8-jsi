@@ -144,7 +144,7 @@ bool DetectMagic(std::string* detail) {
 }
 
 bool CanonicalResultVector(std::string* detail) {
-  // RESULT(kCancelled, run_id=7): magic "V8RE" | type 4 | reserved 0 | run 7 |
+  // RESULT(kCancelled, run_id=7): magic "V8RE" | type 4 | slot 0 | run 7 |
   // disposition 1 = exactly 16 bytes, identical on every arch.
   RunEnvelope in;
   in.type = RunEnvelopeType::kResult;
@@ -166,18 +166,21 @@ bool RejectPaths(std::string* detail) {
        {}});
   bad[0] ^= 0xFF;
   CHECK(!DecodeRunEnvelope(bad.data(), bad.size(), &out), "bad magic accepted");
-  // Unknown env_type (0 and 6).
-  for (uint8_t t : {uint8_t{0}, uint8_t{6}}) {
+  // Unknown env_type (0 and 11).
+  for (uint8_t t : {uint8_t{0}, uint8_t{11}}) {
     std::vector<uint8_t> f =
         Bytes({0x56, 0x38, 0x52, 0x45, t, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                0x00});
     CHECK(!DecodeRunEnvelope(f.data(), f.size(), &out), "unknown type accepted");
   }
-  // reserved != 0.
+  // Slot 16 is out of range; slot 15 remains valid.
   std::vector<uint8_t> rsv =
-      Bytes({0x56, 0x38, 0x52, 0x45, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+      Bytes({0x56, 0x38, 0x52, 0x45, 0x03, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
              0x00});
-  CHECK(!DecodeRunEnvelope(rsv.data(), rsv.size(), &out), "reserved!=0 accepted");
+  CHECK(!DecodeRunEnvelope(rsv.data(), rsv.size(), &out), "slot 16 accepted");
+  rsv[6] = 15;
+  CHECK(DecodeRunEnvelope(rsv.data(), rsv.size(), &out) && out.slot == 15,
+        "CANCEL slot 15 rejected");
   // RESULT with out-of-range disposition (2).
   std::vector<uint8_t> disp =
       Bytes({0x56, 0x38, 0x52, 0x45, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -204,6 +207,107 @@ bool RejectPaths(std::string* detail) {
   return true;
 }
 
+bool SlotCodecBoundaries(std::string* detail) {
+  RunEnvelope out;
+  auto accepts = [&](const RunEnvelope& in) {
+    const auto bytes = EncodeRunEnvelope(in);
+    return DecodeRunEnvelope(bytes.data(), bytes.size(), &out);
+  };
+  for (uint16_t type = 1; type <= 10; ++type) {
+    RunEnvelope in;
+    in.type = static_cast<RunEnvelopeType>(type);
+    in.run_id = type < 6 ? 7 : 0;
+    switch (in.type) {
+      case RunEnvelopeType::kStart:
+        in.payload = {0xAA, 0x00, 0xFF};
+        break;
+      case RunEnvelopeType::kRelay:
+        in.relay_kind = -5;
+        in.payload = {0xFF, 0x00};
+        break;
+      case RunEnvelopeType::kResult:
+        in.disposition = RunEnvelopeDisposition::kCancelled;
+        break;
+      case RunEnvelopeType::kRunError:
+        in.status_code = 0x1234;
+        in.message = "redacted";
+        break;
+      case RunEnvelopeType::kCreateRuntime:
+        in.snapshot_index = 7;
+        break;
+      case RunEnvelopeType::kRuntimeClosed:
+        in.status_code = 9;
+        break;
+      case RunEnvelopeType::kCredit:
+        in.credit = 8;
+        break;
+      default:
+        break;
+    }
+    for (uint16_t slot : {uint16_t{0}, uint16_t{15}}) {
+      in.slot = slot;
+      CHECK(accepts(in), "slot round-trip decode");
+      CHECK(out.type == in.type && out.run_id == in.run_id &&
+                out.slot == in.slot && out.relay_kind == in.relay_kind &&
+                out.disposition == in.disposition &&
+                out.status_code == in.status_code && out.message == in.message &&
+                out.payload == in.payload &&
+                out.snapshot_index == in.snapshot_index && out.credit == in.credit,
+            "slot round-trip fields");
+    }
+    for (uint16_t slot : {uint16_t{16}, uint16_t{0xFFFF}}) {
+      in.slot = slot;
+      CHECK(!accepts(in), "out-of-range slot accepted");
+    }
+    in.slot = 0;
+    if (type >= 6) {
+      in.run_id = 1;
+      CHECK(!accepts(in), "runtime-control run_id 1 accepted");
+      in.run_id = 0;
+      auto bytes = EncodeRunEnvelope(in);
+      if (bytes.size() > v8host::kRunEnvelopeHeaderSize) {
+        CHECK(!DecodeRunEnvelope(bytes.data(), bytes.size() - 1, &out),
+              "truncated runtime-control body accepted");
+      }
+      bytes.push_back(0);
+      CHECK(!DecodeRunEnvelope(bytes.data(), bytes.size(), &out),
+            "runtime-control trailing byte accepted");
+    }
+  }
+  RunEnvelope in;
+  in.type = RunEnvelopeType::kCreateRuntime;
+  for (int32_t index : {-2, -1, 7, 8}) {
+    in.snapshot_index = index;
+    CHECK(accepts(in) == (index == -1 || index == 7), "snapshot index bounds");
+    if (index == -1 || index == 7)
+      CHECK(out.snapshot_index == index, "snapshot index mismatch");
+  }
+  in = RunEnvelope{};
+  in.type = RunEnvelopeType::kRuntimeClosed;
+  for (uint32_t status : {0u, 1u, 8u, 9u, 10u}) {
+    in.status_code = status;
+    CHECK(accepts(in) == (status == 0 || status == 9), "closed status bounds");
+    if (status == 0 || status == 9)
+      CHECK(out.status_code == status, "closed status mismatch");
+  }
+  in = RunEnvelope{};
+  in.type = RunEnvelopeType::kCredit;
+  for (uint32_t count : {0u, 1u, 8u, 9u}) {
+    in.credit = count;
+    CHECK(accepts(in) == (count == 1 || count == 8), "credit bounds");
+    if (count == 1 || count == 8)
+      CHECK(out.credit == count, "credit mismatch");
+  }
+  in.slot = 3;
+  in.credit = 8;
+  CHECK(EncodeRunEnvelope(in) ==
+            Bytes({0x56, 0x38, 0x52, 0x45, 0x0A, 0x00, 0x03, 0x00,
+                   0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00}),
+        "canonical CREDIT bytes");
+  CHECK(CanonicalResultVector(detail), detail->c_str());
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -216,6 +320,7 @@ int main(int argc, char** argv) {
       {"detect", "magic", DetectMagic},
       {"vector", "result-canonical", CanonicalResultVector},
       {"reject", "fail-closed-paths", RejectPaths},
+      {"slot", "codec-boundaries", SlotCodecBoundaries},
   };
   return v8host::test::RunTests(argc, argv, tests);
 }

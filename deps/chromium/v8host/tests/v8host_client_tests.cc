@@ -55,6 +55,7 @@ v8host_status g_main_init_status = v8host_status_internal_error;
 v8host_status g_racer_init_status = v8host_status_internal_error;
 DWORD g_initializing_thread = 0;
 bool g_preinitialize_output_was_nulled = false;
+bool g_preinitialize_broker_output_was_nulled = false;
 std::atomic<int> g_inbound_ok{0};
 std::atomic<int> g_inbound_invalid{0};
 std::atomic<int> g_inbound_other{0};
@@ -103,13 +104,21 @@ class FakeTransport final : public ClientTransport {
 
   v8host_status Start() override {
     started = true;
+    if (hold_until_start) {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (closed.load()) return v8host_status_connect_failed;
+      for (auto& frame : waiting)
+        outbound.push_back(std::move(frame));
+      waiting.clear();
+    }
     if (inline_failure) delegate_->OnDisconnect(TransportDisconnect::kConnectFailed);
     delegate_->OnConnected(1, kWireVersionMajor, kWireVersionMinor);
     return start_status;
   }
   v8host_status SendFrame(const uint8_t* bytes, size_t len) override {
     std::lock_guard<std::mutex> lock(mutex);
-    outbound.emplace_back(bytes, bytes + len);
+    auto& frames = hold_until_start && !started ? waiting : outbound;
+    frames.emplace_back(bytes, bytes + len);
     return send_status;
   }
   uint32_t conn_id() const override { return 1; }
@@ -129,12 +138,17 @@ class FakeTransport final : public ClientTransport {
   void Disconnect() {
     delegate_->OnDisconnect(TransportDisconnect::kBrokerLost);
   }
+  void Disconnect(TransportDisconnect reason) {
+    delegate_->OnDisconnect(reason);
+  }
 
   ClientTransportDelegate* delegate_;
   std::mutex mutex;
   std::vector<std::vector<uint8_t>> outbound;
+  std::vector<std::vector<uint8_t>> waiting;
   std::atomic<bool> closed{false};
   bool started = false, inline_failure = false;
+  bool hold_until_start = false;
   v8host_status start_status = v8host_status_ok;
   v8host_status send_status = v8host_status_ok;
 };
@@ -341,6 +355,1079 @@ v8host_session_s* Create(FakeTransport** fake = nullptr) {
   if (fake)
     *fake = LatestFake();
   return session;
+}
+
+struct TopologyEvent {
+  char kind;
+  void* handle;
+  int32_t code;
+  v8host_status status;
+  std::string data;
+};
+
+struct TopologyRecorder {
+  std::vector<TopologyEvent> events;
+  bool wrong_thread = false;
+  std::function<void(char, void*)> during;
+
+  void Record(char kind, void* handle, int32_t code, v8host_status status,
+              std::string data = {}) {
+    wrong_thread |= ::GetCurrentThreadId() != g_initializing_thread;
+    events.push_back({kind, handle, code, status, std::move(data)});
+    if (during)
+      during(kind, handle);
+  }
+};
+
+void V8HOST_CDECL TopologyBroker(void* p, v8host_broker b,
+                               v8host_broker_state state, v8host_status status) {
+  static_cast<TopologyRecorder*>(p)->Record('b', b, state, status);
+}
+void V8HOST_CDECL TopologyWorker(void* p, v8host_worker w,
+                               v8host_worker_state state, v8host_status status) {
+  static_cast<TopologyRecorder*>(p)->Record('w', w, state, status);
+}
+void V8HOST_CDECL TopologyRuntime(void* p, v8host_runtime r,
+                                v8host_runtime_state state, v8host_status status) {
+  static_cast<TopologyRecorder*>(p)->Record('r', r, state, status);
+}
+void V8HOST_CDECL TopologyRun(void* p, v8host_run r,
+                            v8host_run_event event, v8host_status status) {
+  static_cast<TopologyRecorder*>(p)->Record('u', r, event, status);
+}
+void V8HOST_CDECL TopologyRelay(void* p, v8host_run r, v8host_message_kind kind,
+                              const void* data, size_t size) {
+  static_cast<TopologyRecorder*>(p)->Record(
+      'm', r, kind, v8host_status_ok,
+      size ? std::string(static_cast<const char*>(data), size) : std::string());
+}
+
+template <typename Config>
+v8host_status V8HOST_CDECL ConfigureTopology(void* p, Config config) {
+  return (*static_cast<std::function<v8host_status(Config)>*>(p))(config);
+}
+
+using WorkerSetup = std::function<v8host_status(v8host_worker_config)>;
+using RuntimeSetup = std::function<v8host_status(v8host_runtime_config)>;
+using RunSetup = std::function<v8host_status(v8host_run_config)>;
+
+// Own every host reference independently, including children of closed parents.
+struct TopologyFixture {
+  TopologyRecorder record;
+  v8host_broker broker = nullptr;
+  FakeTransport* fake = nullptr;
+  std::vector<v8host_worker> workers;
+  std::vector<v8host_runtime> runtimes;
+
+  ~TopologyFixture() {
+    for (auto r : runtimes)
+      v8host_runtime_close(r);
+    for (auto w : workers)
+      v8host_worker_close(w);
+    v8host_broker_close(broker);
+    Drain();
+  }
+  bool Open(bool connect = true) {
+    std::function<v8host_status(v8host_broker_config)> configure =
+        [&](v8host_broker_config c) {
+          v8host_broker_callbacks table = V8HOST_BROKER_CALLBACKS_INIT;
+          table.user_data = &record;
+          table.on_broker_state = TopologyBroker;
+          table.on_worker_state = TopologyWorker;
+          table.on_runtime_state = TopologyRuntime;
+          table.on_run_event = TopologyRun;
+          table.on_relay_message = TopologyRelay;
+          auto status = v8host_broker_config_set_mode(c, v8host_broker_mode_shared);
+          if (status == v8host_status_ok)
+            status = v8host_broker_config_set_callbacks(c, &table);
+          return status;
+        };
+    if (v8host_broker_open(ConfigureTopology<v8host_broker_config>, &configure,
+                           &broker) != v8host_status_ok)
+      return false;
+    fake = LatestFake();
+    fake->hold_until_start = !connect;
+    if (connect)
+      Drain();
+    record.events.clear();
+    return true;
+  }
+  v8host_status Worker(v8host_worker* out, WorkerSetup configure = {}) {
+    auto status = v8host_worker_open(
+        broker, configure ? ConfigureTopology<v8host_worker_config> : nullptr,
+        &configure, out);
+    if (status == v8host_status_ok)
+      workers.push_back(*out);
+    return status;
+  }
+  v8host_status Runtime(v8host_worker w, v8host_runtime* out,
+                        RuntimeSetup configure = {}) {
+    auto status = v8host_runtime_open(
+        w, configure ? ConfigureTopology<v8host_runtime_config> : nullptr,
+        &configure, out);
+    if (status == v8host_status_ok)
+      runtimes.push_back(*out);
+    return status;
+  }
+  v8host_status Run(v8host_runtime r, v8host_run* out, RunSetup configure = {}) {
+    return v8host_runtime_start_run(
+        r, configure ? ConfigureTopology<v8host_run_config> : nullptr,
+        &configure, out);
+  }
+  void Close(v8host_runtime r) {
+    v8host_runtime_close(r);
+    for (auto& entry : runtimes)
+      if (entry == r) entry = nullptr;
+  }
+  void Close(v8host_worker w) {
+    v8host_worker_close(w);
+    for (auto& entry : workers)
+      if (entry == w) entry = nullptr;
+  }
+  size_t Count(MessageType type) {
+    size_t count = 0;
+    for (size_t i = 0; i < fake->FrameCount(); ++i) {
+      FrameHeader h;
+      auto bytes = fake->Frame(i);
+      if (DecodeAndValidateFrame(bytes.data(), bytes.size(), &h) == DecodeStatus::kOk &&
+          h.type == type)
+        ++count;
+    }
+    return count;
+  }
+  std::vector<uint8_t> Request(MessageType type, uint32_t target,
+                               uint32_t run = 0) {
+    for (size_t i = 0; i < fake->FrameCount(); ++i) {
+      auto bytes = fake->Frame(i);
+      FrameHeader h;
+      if (DecodeAndValidateFrame(bytes.data(), bytes.size(), &h) == DecodeStatus::kOk &&
+          h.type == type && h.target_id == target && h.run_id == run)
+        return bytes;
+    }
+    return {};
+  }
+  void Refuse(MessageType type, uint32_t target, StatusCode code) {
+    auto bytes = Request(type, target);
+    FrameHeader h;
+    if (DecodeAndValidateFrame(bytes.data(), bytes.size(), &h) != DecodeStatus::kOk)
+      return;
+    ErrorPayload error;
+    error.status_code = code;
+    fake->Inbound(BuildErrorFrame(h, error));
+  }
+  void Ready(v8host_worker w, v8host_runtime r = nullptr) {
+    const uint32_t id = v8host_worker_get_id(w);
+    fake->Inbound(EventFrame(MessageType::STARTUP_READY, id));
+    fake->Inbound(EventFrame(MessageType::SECURITY_READY, id));
+    if (r)
+      fake->Inbound(EventFrame(MessageType::RUNTIME_READY, v8host_runtime_get_id(r)));
+    Drain();
+    record.events.clear();
+  }
+  void RuntimeFailed(v8host_runtime r) {
+    FrameHeader h;
+    h.version_major = kWireVersionMajor;
+    h.version_minor = kWireVersionMinor;
+    h.conn_id = 1;
+    h.target_id = v8host_runtime_get_id(r);
+    fake->Inbound(BuildRuntimeClosedFrame(h, RuntimeClosedPayload{}));
+  }
+  void Relay(v8host_runtime r, v8host_run run, const void* data, size_t size) {
+    FrameHeader h;
+    h.version_major = kWireVersionMajor;
+    h.version_minor = kWireVersionMinor;
+    h.conn_id = 1;
+    h.target_id = v8host_runtime_get_id(r);
+    h.run_id = v8host_run_get_id(run);
+    h.type = MessageType::RELAY_FROM_WORKER;
+    fake->Inbound(BuildRelayFrame(h, v8host_message_kind_binary,
+                                  static_cast<const uint8_t*>(data), size));
+  }
+};
+
+WorkerSetup WorkerOptions(uint32_t max = 1, uint32_t flags = 0) {
+  return [=](v8host_worker_config c) {
+    auto status = v8host_worker_config_set_max_runtimes(c, max);
+    if (status == v8host_status_ok)
+      status = v8host_worker_config_set_flags(c, static_cast<v8host_worker_flags>(flags));
+    return status;
+  };
+}
+
+bool SharedCoreSessionParity(std::string* detail) {
+  FakeTransport* fake = nullptr;
+  auto session = Create(&fake);
+  if (!session) return Fail(detail, "session open");
+  Recorder first, second;
+  auto table = Callbacks(&first);
+  v8host_session_set_callbacks(session, &table);
+  Drain();
+  fake->Inbound(EventFrame(MessageType::STARTUP_READY, 1));
+  table = Callbacks(&second);
+  v8host_session_set_callbacks(session, &table);
+  fake->Inbound(EventFrame(MessageType::SECURITY_READY, 1));
+  v8host_run run = nullptr;
+  auto input = BasicRun();
+  const auto status = StartRun(session, &input, &run);
+  if (status == v8host_status_ok) {
+    fake->Inbound(AckFor(fake->Frame(fake->FrameCount() - 1)));
+    fake->Inbound(ResultFrame(1, 1));
+    fake->Inbound(ResultFrame(1, 1));
+  }
+  Drain();
+  const bool ok = status == v8host_status_ok &&
+      first.states == std::vector<int32_t>{v8host_session_state_worker_startup_ready} &&
+      second.states == std::vector<int32_t>{v8host_session_state_worker_security_ready} &&
+      second.events == std::vector<int32_t>{v8host_run_event_started,
+                                            v8host_run_event_completed} &&
+      first.callback_thread == g_initializing_thread &&
+      second.callback_thread == g_initializing_thread;
+  v8host_session_close(session);
+  Drain();
+  return ok || Fail(detail, "session snapshots, FIFO, terminal CAS or callback thread changed");
+}
+
+bool SharedCoreLifetime(std::string* detail) {
+  using v8host::client::SessionDispatch;
+  const int baseline = SessionDispatch::live_count();
+  for (char close_kind : {'w', 'r', 'b'}) {
+    TopologyFixture f;
+    v8host_worker w = nullptr;
+    v8host_runtime r = nullptr;
+    if (!f.Open() || f.Worker(&w) != v8host_status_ok ||
+        f.Runtime(w, &r) != v8host_status_ok)
+      return Fail(detail, "graph open");
+    if (close_kind == 'w') {
+      f.fake->Inbound(EventFrame(MessageType::STARTUP_READY, v8host_worker_get_id(w)));
+      f.fake->Inbound(EventFrame(MessageType::SECURITY_READY, v8host_worker_get_id(w)));
+    }
+    if (close_kind == 'b')
+      f.fake->delegate_->OnConnected(1, kWireVersionMajor, kWireVersionMinor);
+    const auto runtime_id = v8host_runtime_get_id(r);
+    f.fake->Inbound(EventFrame(MessageType::RUNTIME_READY, runtime_id));
+    f.fake->Inbound(EventFrame(MessageType::RUNTIME_READY, runtime_id));
+    f.record.during = [&](char kind, void* handle) {
+      if (kind == close_kind) {
+        // Reenter getters and close while the event owns the current reference.
+        (void)v8host_worker_get_id(w);
+        if (kind == 'w' && handle == w) f.Close(w);
+        if (kind == 'r' && handle == r) f.Close(r);
+        if (kind == 'b' && handle == f.broker) {
+          v8host_broker_close(f.broker);
+          f.broker = nullptr;
+        }
+      }
+    };
+    Drain();
+    if (f.record.events.size() != 1 || f.record.wrong_thread)
+      return Fail(detail, "callback close failed to suppress descendants or deadlocked");
+    f.record.during = {};
+    if (close_kind != 'r') {
+      v8host_run out = reinterpret_cast<v8host_run>(1);
+      if (f.Run(r, &out) != v8host_status_invalid_state || out)
+        return Fail(detail, "retained child accepted a run after callback parent close");
+    }
+  }
+  return SessionDispatch::live_count() == baseline ||
+      Fail(detail, "broker dispatch reference survived close and drain");
+}
+
+bool PrivateIdRouting(std::string* detail) {
+  TopologyFixture f;
+  v8host_worker w1 = nullptr, w2 = nullptr;
+  v8host_runtime r1 = nullptr, r2 = nullptr, r3 = nullptr;
+  if (!f.Open(false) || f.Worker(&w1, WorkerOptions(2)) != v8host_status_ok ||
+      f.Runtime(w1, &r1) != v8host_status_ok ||
+      f.Runtime(w1, &r2) != v8host_status_ok ||
+      f.Worker(&w2) != v8host_status_ok)
+    return Fail(detail, "preconnect graph");
+  if (f.fake->FrameCount() != 0 || v8host_worker_get_process_id(w1) != 0 ||
+      v8host_worker_get_id(w1) != 1 || v8host_runtime_get_id(r1) != 2 ||
+      v8host_runtime_get_id(r2) != 3 || v8host_worker_get_id(w2) != 4)
+    return Fail(detail, "preconnect send, PID or common target namespace");
+  Drain();
+  if (f.Count(MessageType::CREATE_WORKER) != 2 ||
+      f.Count(MessageType::CREATE_RUNTIME) != 2)
+    return Fail(detail, "preconnect FIFO was not flushed once");
+  for (size_t i = 0; i != 4; ++i) {
+    FrameHeader item;
+    const auto frame = f.fake->Frame(i);
+    if (DecodeAndValidateFrame(frame.data(), frame.size(), &item) != DecodeStatus::kOk ||
+        item.target_id != i + 1)
+      return Fail(detail, "preconnect target FIFO changed order");
+  }
+  FrameHeader h;
+  const uint8_t* body = nullptr;
+  size_t size = 0;
+  auto bytes = f.Request(MessageType::CREATE_RUNTIME, 3);
+  CreateRuntimePayload payload;
+  if (!DecodeFrame(bytes, &h, &body, &size) ||
+      !DecodeCreateRuntimePayload(body, size, &payload) ||
+      payload.worker_id != 1 || payload.snapshot_index != -1)
+    return Fail(detail, "runtime parent routing/default snapshot");
+  f.Ready(w1, r1);
+  if (v8host_worker_get_process_id(w1) != 4321)
+    return Fail(detail, "startup PID");
+  f.Close(r1);
+  if (f.Runtime(w1, &r3) != v8host_status_ok || v8host_runtime_get_id(r3) != 5)
+    return Fail(detail, "target ID reused after close");
+  f.fake->Inbound(EventFrame(MessageType::RUNTIME_READY, 2));
+  Drain();
+  if (!f.record.events.empty()) return Fail(detail, "late frame for retired ID was routed");
+  FakeTransport* session_fake = nullptr;
+  auto session = Create(&session_fake);
+  Drain();
+  auto session_bytes = session_fake->Frame(0);
+  const bool independent = session && session_fake != f.fake &&
+      DecodeFrame(session_bytes, &h, &body, &size) &&
+      h.type == MessageType::CREATE_SESSION && h.target_id == 1;
+  v8host_session_close(session);
+  if (!independent) return Fail(detail, "session connection/target namespace changed");
+  f.fake->Inbound(EventFrame(MessageType::WORKER_EXIT, 1));
+  Drain();
+  if (v8host_worker_get_process_id(w1) != 0)
+    return Fail(detail, "worker PID remained valid after closed callback");
+  return !f.record.wrong_thread || Fail(detail, "wrong callback thread");
+}
+
+bool PrivateRunRouting(std::string* detail) {
+  TopologyFixture f;
+  v8host_worker w = nullptr;
+  v8host_runtime a = nullptr, b = nullptr;
+  v8host_run ra = nullptr, rb = nullptr;
+  if (!f.Open() || f.Worker(&w, WorkerOptions(2)) != v8host_status_ok ||
+      f.Runtime(w, &a) != v8host_status_ok || f.Runtime(w, &b) != v8host_status_ok ||
+      f.Run(a, &ra) != v8host_status_ok || f.Run(b, &rb) != v8host_status_ok)
+    return Fail(detail, "two-runtime runs");
+  if (v8host_run_get_id(ra) != 1 || v8host_run_get_id(rb) != 1 ||
+      f.Request(MessageType::START_RUN, v8host_runtime_get_id(a), 1).empty() ||
+      f.Request(MessageType::START_RUN, v8host_runtime_get_id(b), 1).empty() ||
+      !f.record.events.empty())
+    return Fail(detail, "pre-ready run routing or premature callback");
+  // The broker holds these requests until ready; an open/start is only admission.
+  f.Ready(w, a);
+  f.fake->Inbound(EventFrame(MessageType::RUNTIME_READY, v8host_runtime_get_id(b)));
+  f.fake->Inbound(AckFor(f.Request(MessageType::START_RUN, v8host_runtime_get_id(a), 1)));
+  f.fake->Inbound(AckFor(f.Request(MessageType::START_RUN, v8host_runtime_get_id(b), 1)));
+  f.Relay(b, rb, "b", 1);
+  f.Relay(a, ra, "a", 1);
+  if (v8host_run_cancel(ra) != v8host_status_ok ||
+      v8host_run_cancel(rb) != v8host_status_ok ||
+      f.Request(MessageType::CANCEL_RUN, v8host_runtime_get_id(a), 1).empty() ||
+      f.Request(MessageType::CANCEL_RUN, v8host_runtime_get_id(b), 1).empty())
+    return Fail(detail, "two outstanding cancels lost target correlation");
+  f.fake->Inbound(ResultFrame(v8host_runtime_get_id(a), 1, ResultDisposition::kCancelled));
+  f.fake->Inbound(ResultFrame(v8host_runtime_get_id(b), 1));
+  f.fake->Inbound(ResultFrame(v8host_runtime_get_id(a), 1));
+  f.Relay(a, ra, "late", 4);
+  Drain();
+  const auto& events = f.record.events;
+  if (events.size() != 7 || events[1].handle != ra || events[2].handle != rb ||
+      events[3].handle != rb || events[3].data != "b" ||
+      events[4].handle != ra || events[4].data != "a" ||
+      events[5].code != v8host_run_event_cancelled || events[5].handle != ra ||
+      events[6].code != v8host_run_event_completed || events[6].handle != rb)
+    return Fail(detail, "cross-runtime relay/run routing or duplicate terminal");
+  const size_t sent = f.fake->FrameCount();
+  f.fake->Disconnect();
+  Drain();
+  return (f.fake->FrameCount() == sent && !f.record.wrong_thread) ||
+      Fail(detail, "disconnect replayed traffic or callback thread changed");
+}
+
+bool CloseOrderAndFlags(std::string* detail) {
+  for (uint32_t flags : {0u, static_cast<uint32_t>(v8host_worker_flags_single_use),
+                         static_cast<uint32_t>(v8host_worker_flags_close_when_empty)}) {
+    TopologyFixture f;
+    v8host_worker w = nullptr;
+    v8host_runtime r = nullptr, next = reinterpret_cast<v8host_runtime>(1);
+    if (!f.Open() || f.Worker(&w, WorkerOptions(1, flags)) != v8host_status_ok)
+      return Fail(detail, "flag worker");
+    if (f.Count(MessageType::CLOSE_WORKER) != 0)
+      return Fail(detail, "initial-empty worker auto-closed");
+    if (f.Runtime(w, &r) != v8host_status_ok ||
+        f.Runtime(w, &next) != v8host_status_quota_exceeded || next)
+      return Fail(detail, "default/max runtime admission boundary");
+    const auto id = v8host_worker_get_id(w);
+    f.fake->Inbound(EventFrame(MessageType::RUNTIME_READY, v8host_runtime_get_id(r)));
+    f.Close(r);
+    Drain();
+    if (!f.record.events.empty())
+      return Fail(detail, "runtime close did not suppress queued callback");
+    const auto status = f.Runtime(w, &next);
+    const auto expected = flags == 0 ? v8host_status_ok :
+        flags == v8host_worker_flags_single_use ? v8host_status_quota_exceeded :
+                                                 v8host_status_invalid_state;
+    if (status != expected || (status != v8host_status_ok && next))
+      return Fail(detail, "default reuse/single-use/close-when-empty admission");
+    if (flags == v8host_worker_flags_close_when_empty) {
+      auto close = f.Request(MessageType::CLOSE_WORKER, id);
+      if (close.empty() || f.Count(MessageType::CLOSE_WORKER) != 1)
+        return Fail(detail, "last close did not send exactly one CLOSE_WORKER");
+      f.fake->Inbound(AckFor(close));
+      Drain();
+      if (f.record.events.size() != 1 ||
+          f.record.events[0].code != v8host_worker_state_closed ||
+          f.record.events[0].status != v8host_status_ok)
+        return Fail(detail, "close-when-empty ACK callback");
+    }
+  }
+  // Every admission-release source has the same 1 -> 0 behavior.
+  for (int source = 0; source != 3; ++source) {
+    TopologyFixture f;
+    v8host_worker w = nullptr;
+    v8host_runtime r = nullptr, out = nullptr;
+    if (!f.Open() ||
+        f.Worker(&w, WorkerOptions(1, v8host_worker_flags_close_when_empty)) != v8host_status_ok ||
+        f.Runtime(w, &r) != v8host_status_ok)
+      return Fail(detail, "admission-release graph");
+    const auto id = v8host_worker_get_id(w);
+    if (source == 0) f.RuntimeFailed(r);
+    if (source == 1) f.Refuse(MessageType::CREATE_RUNTIME, v8host_runtime_get_id(r), StatusCode::ERROR_QUOTA);
+    if (source == 2) {
+      f.Ready(w, r);
+      v8host_run run = nullptr;
+      if (f.Run(r, &run) != v8host_status_ok) return Fail(detail, "backpressure run");
+      f.fake->Inbound(AckFor(f.Request(
+          MessageType::START_RUN, v8host_runtime_get_id(r), v8host_run_get_id(run))));
+      for (int i = 0; i != 256; ++i)
+        f.Relay(r, run, "x", 1);
+    }
+    f.Close(r);  // must not decrement a second time
+    if (f.Count(MessageType::CLOSE_WORKER) != 1 ||
+        f.Runtime(w, &out) != v8host_status_invalid_state || out)
+      return Fail(detail, "failure/refusal/backpressure did not release admission exactly once");
+    f.fake->Inbound(AckFor(f.Request(MessageType::CLOSE_WORKER, id)));
+  }
+  for (int order = 0; order != 6; ++order) {
+    TopologyFixture f;
+    v8host_worker w = nullptr;
+    v8host_runtime r = nullptr;
+    if (!f.Open() || f.Worker(&w) != v8host_status_ok ||
+        f.Runtime(w, &r) != v8host_status_ok)
+      return Fail(detail, "close-order graph");
+    f.fake->Inbound(EventFrame(MessageType::RUNTIME_READY, v8host_runtime_get_id(r)));
+    if (order == 0 || order == 3) {
+      f.Close(r);
+      if (order == 3) {
+        v8host_broker_close(f.broker);
+        f.broker = nullptr;
+      }
+      f.Close(w);
+    }
+    if (order == 1 || order == 4) {
+      f.Close(w);
+      const size_t sent = f.fake->FrameCount();
+      if (v8host_runtime_get_id(r) != 0)
+        return Fail(detail, "child ID remained valid after worker close");
+      if (order == 4) {
+        v8host_broker_close(f.broker);
+        f.broker = nullptr;
+      }
+      f.Close(r);
+      if (f.fake->FrameCount() != sent) return Fail(detail, "child close sent after worker close");
+    }
+    if (order == 2 || order == 5) {
+      v8host_broker_close(f.broker);
+      f.broker = nullptr;
+      const size_t sent = f.fake->FrameCount();
+      v8host_runtime out = reinterpret_cast<v8host_runtime>(1);
+      if (v8host_worker_get_id(w) != 0 || v8host_runtime_get_id(r) != 0 ||
+          f.Runtime(w, &out) != v8host_status_invalid_state || out)
+        return Fail(detail, "broker-close child remained active");
+      if (order == 2) { f.Close(w); f.Close(r); }
+      else { f.Close(r); f.Close(w); }
+      if (f.fake->FrameCount() != sent) return Fail(detail, "child close sent after broker close");
+    }
+    Drain();
+    if (!f.record.events.empty()) return Fail(detail, "parent close leaked queued callbacks");
+  }
+  return true;
+}
+
+bool LossFanoutOrder(std::string* detail) {
+  for (int cause = 0; cause != 7; ++cause) {
+    TopologyFixture f;
+    v8host_worker w1 = nullptr, w2 = nullptr;
+    v8host_runtime a = nullptr, b = nullptr, sibling = nullptr;
+    v8host_run ra = nullptr, rb = nullptr, rs = nullptr;
+    if (!f.Open(cause != 4) ||
+        f.Worker(&w1, WorkerOptions(2, v8host_worker_flags_close_when_empty)) != v8host_status_ok ||
+        f.Runtime(w1, &a) != v8host_status_ok || f.Runtime(w1, &b) != v8host_status_ok ||
+        f.Worker(&w2) != v8host_status_ok || f.Runtime(w2, &sibling) != v8host_status_ok ||
+        f.Run(a, &ra) != v8host_status_ok || f.Run(b, &rb) != v8host_status_ok ||
+        f.Run(sibling, &rs) != v8host_status_ok)
+      return Fail(detail, "fan-out graph");
+    const uint32_t wa = v8host_worker_get_id(w1);
+    const size_t sent = f.fake->FrameCount();
+    auto expected = v8host_status_worker_exited;
+    if (cause == 0) {
+      f.fake->Inbound(EventFrame(MessageType::WORKER_EXIT, wa));
+      f.fake->Inbound(EventFrame(MessageType::WORKER_EXIT, wa));
+    } else if (cause == 1) {
+      expected = v8host_status_runtime_failed;
+      f.RuntimeFailed(a); f.RuntimeFailed(a);
+    } else if (cause == 2) {
+      expected = v8host_status_quota_exceeded;
+      f.Refuse(MessageType::CREATE_WORKER, wa, StatusCode::ERROR_QUOTA);
+    } else if (cause == 3) {
+      expected = v8host_status_protocol_error;
+      f.Refuse(MessageType::CREATE_RUNTIME, v8host_runtime_get_id(a), StatusCode::ERROR_BAD_STATE);
+    } else {
+      const auto reason = cause == 4 ? TransportDisconnect::kConnectFailed :
+                          cause == 5 ? TransportDisconnect::kProtocolError :
+                                       TransportDisconnect::kBrokerLost;
+      expected = cause == 4 ? v8host_status_connect_failed :
+                 cause == 5 ? v8host_status_protocol_error : v8host_status_broker_lost;
+      f.fake->Disconnect(reason); f.fake->Disconnect(reason);
+    }
+    Drain();
+    const auto& e = f.record.events;
+    if (cause == 1 || cause == 3) {
+      if (e.size() != 2 || e[0].handle != ra || e[0].kind != 'u' ||
+          e[0].code != v8host_run_event_failed || e[1].handle != a || e[1].kind != 'r')
+        return Fail(detail, "runtime failure/refusal order or duplicate callback");
+      v8host_run next = nullptr;
+      if (f.Run(b, &next) != v8host_status_ok) return Fail(detail, "runtime failure closed sibling");
+    } else if (cause < 4) {
+      if (e.size() != 5 || e[0].handle != ra || e[1].handle != rb ||
+          e[2].handle != a || e[3].handle != b || e[4].handle != w1 ||
+          e[0].code != (cause == 0 ? v8host_run_event_worker_exited : v8host_run_event_failed))
+        return Fail(detail, "worker exit/refused-create fan-out order");
+      v8host_run next = nullptr;
+      if (f.Run(sibling, &next) != v8host_status_ok) return Fail(detail, "worker failure closed another worker");
+    } else {
+      if (e.size() != 9 || e[0].handle != ra || e[1].handle != rb || e[2].handle != rs ||
+          e[3].handle != a || e[4].handle != b || e[5].handle != sibling ||
+          e[6].handle != w1 || e[7].handle != w2 || e[8].handle != f.broker ||
+          e[8].code != v8host_broker_state_disconnected)
+        return Fail(detail, "disconnect run/runtime/worker/broker order");
+      for (size_t i = 0; i != 3; ++i)
+        if (e[i].code != v8host_run_event_failed)
+          return Fail(detail, "disconnect did not report run_event_failed");
+      if (f.fake->FrameCount() != sent) return Fail(detail, "disconnect replayed requests");
+    }
+    for (const auto& event : e)
+      if (event.status != (cause == 0 && event.kind == 'u' ? v8host_status_run_terminal : expected))
+        return Fail(detail, "fan-out status mapping");
+    if (f.Count(MessageType::CLOSE_WORKER) != 0 || f.record.wrong_thread)
+      return Fail(detail, "loss fan-out triggered close-when-empty or wrong-thread callback");
+  }
+  return true;
+}
+
+bool CallbackCapBoundaries(std::string* detail) {
+  // Include runtime state events in the exact per-runtime limit.
+  for (int count : {256, 257}) {
+    TopologyFixture f;
+    v8host_worker w = nullptr;
+    v8host_runtime a = nullptr, b = nullptr;
+    v8host_run run = nullptr;
+    if (!f.Open() || f.Worker(&w, WorkerOptions(2)) != v8host_status_ok ||
+        f.Runtime(w, &a) != v8host_status_ok || f.Runtime(w, &b) != v8host_status_ok ||
+        f.Run(a, &run) != v8host_status_ok)
+      return Fail(detail, "callback-cap graph");
+    f.Ready(w);
+    f.fake->Inbound(EventFrame(MessageType::RUNTIME_READY, v8host_runtime_get_id(b)));
+    f.fake->Inbound(EventFrame(MessageType::RUNTIME_READY, v8host_runtime_get_id(a)));
+    f.fake->Inbound(AckFor(f.Request(MessageType::START_RUN, v8host_runtime_get_id(a), 1)));
+    for (int i = 2; i != count; ++i)
+      f.Relay(a, run, "x", 1);
+    Drain();
+    if (count == 256) {
+      if (f.record.events.size() != 257 || f.Count(MessageType::CLOSE_RUNTIME) != 0)
+        return Fail(detail, "256 callbacks overflowed early");
+      for (const auto& e : f.record.events)
+        if (e.status != v8host_status_ok)
+          return Fail(detail, "callback boundary delivery");
+    } else {
+      if (f.record.events.size() != 2 || f.record.events[0].handle != b ||
+          f.record.events[1].handle != a ||
+          f.record.events[1].code != v8host_runtime_state_closed ||
+          f.record.events[1].status != v8host_status_callback_backpressure ||
+          f.Count(MessageType::CLOSE_RUNTIME) != 1)
+        return Fail(detail, "runtime overflow did not supersede locally");
+      v8host_runtime next = nullptr;
+      if (f.Runtime(w, &next) != v8host_status_ok)
+        return Fail(detail, "overflow did not return runtime admission");
+      f.Close(a);
+      v8host_runtime extra = reinterpret_cast<v8host_runtime>(1);
+      if (f.Runtime(w, &extra) != v8host_status_quota_exceeded || extra)
+        return Fail(detail, "overflowed runtime released admission twice");
+    }
+  }
+  // Sixteen full runtime queues exactly fill the broker cap.
+  for (int count : {4096, 4097}) {
+    TopologyFixture f;
+    v8host_worker w = nullptr;
+    if (!f.Open() || f.Worker(&w, WorkerOptions(16)) != v8host_status_ok)
+      return Fail(detail, "broker-cap worker");
+    f.Ready(w);
+    for (int i = 0; i != 16; ++i) {
+      v8host_runtime r = nullptr;
+      v8host_run run = nullptr;
+      if (f.Runtime(w, &r) != v8host_status_ok || f.Run(r, &run) != v8host_status_ok)
+        return Fail(detail, "broker-cap runtime");
+      const auto id = v8host_runtime_get_id(r);
+      f.fake->Inbound(EventFrame(MessageType::RUNTIME_READY, id));
+      f.fake->Inbound(AckFor(f.Request(MessageType::START_RUN, id, 1)));
+      for (int j = 0; j != 254; ++j)
+        f.Relay(r, run, "x", 1);
+    }
+    v8host_worker extra = nullptr;
+    if (count == 4097) {
+      if (f.Worker(&extra) != v8host_status_ok) return Fail(detail, "4097th worker event");
+      f.fake->Inbound(EventFrame(MessageType::STARTUP_READY, v8host_worker_get_id(extra)));
+    }
+    Drain();
+    if (count == 4096) {
+      if (f.record.events.size() != 4096 || f.fake->closed.load())
+        return Fail(detail, "4096 broker callbacks overflowed early");
+    } else {
+      if (f.record.events.size() != 1 || f.record.events[0].kind != 'b' ||
+          f.record.events[0].code != v8host_broker_state_disconnected ||
+          f.record.events[0].status != v8host_status_callback_backpressure ||
+          !f.fake->closed.load())
+        return Fail(detail, "broker overflow terminal/connection close");
+      f.fake->Disconnect();
+      f.fake->Inbound(EventFrame(MessageType::SECURITY_READY, v8host_worker_get_id(extra)));
+      Drain();
+      if (f.record.events.size() != 1) return Fail(detail, "broker overflow was not sticky");
+    }
+  }
+  // Use bounded wire relays; copied bytes, not frame overhead, consume the cap.
+  for (bool overflow : {false, true}) {
+    TopologyFixture f;
+    v8host_worker w = nullptr;
+    if (!f.Open() || f.Worker(&w, WorkerOptions(16)) != v8host_status_ok)
+      return Fail(detail, "copied-byte worker");
+    f.Ready(w);
+    const std::string bytes(32768, 'x');
+    std::vector<std::pair<v8host_runtime, v8host_run>> traffic;
+    for (int i = 0; i != 16; ++i) {
+      v8host_runtime r = nullptr;
+      v8host_run run = nullptr;
+      if (f.Runtime(w, &r) != v8host_status_ok || f.Run(r, &run) != v8host_status_ok)
+        return Fail(detail, "copied-byte runtime");
+      const auto id = v8host_runtime_get_id(r);
+      f.fake->Inbound(EventFrame(MessageType::RUNTIME_READY, id));
+      f.fake->Inbound(AckFor(f.Request(MessageType::START_RUN, id, 1)));
+      traffic.emplace_back(r, run);
+    }
+    Drain();
+    f.record.events.clear();
+    for (const auto& [r, run] : traffic)
+      for (int j = 0; j != 32; ++j)
+        f.Relay(r, run, bytes.data(), bytes.size());
+    const auto [last, last_run] = traffic.back();
+    if (overflow) f.Relay(last, last_run, "x", 1);
+    Drain();
+    if (overflow) {
+      if (f.record.events.size() != 1 || f.record.events[0].kind != 'b' ||
+          f.record.events[0].status != v8host_status_callback_backpressure)
+        return Fail(detail, "16 MiB + 1 copied bytes did not overflow broker");
+    } else {
+      if (f.record.events.size() != 512 ||
+          f.record.events.back().data != bytes || f.fake->closed.load())
+        return Fail(detail, "exact 16 MiB copied bytes overflowed early");
+      f.record.events.clear();
+      f.Relay(last, last_run, bytes.data(), bytes.size());
+      Drain();
+      if (f.record.events.size() != 1 || f.record.events[0].kind != 'm')
+        return Fail(detail, "drain did not return copied-byte credit");
+    }
+  }
+  return true;
+}
+
+bool WorkerRuntimeBounds(std::string* detail) {
+  TopologyFixture f;
+  if (!f.Open()) return Fail(detail, "bounds broker");
+  struct Check {
+    const char* name;
+    v8host_status expected;
+    WorkerSetup configure;
+  };
+  const std::vector<Check> cases = {
+      {"max zero", v8host_status_invalid_arg, WorkerOptions(0)},
+      {"max one", v8host_status_ok, WorkerOptions(1)},
+      {"max sixteen", v8host_status_ok, WorkerOptions(16)},
+      {"max seventeen", v8host_status_quota_exceeded, WorkerOptions(17)},
+      {"unknown flags", v8host_status_invalid_arg, WorkerOptions(1, 4)},
+      {"tier", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_tier(c, static_cast<v8host_tier>(99)); }},
+      {"integrity", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_integrity_level(c, static_cast<v8host_integrity_level>(99)); }},
+      {"delayed integrity", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_delayed_integrity_level(c, static_cast<v8host_integrity_level>(99)); }},
+      {"initial token", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_initial_token_level(c, static_cast<v8host_token_level>(99)); }},
+      {"lockdown token", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_lockdown_token_level(c, static_cast<v8host_token_level>(99)); }},
+      {"UTF8 null", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_engine_dll_utf8(c, nullptr, 1); }},
+      {"UTF16 null", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_engine_dll_utf16(c, nullptr, V8HOST_AUTO_LENGTH); }},
+      {"UTF8 invalid", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_engine_dll_utf8(c, "\xc0\x80", 2); }},
+      {"UTF8 embedded null", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_engine_dll_utf8(c, "a\0b", 3); }},
+      {"UTF16 surrogate", v8host_status_invalid_arg, [](auto c) {
+        const v8host_char16 text[] = {0xd800, 0};
+        return v8host_worker_config_set_engine_dll_utf16(c, text, 1); }},
+      {"UTF16 embedded null", v8host_status_invalid_arg, [](auto c) {
+        const v8host_char16 text[] = {'a', 0, 'b'};
+        return v8host_worker_config_set_engine_dll_utf16(c, text, 3); }},
+      {"UTF8 bare engine", v8host_status_ok, [](auto c) {
+        return v8host_worker_config_set_engine_dll_utf8(c, "engine.dll-tail", 10); }},
+      {"UTF16 bare engine", v8host_status_ok, [](auto c) {
+        const v8host_char16 text[] = {'e', '.', 'd', 'l', 'l', 0};
+        return v8host_worker_config_set_engine_dll_utf16(c, text, V8HOST_AUTO_LENGTH); }},
+      {"engine path", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_engine_dll_utf8(c, "dir\\engine.dll", V8HOST_AUTO_LENGTH); }},
+      {"engine drive", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_engine_dll_utf8(c, "C:engine.dll", V8HOST_AUTO_LENGTH); }},
+      {"engine empty", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_engine_dll_utf8(c, "", 0); }},
+      {"snapshot empty", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_add_startup_snapshot_path_utf8(c, nullptr, 0); }},
+      {"snapshot absolute", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_add_startup_snapshot_path_utf8(c, "\\snap.bin", V8HOST_AUTO_LENGTH); }},
+      {"snapshot slash", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_add_startup_snapshot_path_utf8(c, "/snap.bin", V8HOST_AUTO_LENGTH); }},
+      {"snapshot drive", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_add_startup_snapshot_path_utf8(c, "C:\\snap.bin", V8HOST_AUTO_LENGTH); }},
+      {"snapshot relative", v8host_status_ok, [](auto c) {
+        return v8host_worker_config_add_startup_snapshot_path_utf8(c, "data\\snap.bin", V8HOST_AUTO_LENGTH); }},
+      {"snapshot UTF16", v8host_status_ok, [](auto c) {
+        const v8host_char16 text[] = {'s', '.', 'b', 'i', 'n', 0};
+        return v8host_worker_config_add_startup_snapshot_path_utf16(c, text, V8HOST_AUTO_LENGTH); }},
+      {"snapshot UTF16 null", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_add_startup_snapshot_path_utf16(c, nullptr, 1); }},
+      {"snapshot UTF8 invalid", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_add_startup_snapshot_path_utf8(c, "\xed\xa0\x80", 3); }},
+      {"snapshot UTF16 surrogate", v8host_status_invalid_arg, [](auto c) {
+        const v8host_char16 text[] = {0xdc00};
+        return v8host_worker_config_add_startup_snapshot_path_utf16(c, text, 1); }},
+      {"profile UTF8 null", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_profile_name_utf8(c, nullptr, 1); }},
+      {"profile UTF16 null", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_profile_name_utf16(c, nullptr, 1); }},
+      {"capability UTF8 null", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_add_capability_utf8(c, nullptr, 0); }},
+      {"capability UTF16 null", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_add_capability_utf16(c, nullptr, 0); }},
+      {"file UTF8 null", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_add_file_rule_utf8(c, nullptr, 1, true); }},
+      {"file UTF16 null", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_add_file_rule_utf16(c, nullptr, 1, true); }},
+      {"profile without container", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_profile_name_utf8(c, "profile", 7); }},
+      {"container without profile", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_use_app_container(c, true); }},
+      {"LPAC without container", v8host_status_invalid_arg, [](auto c) {
+        return v8host_worker_config_set_low_privilege_app_container(c, true); }},
+  };
+  for (const auto& test : cases) {
+    v8host_worker out = reinterpret_cast<v8host_worker>(1);
+    const size_t before = f.fake->FrameCount();
+    auto status = f.Worker(&out, test.configure);
+    if (status != test.expected || (status != v8host_status_ok &&
+                                   (out || f.fake->FrameCount() != before))) {
+      *detail = std::string("worker builder: ") + test.name;
+      return false;
+    }
+    if (status == v8host_status_ok) f.Close(out);
+  }
+  // The mirrored policy setters copy both encodings into the worker's payload.
+  v8host_worker copied = nullptr;
+  if (f.Worker(&copied, [](auto c) {
+        v8host_status s = v8host_worker_config_set_tier(c, v8host_tier_untrusted);
+        if (s == v8host_status_ok) s = v8host_worker_config_set_use_app_container(c, true);
+        if (s == v8host_status_ok) s = v8host_worker_config_set_low_privilege_app_container(c, true);
+        if (s == v8host_status_ok) s = v8host_worker_config_set_integrity_level(
+            c, static_cast<v8host_integrity_level>(0));
+        if (s == v8host_status_ok) s = v8host_worker_config_set_delayed_integrity_level(
+            c, static_cast<v8host_integrity_level>(0));
+        if (s == v8host_status_ok) s = v8host_worker_config_set_initial_token_level(
+            c, static_cast<v8host_token_level>(0));
+        if (s == v8host_status_ok) s = v8host_worker_config_set_lockdown_token_level(
+            c, static_cast<v8host_token_level>(0));
+        if (s == v8host_status_ok) s = v8host_worker_config_set_profile_name_utf8(c, "old", 3);
+        if (s == v8host_status_ok) s = v8host_worker_config_set_profile_name_utf16(
+            c, v8host::test::AsChar16(L"profile"), V8HOST_AUTO_LENGTH);
+        if (s == v8host_status_ok) s = v8host_worker_config_add_capability_utf8(c, "internetClient", 14);
+        if (s == v8host_status_ok) s = v8host_worker_config_add_capability_utf16(
+            c, v8host::test::AsChar16(L"privateNetworkClientServer"), V8HOST_AUTO_LENGTH);
+        if (s == v8host_status_ok) s = v8host_worker_config_add_file_rule_utf8(c, "data\\*", 6, true);
+        if (s == v8host_status_ok) s = v8host_worker_config_add_file_rule_utf16(
+            c, v8host::test::AsChar16(L"other\\*"), V8HOST_AUTO_LENGTH, false);
+        char engine[] = "custom.dll";
+        if (s == v8host_status_ok) s = v8host_worker_config_set_engine_dll_utf8(c, engine, 10);
+        std::memset(engine, 'x', 10);
+        if (s == v8host_status_ok) s = v8host_worker_config_set_flags(
+            c, static_cast<v8host_worker_flags>(
+                v8host_worker_flags_close_when_empty | v8host_worker_flags_single_use));
+        return s;
+      }) != v8host_status_ok)
+    return Fail(detail, "mirrored worker policy setters");
+  auto encoded = f.Request(MessageType::CREATE_WORKER, v8host_worker_get_id(copied));
+  FrameHeader header;
+  const uint8_t* body = nullptr;
+  size_t body_size = 0;
+  CreateWorkerPayload copy;
+  if (!DecodeFrame(encoded, &header, &body, &body_size) ||
+      !DecodeCreateWorkerPayload(body, body_size, &copy) ||
+      copy.engine_dll != "custom.dll" || copy.max_runtimes != 1 ||
+      copy.flags != kWorkerFlagSingleUse || copy.session.broker_mode != kEndpointModeShared ||
+      !copy.session.prohibit_dynamic_code || !copy.session.use_app_container ||
+      !copy.session.low_privilege_app_container || copy.session.app_container_profile != "profile" ||
+      copy.session.file_rules.size() != 2 || copy.session.file_rules[0].pattern != "data\\*" ||
+      !copy.session.file_rules[0].readonly || copy.session.file_rules[1].pattern != "other\\*" ||
+      copy.session.file_rules[1].readonly ||
+      copy.session.capabilities != std::vector<std::string>{"internetClient", "privateNetworkClientServer"})
+    return Fail(detail, "worker policy copy/defaults/ACG or client-only flag leaked to wire");
+  f.Close(copied);
+  for (unsigned count : {64u, 65u}) {
+    for (bool capabilities : {false, true}) {
+      v8host_worker out = reinterpret_cast<v8host_worker>(1);
+      const auto status = f.Worker(&out, [=](auto c) {
+        auto s = v8host_worker_config_set_use_app_container(c, true);
+        if (s == v8host_status_ok) s = v8host_worker_config_set_profile_name_utf8(c, "p", 1);
+        for (unsigned i = 0; s == v8host_status_ok && i != count; ++i)
+          s = capabilities ? v8host_worker_config_add_capability_utf8(c, "internetClient", 14) :
+                             v8host_worker_config_add_file_rule_utf8(c, "data\\*", 6, true);
+        return s;
+      });
+      if (status != (count == 64 ? v8host_status_ok : v8host_status_quota_exceeded) ||
+          (count == 65 && out))
+        return Fail(detail, "worker mirrored 64/65 policy limits");
+      if (out) f.Close(out);
+    }
+  }
+  for (unsigned count : {8u, 9u}) {
+    v8host_worker w = reinterpret_cast<v8host_worker>(1);
+    auto status = f.Worker(&w, [=](auto c) {
+      for (unsigned i = 0; i != count; ++i) {
+        auto s = v8host_worker_config_add_startup_snapshot_path_utf8(c, "snap.bin", 8);
+        if (s != v8host_status_ok) return s;
+      }
+      return v8host_status_ok;
+    });
+    if (status != (count == 8 ? v8host_status_ok : v8host_status_quota_exceeded) ||
+        (count == 9 && w))
+      return Fail(detail, "eight/nine snapshots");
+    if (count == 8) {
+      for (uint32_t index : {7u, 8u, UINT32_MAX}) {
+        v8host_runtime r = reinterpret_cast<v8host_runtime>(1);
+        auto s = f.Runtime(w, &r, [=](auto c) {
+          return v8host_runtime_config_set_startup_snapshot_index(c, index);
+        });
+        if (s != (index == 7 ? v8host_status_ok : v8host_status_invalid_arg) ||
+            (index != 7 && r))
+          return Fail(detail, "snapshot index bounds");
+        if (r) f.Close(r);
+      }
+      f.Close(w);
+    }
+  }
+  for (size_t total : {4096u, 4097u}) {
+    v8host_worker w = reinterpret_cast<v8host_worker>(1);
+    const size_t sent = f.fake->FrameCount();
+    auto status = f.Worker(&w, [=](auto c) {
+      auto s = v8host_worker_config_set_tier(c, v8host_tier_untrusted);
+      const std::string path(total - 39, 's');
+      return s == v8host_status_ok
+          ? v8host_worker_config_add_startup_snapshot_path_utf8(c, path.data(), path.size()) : s;
+    });
+    if (status != (total == 4096 ? v8host_status_ok : v8host_status_quota_exceeded) ||
+        (total == 4097 && (w || f.fake->FrameCount() != sent)))
+      return Fail(detail, "predictable 4096/4097 profile quota");
+    if (w) f.Close(w);
+  }
+  v8host_worker capacity = nullptr;
+  if (f.Worker(&capacity, WorkerOptions(16)) != v8host_status_ok)
+    return Fail(detail, "sixteen-runtime worker");
+  for (unsigned i = 0; i != 16; ++i) {
+    v8host_runtime r = nullptr;
+    if (f.Runtime(capacity, &r) != v8host_status_ok)
+      return Fail(detail, "sixteen simultaneous runtime admissions");
+  }
+  v8host_runtime overflow_runtime = reinterpret_cast<v8host_runtime>(1);
+  size_t capacity_sent = f.fake->FrameCount();
+  if (f.Runtime(capacity, &overflow_runtime) != v8host_status_quota_exceeded ||
+      overflow_runtime || f.fake->FrameCount() != capacity_sent)
+    return Fail(detail, "seventeenth runtime marshalled");
+  f.Close(capacity);
+  // Worker and run quotas are synchronous and may not marshal the failed call.
+  std::vector<v8host_worker> live;
+  for (int i = 0; i != 32; ++i) {
+    v8host_worker w = nullptr;
+    if (f.Worker(&w) != v8host_status_ok) return Fail(detail, "32 workers");
+    live.push_back(w);
+  }
+  v8host_worker extra = reinterpret_cast<v8host_worker>(1);
+  size_t before = f.fake->FrameCount();
+  if (f.Worker(&extra) != v8host_status_quota_exceeded || extra ||
+      f.fake->FrameCount() != before) return Fail(detail, "33rd worker marshalled");
+  v8host_runtime r = nullptr;
+  if (f.Runtime(live[0], &r) != v8host_status_ok) return Fail(detail, "quota runtime");
+  v8host_runtime default_extra = reinterpret_cast<v8host_runtime>(1);
+  before = f.fake->FrameCount();
+  if (f.Runtime(live[0], &default_extra) != v8host_status_quota_exceeded ||
+      default_extra || f.fake->FrameCount() != before)
+    return Fail(detail, "default max_runtimes was not one");
+  v8host_run run = nullptr;
+  for (int i = 0; i != 4; ++i)
+    if (f.Run(r, &run) != v8host_status_ok) return Fail(detail, "four live runs");
+  before = f.fake->FrameCount();
+  run = reinterpret_cast<v8host_run>(1);
+  if (f.Run(r, &run) != v8host_status_quota_exceeded || run ||
+      f.fake->FrameCount() != before) return Fail(detail, "fifth run marshalled");
+  f.fake->Inbound(ResultFrame(v8host_runtime_get_id(r), 1));
+  if (f.Run(r, &run) != v8host_status_ok || v8host_run_get_id(run) != 5)
+    return Fail(detail, "terminal run did not restore capacity/monotonic ID");
+  const std::vector<RunSetup> overrides = {
+      [](auto c) { return v8host_run_config_set_tier(c, v8host_tier_untrusted); },
+      [](auto c) { return v8host_run_config_set_engine_dll_utf8(c, "e.dll", 5); },
+      [](auto c) { return v8host_run_config_set_startup_snapshot_path_utf8(c, "s.bin", 5); },
+  };
+  for (const auto& configure : overrides) {
+    before = f.fake->FrameCount();
+    run = reinterpret_cast<v8host_run>(1);
+    if (f.Run(r, &run, configure) != v8host_status_profile_already_bound || run ||
+        f.fake->FrameCount() != before)
+      return Fail(detail, "runtime profile override was not refused before send");
+  }
+  return true;
+}
+
+bool PoisonAndNullOutput(std::string* detail) {
+  if (!g_preinitialize_broker_output_was_nulled)
+    return Fail(detail, "pre-initialize broker failure did not null output");
+  TopologyFixture f;
+  if (!f.Open()) return Fail(detail, "poison broker");
+  bool poison = true;
+  std::function<v8host_status(v8host_broker_config)> bad_broker = [&](auto c) {
+    poison &= v8host_broker_config_set_mode(c, static_cast<v8host_broker_mode>(99)) ==
+        v8host_status_invalid_arg;
+    poison &= v8host_broker_config_set_mode(c, v8host_broker_mode_shared) ==
+        v8host_status_invalid_arg;
+    return v8host_status_ok;
+  };
+  v8host_broker broker = reinterpret_cast<v8host_broker>(1);
+  if (v8host_broker_open(ConfigureTopology<v8host_broker_config>, &bad_broker, &broker) !=
+          v8host_status_invalid_arg || broker || !poison)
+    return Fail(detail, "broker first-error poisoning/output");
+  std::function<v8host_status(v8host_broker_config)> rejected_broker =
+      [](auto) { return v8host_status_internal_error; };
+  broker = reinterpret_cast<v8host_broker>(1);
+  if (v8host_broker_open(ConfigureTopology<v8host_broker_config>, &rejected_broker, &broker) !=
+          v8host_status_internal_error || broker)
+    return Fail(detail, "broker callback failure/output");
+  std::function<v8host_status(v8host_broker_config)> short_callbacks = [](auto c) {
+    v8host_broker_callbacks table = V8HOST_BROKER_CALLBACKS_INIT;
+    --table.struct_size;
+    (void)v8host_broker_config_set_callbacks(c, &table);
+    (void)v8host_broker_config_set_mode(c, v8host_broker_mode_shared);
+    return v8host_status_ok;
+  };
+  broker = reinterpret_cast<v8host_broker>(1);
+  if (v8host_broker_open(ConfigureTopology<v8host_broker_config>, &short_callbacks, &broker) !=
+          v8host_status_invalid_struct_size || broker)
+    return Fail(detail, "broker callback size poison/output");
+  v8host_worker worker = reinterpret_cast<v8host_worker>(1);
+  const size_t before = f.fake->FrameCount();
+  if (f.Worker(&worker, [&](auto c) {
+        poison &= v8host_worker_config_set_max_runtimes(c, 17) == v8host_status_quota_exceeded;
+        poison &= v8host_worker_config_set_flags(c, static_cast<v8host_worker_flags>(4)) ==
+            v8host_status_quota_exceeded;
+        poison &= v8host_worker_config_set_max_runtimes(c, 1) == v8host_status_quota_exceeded;
+        return v8host_status_ok;
+      }) != v8host_status_quota_exceeded || worker || !poison ||
+      f.fake->FrameCount() != before)
+    return Fail(detail, "worker first-error poisoning marshalled or changed status");
+  if (v8host_initialize(0) != v8host_status_version_mismatch ||
+      v8host_initialize(V8HOST_ABI_VERSION + 1) != v8host_status_version_mismatch ||
+      v8host_initialize(V8HOST_ABI_VERSION) != v8host_status_ok)
+    return Fail(detail, "ABI version mismatch");
+  if (v8host_worker_open(nullptr, nullptr, nullptr, &worker) != v8host_status_invalid_arg ||
+      worker || v8host_broker_open(nullptr, nullptr, nullptr) != v8host_status_invalid_arg ||
+      v8host_worker_open(f.broker, nullptr, nullptr, nullptr) != v8host_status_invalid_arg)
+    return Fail(detail, "broker/worker null outputs");
+  if (f.Worker(&worker) != v8host_status_ok) return Fail(detail, "valid worker");
+  v8host_runtime runtime = reinterpret_cast<v8host_runtime>(1);
+  if (v8host_runtime_open(nullptr, nullptr, nullptr, &runtime) != v8host_status_invalid_arg ||
+      runtime || v8host_runtime_open(worker, nullptr, nullptr, nullptr) != v8host_status_invalid_arg)
+    return Fail(detail, "runtime null outputs");
+  if (f.Runtime(worker, &runtime, [](auto) { return v8host_status_no_memory; }) !=
+          v8host_status_no_memory || runtime)
+    return Fail(detail, "runtime configure error output");
+  if (f.Runtime(worker, &runtime) != v8host_status_ok) return Fail(detail, "valid runtime");
+  v8host_run run = reinterpret_cast<v8host_run>(1);
+  if (v8host_runtime_start_run(nullptr, nullptr, nullptr, &run) != v8host_status_invalid_arg ||
+      run || v8host_runtime_start_run(runtime, nullptr, nullptr, nullptr) != v8host_status_invalid_arg)
+    return Fail(detail, "run null outputs");
+  if (f.Run(runtime, &run, [](auto c) {
+        (void)v8host_run_config_set_tier(c, static_cast<v8host_tier>(99));
+        (void)v8host_run_config_set_payload(c, nullptr, 0);
+        return v8host_status_ok;
+      }) != v8host_status_invalid_arg || run)
+    return Fail(detail, "runtime run poison/output");
+  if (f.Run(runtime, &run, [](auto) { return v8host_status_no_memory; }) !=
+          v8host_status_no_memory || run)
+    return Fail(detail, "run configure failure/output");
+  v8host_worker failed_worker = reinterpret_cast<v8host_worker>(1);
+  if (f.Worker(&failed_worker, [](auto) { return v8host_status_internal_error; }) !=
+          v8host_status_internal_error || failed_worker)
+    return Fail(detail, "worker configure failure/output");
+  if (v8host_broker_config_set_callbacks(nullptr, nullptr) != v8host_status_invalid_arg ||
+      v8host_worker_config_set_flags(nullptr, v8host_worker_flags_none) != v8host_status_invalid_arg ||
+      v8host_runtime_config_set_startup_snapshot_index(nullptr, 0) != v8host_status_invalid_arg)
+    return Fail(detail, "NULL builders");
+  f.Close(worker);
+  if (f.Run(runtime, &run) != v8host_status_invalid_state || run)
+    return Fail(detail, "closed-parent run output");
+  f.Close(runtime);
+  f.fake->Disconnect();
+  if (f.Worker(&failed_worker) != v8host_status_invalid_state || failed_worker)
+    return Fail(detail, "disconnected broker factory output");
+  v8host_broker_close(f.broker);
+  // Keep no raw broker reference after its close; child-retention cases above
+  // exercise failure calls on still-owned child handles instead.
+  f.broker = nullptr;
+  for (int operation = 0; operation != 3; ++operation) {
+    TopologyFixture rejected;
+    v8host_worker w = nullptr;
+    v8host_runtime r = nullptr;
+    if (!rejected.Open() ||
+        (operation >= 1 && rejected.Worker(&w) != v8host_status_ok) ||
+        (operation >= 2 && rejected.Runtime(w, &r) != v8host_status_ok))
+      return Fail(detail, "submission failure graph");
+    rejected.fake->send_status = v8host_status_quota_exceeded;
+    v8host_status status;
+    if (operation == 0) {
+      w = reinterpret_cast<v8host_worker>(1);
+      status = rejected.Worker(&w);
+      if (w) return Fail(detail, "worker submission failure leaked output");
+    } else if (operation == 1) {
+      r = reinterpret_cast<v8host_runtime>(1);
+      status = rejected.Runtime(w, &r);
+      if (r) return Fail(detail, "runtime submission failure leaked output");
+    } else {
+      v8host_run out = reinterpret_cast<v8host_run>(1);
+      status = rejected.Run(r, &out);
+      if (out) return Fail(detail, "run submission failure leaked output");
+    }
+    if (status != v8host_status_quota_exceeded)
+      return Fail(detail, "submission failure status changed");
+    rejected.fake->send_status = v8host_status_ok;
+    if (operation == 0 && rejected.Worker(&w) != v8host_status_ok)
+      return Fail(detail, "worker admission did not roll back");
+    if (operation == 1 && rejected.Runtime(w, &r) != v8host_status_ok)
+      return Fail(detail, "runtime admission did not roll back");
+  }
+  return true;
 }
 
 bool ConcurrentInitializeLifecycle(std::string* detail) {
@@ -2691,6 +3778,10 @@ int main(int argc, char** argv) {
       OpenSession(&preinit_config, &preinit_session) ==
           v8host_status_not_initialized &&
       preinit_session == nullptr;
+  v8host_broker preinit_broker = reinterpret_cast<v8host_broker>(1);
+  g_preinitialize_broker_output_was_nulled =
+      v8host_broker_open(nullptr, nullptr, &preinit_broker) ==
+          v8host_status_not_initialized && preinit_broker == nullptr;
   g_initializing_thread = ::GetCurrentThreadId();
   SetInitializeAfterDispatcherHookForTesting(&InitializeAfterDispatcherHook);
   std::thread racer([] {
@@ -2762,6 +3853,15 @@ int main(int argc, char** argv) {
       {"close", "flooding-nonblocking", CloseWhileFloodingNonblocking},
       {"disconnect", "no-replay", DisconnectNoReplay},
       {"race", "inbound-vs-close", InboundVsCloseRace},
+      {"dispatch", "shared-core-session-parity", SharedCoreSessionParity},
+      {"dispatch", "shared-core-lifetime", SharedCoreLifetime},
+      {"topology", "private-id-routing", PrivateIdRouting},
+      {"topology", "private-run-routing", PrivateRunRouting},
+      {"topology", "close-order-and-flags", CloseOrderAndFlags},
+      {"topology", "loss-fanout-order", LossFanoutOrder},
+      {"topology", "callback-cap-boundaries", CallbackCapBoundaries},
+      {"builders", "worker-runtime-bounds", WorkerRuntimeBounds},
+      {"builders", "poison-and-null-output", PoisonAndNullOutput},
   };
   for (auto& test : tests) {
     auto run = std::move(test.run);

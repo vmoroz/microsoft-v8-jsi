@@ -38,9 +38,11 @@ class ClientConnection;
 }
 
 struct v8host_session_s;
+struct v8host_runtime_s;
 
 struct v8host_run_s {
   v8host_session_s* session = nullptr;
+  v8host_runtime_s* runtime = nullptr;  // a runtime's run (session is null)
   uint32_t run_id = 0;
   v8host::client::RunTerminalArbiter arbiter;
   std::atomic<bool> terminal_local{false};
@@ -82,6 +84,94 @@ struct v8host_run_config_s {
   v8host_status status = v8host_status_ok;
 };
 
+// A worker builder is a session policy builder plus the worker-only fields, so
+// the mirrored policy setters reuse the session setters as they are.
+struct v8host_worker_config_s : v8host_config_s {
+  std::wstring engine;
+  std::vector<std::wstring> snapshots;
+  uint32_t max_runtimes = 1;
+  uint32_t flags = 0;
+};
+
+struct v8host_broker_config_s {
+  int32_t mode = 0;
+  v8host_broker_callbacks table{};
+  v8host_status status = v8host_status_ok;
+};
+
+struct v8host_runtime_config_s {
+  bool has_snapshot = false;
+  uint32_t snapshot_index = 0;
+  v8host_status status = v8host_status_ok;
+};
+
+// The broker graph. The broker's one mutex guards every worker, runtime, and
+// run in it, so the parent-before-child lock order holds trivially. Each object
+// is reference counted: the host holds one reference until it closes the
+// handle, a parent's map holds one while the child is live, a child holds one
+// on its parent, and each queued callback holds one on the object it names.
+// The last release deletes on the app thread.
+struct v8host_worker_s;
+struct v8host_broker_s {
+  std::atomic<int> refcount{1};
+  std::shared_ptr<v8host::client::ClientConnection> conn;
+  int32_t mode = 0;
+  v8host::client::SessionDispatch* dispatch = nullptr;
+  std::mutex mutex;
+  bool released = false;  // the host closed it
+  bool terminal = false;  // disconnected or closed: no more events
+  uint32_t next_id = 1;
+  uint32_t open_workers = 0;  // workers the host hasn't closed
+  std::unordered_map<uint32_t, v8host_worker_s*> workers;
+  std::unordered_map<uint32_t, v8host_runtime_s*> runtimes;
+
+  void AddRef() { refcount.fetch_add(1, std::memory_order_relaxed); }
+  void Release();
+};
+
+struct v8host_worker_s {
+  std::atomic<int> refcount{1};
+  v8host_broker_s* broker = nullptr;
+  uint32_t id = 0;
+  std::atomic<uint32_t> process_id{0};
+  bool released = false;
+  bool closed = false;   // closed by the host or its broker, or terminal
+  bool closing = false;  // close_when_empty sent CLOSE_WORKER
+  bool orphaned = false; // the host closed its broker: getters return 0
+  uint32_t max_runtimes = 1;
+  uint32_t flags = 0;
+  uint32_t snapshot_count = 0;
+  uint32_t admissions = 0;  // open runtimes, as the coordinator counts them
+  uint32_t created = 0;     // runtimes ever opened (single_use)
+  std::unordered_map<uint32_t, v8host_runtime_s*> runtimes;
+
+  void AddRef() { refcount.fetch_add(1, std::memory_order_relaxed); }
+  void Release();
+  ~v8host_worker_s() {
+    if (broker)
+      broker->Release();
+  }
+};
+
+struct v8host_runtime_s {
+  std::atomic<int> refcount{1};
+  v8host_worker_s* worker = nullptr;
+  uint32_t id = 0;
+  bool released = false;
+  bool closed = false;    // closed by the host or a parent, or terminal
+  bool silenced = false;  // its callback queue overflowed: no more events
+  bool orphaned = false;  // the host closed its broker: getters return 0
+  std::unordered_map<uint32_t, std::unique_ptr<v8host_run_s>> runs;
+  uint32_t next_run_id = 1;
+
+  void AddRef() { refcount.fetch_add(1, std::memory_order_relaxed); }
+  void Release();
+  ~v8host_runtime_s() {
+    if (worker)
+      worker->Release();
+  }
+};
+
 struct v8host_session_s {
   std::atomic<int> refcount{1};
   std::shared_ptr<v8host::client::ClientConnection> conn;
@@ -105,6 +195,7 @@ namespace {
 
 constexpr UINT kDestroySessionMessage = WM_APP + 0x1E;
 constexpr UINT kStartTransportMessage = WM_APP + 0x1F;
+constexpr UINT kDestroyObjectMessage = WM_APP + 0x20;
 void StartConnection(ClientConnection* connection);
 
 HINSTANCE ModuleInstance() {
@@ -231,6 +322,22 @@ class ClientRuntime {
     // the post, leaking is safer than cross-thread deletion during a callback.
   }
 
+  // Deletes a broker-graph object on the app thread, after any callback or
+  // routing call that may still use it has returned.
+  void ScheduleDelete(void* object, void (*destroy)(void*)) {
+    HWND hwnd = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      hwnd = hwnd_;
+    }
+    if (hwnd != nullptr &&
+        ::PostMessageW(hwnd, kDestroyObjectMessage, reinterpret_cast<WPARAM>(object),
+                       reinterpret_cast<LPARAM>(destroy))) {
+      return;
+    }
+    // As for sessions: leak rather than delete under a callback.
+  }
+
  private:
   static LRESULT CALLBACK WindowProc(HWND hwnd,
                                      UINT message,
@@ -246,6 +353,10 @@ class ClientRuntime {
       Instance().last_delete_thread_id_.store(::GetCurrentThreadId(),
                                                std::memory_order_release);
       delete reinterpret_cast<v8host_session_s*>(wparam);
+      return 0;
+    }
+    if (message == kDestroyObjectMessage) {
+      reinterpret_cast<void (*)(void*)>(lparam)(reinterpret_cast<void*>(wparam));
       return 0;
     }
     return ::DefWindowProcW(hwnd, message, wparam, lparam);
@@ -345,20 +456,40 @@ v8host_status MapStatus(protocol::StatusCode status) {
       return v8host_status_internal_error;
     case protocol::StatusCode::ERROR_PROFILE_ALREADY_BOUND:
       return v8host_status_profile_already_bound;
-    case protocol::StatusCode::ERROR_UNSUPPORTED_MESSAGE:
     case protocol::StatusCode::ERROR_RUNTIME_FAILED:
+      return v8host_status_runtime_failed;
+    case protocol::StatusCode::ERROR_UNSUPPORTED_MESSAGE:
     case protocol::StatusCode::ERROR_STALE_REQUEST:
       return v8host_status_protocol_error;
   }
   return v8host_status_internal_error;
 }
 
-enum class PendingType { kCreate, kStart, kCancel, kClose };
+enum class PendingType {
+  kCreate,
+  kStart,
+  kCancel,
+  kClose,
+  kCreateWorker,
+  kCloseWorker,
+  kCreateRuntime,
+  kCloseRuntime,
+};
 struct PendingControl {
   PendingType type;
-  uint32_t session_id;
+  uint32_t session_id;  // the target: a session, worker, or runtime
   uint32_t run_id;
 };
+
+// The broker side of a connection, defined after ClientConnection.
+void BrokerConnected(v8host_broker_s* broker);
+bool BrokerFrame(v8host_broker_s* broker, const protocol::FrameHeader& header,
+                 const uint8_t* payload, size_t len);
+void BrokerReply(v8host_broker_s* broker, const PendingControl& pending, bool ack,
+                 protocol::StatusCode code);
+void BrokerRelayQuota(v8host_broker_s* broker, uint32_t target, uint32_t run);
+void BrokerDisconnected(v8host_broker_s* broker, TransportDisconnect reason,
+                        v8host_status status);
 
 }  // namespace
 
@@ -449,6 +580,23 @@ class ClientConnection final
   void OnConnected(uint32_t, uint16_t major, uint16_t minor) override {
     selected_major_.store(major, std::memory_order_release);
     selected_minor_.store(minor, std::memory_order_release);
+    if (v8host_broker_s* broker = AcquireBroker()) {
+      BrokerConnected(broker);
+      broker->Release();
+    }
+  }
+
+  // A broker owns this connection instead of a session; null once it closes.
+  void SetBroker(v8host_broker_s* broker) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    broker_ = broker;
+  }
+
+  v8host_broker_s* AcquireBroker() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (broker_ != nullptr)
+      broker_->AddRef();
+    return broker_;
   }
 
   uint32_t conn_id() const {
@@ -513,6 +661,14 @@ class ClientConnection final
       return;
     }
 
+    if (v8host_broker_s* broker = AcquireBroker()) {
+      const bool ok = BrokerFrame(broker, header, payload, payload_len);
+      broker->Release();
+      if (!ok)
+        OnDisconnect(TransportDisconnect::kProtocolError);
+      return;
+    }
+
     v8host_session_s* session = AcquireSession(header.target_id);
     if (session == nullptr) {
       ObserveInboundStatusForTesting(v8host_status_invalid_state);
@@ -535,6 +691,14 @@ class ClientConnection final
             : (reason == TransportDisconnect::kConnectFailed
                    ? v8host_status_connect_failed
                    : v8host_status_broker_lost);
+    if (v8host_broker_s* broker = AcquireBroker()) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_.clear();
+      }
+      BrokerDisconnected(broker, reason, status);
+      broker->Release();
+    }
     std::vector<v8host_session_s*> sessions;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -609,6 +773,12 @@ class ClientConnection final
       OnDisconnect(TransportDisconnect::kProtocolError);
       return;
     }
+    if (v8host_broker_s* broker = AcquireBroker()) {
+      // A runtime the host already closed may still get its run's error.
+      BrokerRelayQuota(broker, header.target_id, header.run_id);
+      broker->Release();
+      return;
+    }
     v8host_session_s* session = AcquireSession(header.target_id);
     if (!session) {
       OnDisconnect(TransportDisconnect::kProtocolError);
@@ -656,6 +826,24 @@ class ClientConnection final
       return;
     if (!correlation_valid) {
       OnDisconnect(TransportDisconnect::kProtocolError);
+      return;
+    }
+    if (v8host_broker_s* broker = AcquireBroker()) {
+      bool ok = true;
+      protocol::StatusCode code = protocol::StatusCode::OK;
+      if (header.type == protocol::MessageType::ACK) {
+        protocol::AckPayload ack;
+        ok = protocol::DecodeAckPayload(payload, payload_len, &ack);
+      } else {
+        protocol::ErrorPayload error;
+        ok = protocol::DecodeErrorPayload(payload, payload_len, &error);
+        code = error.status_code;
+      }
+      if (ok)
+        BrokerReply(broker, pending, header.type == protocol::MessageType::ACK, code);
+      broker->Release();
+      if (!ok)
+        OnDisconnect(TransportDisconnect::kProtocolError);
       return;
     }
     v8host_session_s* session = AcquireSession(pending.session_id);
@@ -793,6 +981,7 @@ class ClientConnection final
 
   std::mutex mutex_;
   std::unordered_map<uint32_t, v8host_session_s*> sessions_;
+  v8host_broker_s* broker_ = nullptr;
   std::unordered_map<uint32_t, PendingControl> pending_;
   std::deque<uint32_t> consumed_requests_;
   std::unordered_map<uint32_t, PendingControl> consumed_request_map_;
@@ -807,6 +996,432 @@ class ClientConnection final
 
 namespace {
 void StartConnection(ClientConnection* connection) { connection->StartTransport(); }
+
+//==========================================================================
+// The broker graph (design §2.2, §6.4, §6.5). Every function here runs with
+// the broker's mutex held. Events go to the broker's one FIFO; each holds a
+// reference on the object it names.
+//==========================================================================
+using EventKind = SessionDispatch::EventKind;
+
+void ReleaseWorker(void* worker) { static_cast<v8host_worker_s*>(worker)->Release(); }
+void ReleaseRuntime(void* runtime) { static_cast<v8host_runtime_s*>(runtime)->Release(); }
+
+void BrokerBackpressure(v8host_broker_s* b);
+void RuntimeBackpressure(v8host_broker_s* b, v8host_runtime_s* r);
+
+void PostEvent(v8host_broker_s* b, SessionDispatch::BrokerPost&& post, v8host_runtime_s* r) {
+  PostOverflow overflow = PostOverflow::kNone;
+  if (b->dispatch == nullptr) {
+    if (post.release != nullptr)
+      post.release(post.holder);
+    return;
+  }
+  b->dispatch->PostBroker(std::move(post), &overflow);
+  if (overflow == PostOverflow::kRuntime && r != nullptr)
+    RuntimeBackpressure(b, r);
+  else if (overflow == PostOverflow::kBroker)
+    BrokerBackpressure(b);
+}
+
+void PostBrokerState(v8host_broker_s* b, int32_t state, v8host_status status) {
+  SessionDispatch::BrokerPost post;
+  post.kind = EventKind::kBrokerState;
+  post.code = state;
+  post.status = status;
+  PostEvent(b, std::move(post), nullptr);
+}
+
+void PostWorkerState(v8host_broker_s* b, v8host_worker_s* w, int32_t state,
+                     v8host_status status) {
+  w->AddRef();
+  SessionDispatch::BrokerPost post;
+  post.kind = EventKind::kWorkerState;
+  post.object = w;
+  post.code = state;
+  post.status = status;
+  post.worker_id = w->id;
+  post.holder = w;
+  post.release = &ReleaseWorker;
+  PostEvent(b, std::move(post), nullptr);
+}
+
+void PostRuntimeEvent(v8host_broker_s* b, v8host_runtime_s* r, EventKind kind,
+                      v8host_run_s* run, int32_t code, v8host_status status,
+                      const void* data = nullptr, size_t size = 0) {
+  if (r->silenced)
+    return;
+  r->AddRef();
+  SessionDispatch::BrokerPost post;
+  post.kind = kind;
+  post.object = r;
+  post.run = run;
+  post.code = code;
+  post.status = status;
+  post.data = data;
+  post.size = size;
+  post.worker_id = r->worker->id;
+  post.runtime_id = r->id;
+  post.terminal = kind == EventKind::kRunEvent && code != v8host_run_event_started;
+  post.arbiter = run != nullptr ? &run->arbiter : nullptr;
+  post.holder = r;
+  post.release = &ReleaseRuntime;
+  PostEvent(b, std::move(post), r);
+}
+
+void UnregisterRuntime(v8host_broker_s* b, v8host_runtime_s* r) {
+  if (b->runtimes.erase(r->id))
+    r->Release();
+  if (r->worker->runtimes.erase(r->id))
+    r->Release();
+}
+
+void UnregisterWorker(v8host_broker_s* b, v8host_worker_s* w) {
+  if (b->workers.erase(w->id))
+    w->Release();
+}
+
+template <typename Map>
+std::vector<typename Map::mapped_type> Referenced(const Map& map) {
+  std::vector<typename Map::mapped_type> objects;
+  for (const auto& entry : map) {
+    entry.second->AddRef();
+    objects.push_back(entry.second);
+  }
+  std::sort(objects.begin(), objects.end(),
+            [](const auto* a, const auto* b) { return a->id < b->id; });
+  return objects;
+}
+
+void MarkRunsTerminal(v8host_runtime_s* r) {
+  for (const auto& entry : r->runs)
+    entry.second->terminal_local.store(true, std::memory_order_release);
+}
+
+// Ends every live run of `r` with one terminal event, in run order.
+void EndRuns(v8host_broker_s* b, v8host_runtime_s* r, int32_t event,
+             v8host_status status) {
+  std::vector<v8host_run_s*> runs;
+  for (const auto& entry : r->runs)
+    if (!entry.second->terminal_local.exchange(true, std::memory_order_acq_rel))
+      runs.push_back(entry.second.get());
+  std::sort(runs.begin(), runs.end(),
+            [](const v8host_run_s* a, const v8host_run_s* b) { return a->run_id < b->run_id; });
+  for (v8host_run_s* run : runs)
+    PostRuntimeEvent(b, r, EventKind::kRunEvent, run, event, status);
+}
+
+void MarkTerminal(v8host_broker_s* b, v8host_runtime_s* r, v8host_run_s* run,
+                  int32_t event, v8host_status status) {
+  if (!run->terminal_local.exchange(true, std::memory_order_acq_rel))
+    PostRuntimeEvent(b, r, EventKind::kRunEvent, run, event, status);
+}
+
+// close_when_empty fires when a worker's admissions drop from 1 to 0 by a host
+// close, a runtime failure, a refused open, or backpressure — never during a
+// worker or broker fan-out, which closes the worker first (design §6.2).
+void ReleaseAdmission(v8host_broker_s* b, v8host_worker_s* w) {
+  if (w->admissions == 0 || --w->admissions != 0 || w->closed || w->closing ||
+      b->terminal || !(w->flags & v8host_worker_flags_close_when_empty))
+    return;
+  w->closing = true;
+  b->conn->SubmitControl({PendingType::kCloseWorker, w->id, 0}, [](const auto& header) {
+    return protocol::BuildCloseWorkerFrame(header);
+  });
+}
+
+// A runtime ended unasked or refused: its runs fail, then it reports closed.
+void EndRuntime(v8host_broker_s* b, v8host_runtime_s* r, v8host_status status) {
+  if (r->closed)
+    return;
+  EndRuns(b, r, v8host_run_event_failed, status);
+  if (r->closed)
+    return;  // its queue overflowed during the fan-out
+  r->closed = true;
+  PostRuntimeEvent(b, r, EventKind::kRuntimeState, nullptr, v8host_runtime_state_closed, status);
+  v8host_worker_s* w = r->worker;
+  UnregisterRuntime(b, r);
+  ReleaseAdmission(b, w);
+}
+
+// A worker ended: every live run, then every runtime, then the worker report
+// their terminal, each once (design §6.5).
+void EndWorker(v8host_broker_s* b, v8host_worker_s* w, int32_t run_event,
+               v8host_status run_status, v8host_status status) {
+  if (w->closed)
+    return;
+  w->closed = true;
+  auto runtimes = Referenced(w->runtimes);
+  for (v8host_runtime_s* r : runtimes)
+    if (!r->closed)
+      EndRuns(b, r, run_event, run_status);
+  for (v8host_runtime_s* r : runtimes) {
+    if (!r->closed) {
+      r->closed = true;
+      PostRuntimeEvent(b, r, EventKind::kRuntimeState, nullptr, v8host_runtime_state_closed, status);
+    }
+    UnregisterRuntime(b, r);
+  }
+  PostWorkerState(b, w, v8host_worker_state_closed, status);
+  UnregisterWorker(b, w);
+  for (v8host_runtime_s* r : runtimes)
+    r->Release();
+}
+
+// Marks every child closed and unregisters it, without events. `orphan` is a
+// host close of the broker: the children's getters then return 0.
+void CloseGraph(v8host_broker_s* b, bool orphan) {
+  auto runtimes = Referenced(b->runtimes);
+  for (v8host_runtime_s* r : runtimes) {
+    r->closed = r->silenced = true;
+    r->orphaned = r->orphaned || orphan;
+    MarkRunsTerminal(r);
+    UnregisterRuntime(b, r);
+    r->Release();
+  }
+  auto workers = Referenced(b->workers);
+  for (v8host_worker_s* w : workers) {
+    w->closed = true;
+    w->orphaned = w->orphaned || orphan;
+    UnregisterWorker(b, w);
+    w->Release();
+  }
+}
+
+// A runtime's callback queue overflowed: the dispatcher already queued its
+// closed(callback_backpressure), which supersedes its runs' terminals.
+void RuntimeBackpressure(v8host_broker_s* b, v8host_runtime_s* r) {
+  r->silenced = true;
+  if (r->closed)
+    return;
+  r->closed = true;
+  MarkRunsTerminal(r);
+  v8host_worker_s* w = r->worker;
+  if (!w->closed && !b->terminal)
+    b->conn->SubmitControl({PendingType::kCloseRuntime, r->id, 0}, [](const auto& header) {
+      return protocol::BuildCloseRuntimeFrame(header);
+    });
+  UnregisterRuntime(b, r);
+  ReleaseAdmission(b, w);
+}
+
+// The broker's queue overflowed: the dispatcher queued its one sticky
+// disconnected(callback_backpressure), which supersedes every child terminal.
+void BrokerBackpressure(v8host_broker_s* b) {
+  if (b->terminal)
+    return;
+  b->terminal = true;
+  CloseGraph(b, false);
+  b->conn->CloseTransport();
+}
+
+void BrokerConnected(v8host_broker_s* b) {
+  std::lock_guard<std::mutex> lock(b->mutex);
+  if (!b->terminal && !b->released)
+    PostBrokerState(b, v8host_broker_state_connected, v8host_status_ok);
+}
+
+bool BrokerFrame(v8host_broker_s* b, const protocol::FrameHeader& header,
+                 const uint8_t* payload, size_t len) {
+  std::lock_guard<std::mutex> lock(b->mutex);
+  if (b->terminal || b->released)
+    return true;
+  auto worker = [&]() -> v8host_worker_s* {
+    const auto it = b->workers.find(header.target_id);
+    return it == b->workers.end() ? nullptr : it->second;
+  };
+  auto runtime = [&]() -> v8host_runtime_s* {
+    const auto it = b->runtimes.find(header.target_id);
+    return it == b->runtimes.end() ? nullptr : it->second;
+  };
+  auto run_of = [&](v8host_runtime_s* r) -> v8host_run_s* {
+    const auto it = r->runs.find(header.run_id);
+    return it == r->runs.end() ? nullptr : it->second.get();
+  };
+  // Frames for objects the host or a fan-out already closed are late: drop.
+  switch (header.type) {
+    case protocol::MessageType::STARTUP_READY: {
+      protocol::StartupReadyPayload ready;
+      if (!protocol::DecodeStartupReadyPayload(payload, len, &ready))
+        return false;
+      if (v8host_worker_s* w = worker()) {
+        w->process_id.store(ready.process_id, std::memory_order_release);
+        PostWorkerState(b, w, v8host_worker_state_startup_ready, v8host_status_ok);
+      }
+      return true;
+    }
+    case protocol::MessageType::SECURITY_READY:
+      if (v8host_worker_s* w = worker())
+        PostWorkerState(b, w, v8host_worker_state_security_ready, v8host_status_ok);
+      return true;
+    case protocol::MessageType::WORKER_EXIT:
+      if (v8host_worker_s* w = worker()) {
+        w->AddRef();
+        EndWorker(b, w, v8host_run_event_worker_exited, v8host_status_run_terminal,
+                  v8host_status_worker_exited);
+        w->Release();
+      }
+      return true;
+    case protocol::MessageType::RUNTIME_READY:
+      if (v8host_runtime_s* r = runtime())
+        PostRuntimeEvent(b, r, EventKind::kRuntimeState, nullptr, v8host_runtime_state_ready,
+                         v8host_status_ok);
+      return true;
+    case protocol::MessageType::RUNTIME_CLOSED: {
+      protocol::RuntimeClosedPayload closed;
+      if (!protocol::DecodeRuntimeClosedPayload(payload, len, &closed))
+        return false;
+      if (v8host_runtime_s* r = runtime()) {
+        r->AddRef();
+        EndRuntime(b, r, v8host_status_runtime_failed);
+        r->Release();
+      }
+      return true;
+    }
+    case protocol::MessageType::RELAY_FROM_WORKER: {
+      int32_t kind = 0;
+      const uint8_t* body = nullptr;
+      size_t body_len = 0;
+      if (!protocol::DecodeRelayPayload(payload, len, &kind, &body, &body_len))
+        return false;
+      if (v8host_runtime_s* r = runtime())
+        if (v8host_run_s* run = run_of(r); run && !run->terminal_local.load(std::memory_order_acquire))
+          PostRuntimeEvent(b, r, EventKind::kRelay, run, kind, v8host_status_ok, body, body_len);
+      return true;
+    }
+    case protocol::MessageType::RESULT: {
+      protocol::ResultPayload result;
+      if (!protocol::DecodeResultPayload(payload, len, &result))
+        return false;
+      if (v8host_runtime_s* r = runtime())
+        if (v8host_run_s* run = run_of(r))
+          MarkTerminal(b, r, run,
+                       result.disposition == protocol::ResultDisposition::kCancelled
+                           ? v8host_run_event_cancelled
+                           : v8host_run_event_completed,
+                       v8host_status_ok);
+      return true;
+    }
+    case protocol::MessageType::RUN_ERROR: {
+      protocol::ErrorPayload error;
+      const v8host_status status = protocol::DecodeErrorPayload(payload, len, &error)
+                                       ? MapStatus(error.status_code)
+                                       : v8host_status_protocol_error;
+      if (v8host_runtime_s* r = runtime())
+        if (v8host_run_s* run = run_of(r))
+          MarkTerminal(b, r, run, v8host_run_event_failed, status);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+void BrokerReply(v8host_broker_s* b, const PendingControl& pending, bool ack,
+                 protocol::StatusCode code) {
+  std::lock_guard<std::mutex> lock(b->mutex);
+  if (b->terminal || b->released)
+    return;
+  // A refused create closes the object with the mapped status; an unknown or
+  // foreign target (ERROR_BAD_STATE) is a protocol error (design §3.4, §6.5).
+  const v8host_status refused = code == protocol::StatusCode::ERROR_BAD_STATE
+                                    ? v8host_status_protocol_error
+                                    : MapStatus(code);
+  const auto w_it = b->workers.find(pending.session_id);
+  v8host_worker_s* w = w_it == b->workers.end() ? nullptr : w_it->second;
+  const auto r_it = b->runtimes.find(pending.session_id);
+  v8host_runtime_s* r = r_it == b->runtimes.end() ? nullptr : r_it->second;
+  switch (pending.type) {
+    case PendingType::kCreateWorker:
+      if (!ack && w) {
+        w->AddRef();
+        EndWorker(b, w, v8host_run_event_failed, refused, refused);
+        w->Release();
+      }
+      return;
+    case PendingType::kCloseWorker:
+      if (ack && w && w->closing) {
+        w->AddRef();
+        EndWorker(b, w, v8host_run_event_failed, v8host_status_ok, v8host_status_ok);
+        w->Release();
+      }
+      return;
+    case PendingType::kCreateRuntime:
+      if (!ack && r) {
+        r->AddRef();
+        EndRuntime(b, r, refused);
+        r->Release();
+      }
+      return;
+    case PendingType::kStart:
+    case PendingType::kCancel: {
+      if (!r)
+        return;
+      const auto it = r->runs.find(pending.run_id);
+      if (it == r->runs.end())
+        return;
+      v8host_run_s* run = it->second.get();
+      if (!ack)
+        MarkTerminal(b, r, run, v8host_run_event_failed, MapStatus(code));
+      else if (pending.type == PendingType::kStart &&
+               !run->terminal_local.load(std::memory_order_acquire))
+        PostRuntimeEvent(b, r, EventKind::kRunEvent, run, v8host_run_event_started,
+                         v8host_status_ok);
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+void BrokerRelayQuota(v8host_broker_s* b, uint32_t target, uint32_t run_id) {
+  std::lock_guard<std::mutex> lock(b->mutex);
+  if (b->terminal || b->released)
+    return;
+  const auto it = b->runtimes.find(target);
+  if (it == b->runtimes.end())
+    return;
+  v8host_runtime_s* r = it->second;
+  const auto run = r->runs.find(run_id);
+  if (run != r->runs.end())
+    MarkTerminal(b, r, run->second.get(), v8host_run_event_failed, v8host_status_quota_exceeded);
+}
+
+// The connection ended: every live run, then every runtime, then every worker,
+// and finally the broker report the status once. Nothing is replayed.
+void BrokerDisconnected(v8host_broker_s* b, TransportDisconnect,
+                        v8host_status status) {
+  std::lock_guard<std::mutex> lock(b->mutex);
+  if (b->terminal || b->released)
+    return;
+  const int32_t run_event = v8host_run_event_failed;
+  auto workers = Referenced(b->workers);
+  auto runtimes = Referenced(b->runtimes);
+  for (v8host_worker_s* w : workers)
+    w->closed = true;  // no close_when_empty during the fan-out
+  for (v8host_runtime_s* r : runtimes)
+    if (!r->closed)
+      EndRuns(b, r, run_event, status);
+  for (v8host_runtime_s* r : runtimes) {
+    if (!r->closed) {
+      r->closed = true;
+      PostRuntimeEvent(b, r, EventKind::kRuntimeState, nullptr, v8host_runtime_state_closed, status);
+    }
+    UnregisterRuntime(b, r);
+  }
+  for (v8host_worker_s* w : workers) {
+    if (!b->terminal)
+      PostWorkerState(b, w, v8host_worker_state_closed, status);
+    UnregisterWorker(b, w);
+  }
+  if (!b->terminal)
+    PostBrokerState(b, v8host_broker_state_disconnected, status);
+  b->terminal = true;
+  for (v8host_runtime_s* r : runtimes)
+    r->Release();
+  for (v8host_worker_s* w : workers)
+    w->Release();
+}
 }
 #ifdef V8HOST_CLIENT_TESTING
 void SetSubmissionHooksForTesting(void (*before)(), void (*admitted)()) {
@@ -1026,6 +1641,47 @@ void v8host_session_s::Release() {
   if (refcount.fetch_sub(1, std::memory_order_acq_rel) == 1)
     v8host::client::ClientRuntime::Instance().ScheduleSessionDelete(this);
 }
+
+void v8host_broker_s::Release() {
+  if (refcount.fetch_sub(1, std::memory_order_acq_rel) == 1)
+    v8host::client::ClientRuntime::Instance().ScheduleDelete(
+        this, [](void* object) { delete static_cast<v8host_broker_s*>(object); });
+}
+
+void v8host_worker_s::Release() {
+  if (refcount.fetch_sub(1, std::memory_order_acq_rel) == 1)
+    v8host::client::ClientRuntime::Instance().ScheduleDelete(
+        this, [](void* object) { delete static_cast<v8host_worker_s*>(object); });
+}
+
+void v8host_runtime_s::Release() {
+  if (refcount.fetch_sub(1, std::memory_order_acq_rel) == 1)
+    v8host::client::ClientRuntime::Instance().ScheduleDelete(
+        this, [](void* object) { delete static_cast<v8host_runtime_s*>(object); });
+}
+
+namespace {
+
+constexpr size_t kWorkerProfileMaxBytes = 4096;
+
+v8host_status SetWorkerEngine(v8host_worker_config_s& builder, std::wstring name) {
+  if (!v8host::client::IsBareFilename(name))
+    return v8host_status_invalid_arg;
+  builder.engine = std::move(name);
+  return v8host_status_ok;
+}
+
+v8host_status AddWorkerSnapshot(v8host_worker_config_s& builder, std::wstring path) {
+  if (path.empty() || path.front() == L'\\' || path.front() == L'/' ||
+      path.find(L':') != std::wstring::npos)
+    return v8host_status_invalid_arg;
+  if (builder.snapshots.size() >= v8host::protocol::kMaxWorkerSnapshots)
+    return v8host_status_quota_exceeded;
+  builder.snapshots.push_back(std::move(path));
+  return v8host_status_ok;
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -1478,6 +2134,18 @@ v8host_status V8HOST_CDECL v8host_run_post_message(
     return v8host_status_quota_exceeded;
   if (run->terminal_local.load(std::memory_order_acquire))
     return v8host_status_run_terminal;
+  if (v8host_runtime_s* runtime = run->runtime) {
+    v8host_broker_s* broker = runtime->worker->broker;
+    std::lock_guard<std::mutex> lock(broker->mutex);
+    if (run->terminal_local.load(std::memory_order_acquire))
+      return v8host_status_run_terminal;
+    if (runtime->closed || broker->terminal)
+      return v8host_status_invalid_state;
+    auto header = v8host::client::MakeHeader(broker->conn.get(), runtime->id, run->run_id, 0, false);
+    header.type = v8host::protocol::MessageType::RELAY_TO_WORKER;
+    return broker->conn->Send(v8host::protocol::BuildRelayFrame(
+        header, kind, static_cast<const uint8_t*>(data), size));
+  }
   v8host_session_s* session = run->session;
   std::unique_lock<std::mutex> lock(session->mutex);
   if (session->closed)
@@ -1498,6 +2166,22 @@ v8host_status V8HOST_CDECL v8host_run_cancel(v8host_run run) {
     return v8host_status_invalid_arg;
   if (run->terminal_local.load(std::memory_order_acquire))
     return v8host_status_run_terminal;
+  if (v8host_runtime_s* runtime = run->runtime) {
+    v8host_broker_s* broker = runtime->worker->broker;
+    v8host_status status = v8host_status_ok;
+    {
+      std::lock_guard<std::mutex> lock(broker->mutex);
+      if (run->terminal_local.load(std::memory_order_acquire))
+        return v8host_status_run_terminal;
+      if (runtime->closed || broker->terminal)
+        return v8host_status_invalid_state;
+      status = broker->conn->SubmitControl(
+          {v8host::client::PendingType::kCancel, runtime->id, run->run_id},
+          [](const auto& header) { return v8host::protocol::BuildCancelRunFrame(header); });
+    }
+    broker->conn->TerminalizeExhaustion();
+    return status;
+  }
   v8host_session_s* session = run->session;
   std::unique_lock<std::mutex> lock(session->mutex);
   if (session->closed)
@@ -1530,6 +2214,576 @@ void V8HOST_CDECL v8host_session_close(v8host_session session) {
       [](const auto& header) { return v8host::protocol::BuildCloseSessionFrame(header); });
   session->conn->CloseTransport();
   session->Release();
+}
+
+//==========================================================================
+// Brokers, workers, and runtimes (Contract C, design §6).
+//==========================================================================
+
+v8host_status V8HOST_CDECL v8host_broker_config_set_mode(
+    v8host_broker_config config,
+    v8host_broker_mode value) {
+  return v8host::client::ApplySetter(config, [&](v8host_broker_config_s& builder) {
+    if (value != v8host_broker_mode_dedicated && value != v8host_broker_mode_shared)
+      return v8host_status_invalid_arg;
+    builder.mode = value;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_broker_config_set_callbacks(
+    v8host_broker_config config,
+    const v8host_broker_callbacks* callbacks) {
+  return v8host::client::ApplySetter(config, [&](v8host_broker_config_s& builder) {
+    if (callbacks == nullptr)
+      return v8host_status_invalid_arg;
+    if (callbacks->struct_size < sizeof(v8host_broker_callbacks))
+      return v8host_status_invalid_struct_size;
+    builder.table = *callbacks;
+    builder.table.struct_size = sizeof(v8host_broker_callbacks);
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_broker_open(
+    v8host_configure_broker_cb configure,
+    void* user_data,
+    v8host_broker* out_broker) {
+  if (out_broker == nullptr)
+    return v8host_status_invalid_arg;
+  *out_broker = nullptr;
+  if (!v8host::client::ClientRuntime::Instance().IsInitialized())
+    return v8host_status_not_initialized;
+  v8host_broker_config_s builder;
+  if (configure != nullptr) {
+    const v8host_status status = configure(user_data, &builder);
+    if (status != v8host_status_ok)
+      return status;
+  }
+  if (builder.status != v8host_status_ok)
+    return builder.status;
+  std::shared_ptr<v8host::client::ClientConnection> connection(
+      new (std::nothrow) v8host::client::ClientConnection());
+  if (!connection)
+    return v8host_status_no_memory;
+  v8host_status status = connection->Initialize(builder.mode);
+  if (status != v8host_status_ok)
+    return status;
+  std::unique_ptr<v8host_broker_s> broker(new (std::nothrow) v8host_broker_s());
+  if (!broker)
+    return v8host_status_no_memory;
+  broker->conn = connection;
+  broker->mode = builder.mode;
+  broker->dispatch = v8host::client::SessionDispatch::CreateBroker(
+      &v8host::client::Dispatcher::Instance(), broker.get(), builder.table);
+  if (broker->dispatch == nullptr)
+    return v8host_status_no_memory;
+  connection->SetBroker(broker.get());
+  if (!v8host::client::ClientRuntime::Instance().ScheduleStart(connection)) {
+    connection->SetBroker(nullptr);
+    broker->dispatch->CloseAndRelease();
+    return v8host_status_connect_failed;
+  }
+  *out_broker = broker.release();
+  return v8host_status_ok;
+}
+
+void V8HOST_CDECL v8host_broker_close(v8host_broker broker) {
+  if (broker == nullptr)
+    return;
+  {
+    std::lock_guard<std::mutex> lock(broker->mutex);
+    if (broker->released)
+      return;
+    broker->released = true;
+    broker->terminal = true;
+    v8host::client::CloseGraph(broker, true);
+    broker->dispatch->CloseAndRelease();
+    broker->dispatch = nullptr;
+  }
+  broker->conn->SetBroker(nullptr);
+  broker->conn->CloseTransport();
+  broker->Release();
+}
+
+// The worker's policy setters reuse the session's: a worker builder is a
+// session builder with the worker-only fields after it.
+v8host_status V8HOST_CDECL v8host_worker_config_set_tier(
+    v8host_worker_config config,
+    v8host_tier value) {
+  return v8host_config_set_tier(config, value);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_set_integrity_level(
+    v8host_worker_config config,
+    v8host_integrity_level value) {
+  return v8host_config_set_integrity_level(config, value);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_set_delayed_integrity_level(
+    v8host_worker_config config,
+    v8host_integrity_level value) {
+  return v8host_config_set_delayed_integrity_level(config, value);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_set_initial_token_level(
+    v8host_worker_config config,
+    v8host_token_level value) {
+  return v8host_config_set_initial_token_level(config, value);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_set_lockdown_token_level(
+    v8host_worker_config config,
+    v8host_token_level value) {
+  return v8host_config_set_lockdown_token_level(config, value);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_add_file_rule_utf8(
+    v8host_worker_config config,
+    const char* pattern,
+    size_t length,
+    bool readonly) {
+  return v8host_config_add_file_rule_utf8(config, pattern, length, readonly);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_add_file_rule_utf16(
+    v8host_worker_config config,
+    const v8host_char16* pattern,
+    size_t length,
+    bool readonly) {
+  return v8host_config_add_file_rule_utf16(config, pattern, length, readonly);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_set_use_app_container(
+    v8host_worker_config config,
+    bool value) {
+  return v8host_config_set_use_app_container(config, value);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_set_low_privilege_app_container(
+    v8host_worker_config config,
+    bool value) {
+  return v8host_config_set_low_privilege_app_container(config, value);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_set_profile_name_utf8(
+    v8host_worker_config config,
+    const char* value,
+    size_t length) {
+  return v8host_config_set_profile_name_utf8(config, value, length);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_set_profile_name_utf16(
+    v8host_worker_config config,
+    const v8host_char16* value,
+    size_t length) {
+  return v8host_config_set_profile_name_utf16(config, value, length);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_add_capability_utf8(
+    v8host_worker_config config,
+    const char* value,
+    size_t length) {
+  return v8host_config_add_capability_utf8(config, value, length);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_add_capability_utf16(
+    v8host_worker_config config,
+    const v8host_char16* value,
+    size_t length) {
+  return v8host_config_add_capability_utf16(config, value, length);
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_set_engine_dll_utf8(
+    v8host_worker_config config,
+    const char* value,
+    size_t length) {
+  return v8host::client::ApplySetter(config, [&](v8host_worker_config_s& builder) {
+    std::wstring text;
+    const v8host_status status = v8host::client::CopyUtf8(value, length, &text);
+    return status != v8host_status_ok ? status : SetWorkerEngine(builder, std::move(text));
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_set_engine_dll_utf16(
+    v8host_worker_config config,
+    const v8host_char16* value,
+    size_t length) {
+  return v8host::client::ApplySetter(config, [&](v8host_worker_config_s& builder) {
+    std::wstring text;
+    const v8host_status status = v8host::client::CopyUtf16(value, length, &text);
+    return status != v8host_status_ok ? status : SetWorkerEngine(builder, std::move(text));
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_add_startup_snapshot_path_utf8(
+    v8host_worker_config config,
+    const char* value,
+    size_t length) {
+  return v8host::client::ApplySetter(config, [&](v8host_worker_config_s& builder) {
+    std::wstring text;
+    const v8host_status status = v8host::client::CopyUtf8(value, length, &text);
+    return status != v8host_status_ok ? status : AddWorkerSnapshot(builder, std::move(text));
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_add_startup_snapshot_path_utf16(
+    v8host_worker_config config,
+    const v8host_char16* value,
+    size_t length) {
+  return v8host::client::ApplySetter(config, [&](v8host_worker_config_s& builder) {
+    std::wstring text;
+    const v8host_status status = v8host::client::CopyUtf16(value, length, &text);
+    return status != v8host_status_ok ? status : AddWorkerSnapshot(builder, std::move(text));
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_set_max_runtimes(
+    v8host_worker_config config,
+    uint32_t value) {
+  return v8host::client::ApplySetter(config, [&](v8host_worker_config_s& builder) {
+    if (value == 0)
+      return v8host_status_invalid_arg;
+    if (value > v8host::protocol::kMaxRuntimesPerWorker)
+      return v8host_status_quota_exceeded;
+    builder.max_runtimes = value;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_worker_config_set_flags(
+    v8host_worker_config config,
+    v8host_worker_flags value) {
+  return v8host::client::ApplySetter(config, [&](v8host_worker_config_s& builder) {
+    constexpr uint32_t kKnown =
+        v8host_worker_flags_close_when_empty | v8host_worker_flags_single_use;
+    if (static_cast<uint32_t>(value) & ~kKnown)
+      return v8host_status_invalid_arg;
+    builder.flags = static_cast<uint32_t>(value);
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_worker_open(
+    v8host_broker broker,
+    v8host_configure_worker_cb configure,
+    void* user_data,
+    v8host_worker* out_worker) {
+  if (out_worker == nullptr)
+    return v8host_status_invalid_arg;
+  *out_worker = nullptr;
+  if (broker == nullptr)
+    return v8host_status_invalid_arg;
+  std::unique_ptr<v8host_worker_config_s> builder(new (std::nothrow) v8host_worker_config_s());
+  if (!builder)
+    return v8host_status_no_memory;
+  v8host_status status = v8host_status_ok;
+  if (configure != nullptr) {
+    status = configure(user_data, builder.get());
+    if (status != v8host_status_ok)
+      return status;
+  }
+  if (builder->status != v8host_status_ok)
+    return builder->status;
+  // The mode is the broker's, and ACG follows the tier.
+  builder->config.broker_mode = broker->mode;
+  builder->config.prohibit_dynamic_code = builder->config.tier == v8host_tier_untrusted ? 1 : 0;
+  status = v8host::client::ValidateSessionConfig(builder->config);
+  if (status != v8host_status_ok)
+    return status;
+  v8host::protocol::CreateWorkerPayload payload;
+  payload.session = v8host::client::MakeCreatePayload(builder->config);
+  payload.max_runtimes = builder->max_runtimes;
+  payload.flags = (builder->flags & v8host_worker_flags_single_use) ? v8host::protocol::kWorkerFlagSingleUse : 0;
+  status = v8host::client::WideToUtf8(builder->engine.c_str(), true, &payload.engine_dll);
+  if (status != v8host_status_ok)
+    return status;
+  // Canonicalizing never lengthens a path, so the profile's size is bounded
+  // from what the host passed (design §4.3): no surprise async quota error.
+  size_t profile = 16 + 4 + 4 +
+      (payload.engine_dll.empty()
+           ? (builder->config.tier == v8host_tier_untrusted ? 11 : 9)
+           : payload.engine_dll.size());
+  for (const std::wstring& path : builder->snapshots) {
+    std::string utf8;
+    status = v8host::client::WideToUtf8(path.c_str(), false, &utf8);
+    if (status != v8host_status_ok)
+      return status;
+    profile += 4 + utf8.size();
+    payload.snapshot_paths.push_back(std::move(utf8));
+  }
+  v8host::protocol::Writer encoded;
+  v8host::protocol::EncodeCreateWorkerPayload(payload, encoded);
+  if (profile > kWorkerProfileMaxBytes || encoded.size() > v8host::protocol::kMaxFramePayload)
+    return v8host_status_quota_exceeded;
+
+  v8host_worker_s* worker = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(broker->mutex);
+    if (broker->released || broker->terminal)
+      return v8host_status_invalid_state;
+    if (broker->open_workers >= v8host::protocol::kMaxSessionsPerConnection ||
+        broker->next_id == UINT32_MAX)
+      return v8host_status_quota_exceeded;
+    worker = new (std::nothrow) v8host_worker_s();
+    if (worker == nullptr)
+      return v8host_status_no_memory;
+    worker->broker = broker;
+    broker->AddRef();
+    worker->id = broker->next_id++;
+    worker->max_runtimes = builder->max_runtimes;
+    worker->flags = builder->flags;
+    worker->snapshot_count = static_cast<uint32_t>(builder->snapshots.size());
+    broker->workers[worker->id] = worker;
+    worker->AddRef();
+    ++broker->open_workers;
+    status = broker->conn->SubmitControl(
+        {v8host::client::PendingType::kCreateWorker, worker->id, 0},
+        [&](const auto& header) { return v8host::protocol::BuildCreateWorkerFrame(header, payload); });
+    if (status != v8host_status_ok) {
+      broker->workers.erase(worker->id);
+      --broker->open_workers;
+      worker->Release();
+      worker->Release();
+      worker = nullptr;
+    }
+  }
+  if (status != v8host_status_ok) {
+    broker->conn->TerminalizeExhaustion();
+    return status;
+  }
+  *out_worker = worker;
+  return v8host_status_ok;
+}
+
+void V8HOST_CDECL v8host_worker_close(v8host_worker worker) {
+  if (worker == nullptr)
+    return;
+  v8host_broker_s* broker = worker->broker;
+  {
+    std::lock_guard<std::mutex> lock(broker->mutex);
+    if (worker->released)
+      return;
+    worker->released = true;
+    --broker->open_workers;
+    if (!worker->closed) {
+      worker->closed = true;
+      auto runtimes = v8host::client::Referenced(worker->runtimes);
+      for (v8host_runtime_s* runtime : runtimes) {
+        runtime->closed = runtime->silenced = true;
+        v8host::client::MarkRunsTerminal(runtime);
+        v8host::client::UnregisterRuntime(broker, runtime);
+        runtime->Release();
+      }
+      v8host::client::UnregisterWorker(broker, worker);
+      if (!broker->terminal && !worker->closing)
+        broker->conn->SubmitControl(
+            {v8host::client::PendingType::kCloseWorker, worker->id, 0},
+            [](const auto& header) { return v8host::protocol::BuildCloseWorkerFrame(header); });
+    }
+    // Nothing more is delivered for the worker or anything in it.
+    if (broker->dispatch != nullptr)
+      broker->dispatch->Suppress(worker->id, 0);
+  }
+  worker->Release();
+}
+
+uint32_t V8HOST_CDECL v8host_worker_get_process_id(v8host_worker worker) {
+  if (worker == nullptr)
+    return 0;
+  std::lock_guard<std::mutex> lock(worker->broker->mutex);
+  return worker->released || worker->closed || worker->orphaned
+             ? 0
+             : worker->process_id.load(std::memory_order_acquire);
+}
+
+uint32_t V8HOST_CDECL v8host_worker_get_id(v8host_worker worker) {
+  if (worker == nullptr)
+    return 0;
+  std::lock_guard<std::mutex> lock(worker->broker->mutex);
+  return worker->released || worker->closed || worker->orphaned ? 0 : worker->id;
+}
+
+v8host_status V8HOST_CDECL v8host_runtime_config_set_startup_snapshot_index(
+    v8host_runtime_config config,
+    uint32_t index) {
+  return v8host::client::ApplySetter(config, [&](v8host_runtime_config_s& builder) {
+    builder.has_snapshot = true;
+    builder.snapshot_index = index;
+    return v8host_status_ok;
+  });
+}
+
+v8host_status V8HOST_CDECL v8host_runtime_open(
+    v8host_worker worker,
+    v8host_configure_runtime_cb configure,
+    void* user_data,
+    v8host_runtime* out_runtime) {
+  if (out_runtime == nullptr)
+    return v8host_status_invalid_arg;
+  *out_runtime = nullptr;
+  if (worker == nullptr)
+    return v8host_status_invalid_arg;
+  v8host_runtime_config_s builder;
+  v8host_status status = v8host_status_ok;
+  if (configure != nullptr) {
+    status = configure(user_data, &builder);
+    if (status != v8host_status_ok)
+      return status;
+  }
+  if (builder.status != v8host_status_ok)
+    return builder.status;
+  v8host_broker_s* broker = worker->broker;
+  v8host_runtime_s* runtime = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(broker->mutex);
+    if (worker->released || worker->closed || worker->closing || broker->released ||
+        broker->terminal)
+      return v8host_status_invalid_state;
+    if (builder.has_snapshot && builder.snapshot_index >= worker->snapshot_count)
+      return v8host_status_invalid_arg;
+    // The client counts admissions exactly as the coordinator does (§2.1).
+    if (worker->admissions >= worker->max_runtimes ||
+        ((worker->flags & v8host_worker_flags_single_use) && worker->created >= worker->max_runtimes) ||
+        broker->next_id == UINT32_MAX)
+      return v8host_status_quota_exceeded;
+    runtime = new (std::nothrow) v8host_runtime_s();
+    if (runtime == nullptr)
+      return v8host_status_no_memory;
+    runtime->worker = worker;
+    worker->AddRef();
+    runtime->id = broker->next_id++;
+    broker->runtimes[runtime->id] = runtime;
+    runtime->AddRef();
+    worker->runtimes[runtime->id] = runtime;
+    runtime->AddRef();
+    ++worker->admissions;
+    ++worker->created;
+    v8host::protocol::CreateRuntimePayload payload;
+    payload.worker_id = worker->id;
+    payload.snapshot_index = builder.has_snapshot ? static_cast<int32_t>(builder.snapshot_index) : -1;
+    status = broker->conn->SubmitControl(
+        {v8host::client::PendingType::kCreateRuntime, runtime->id, 0},
+        [&](const auto& header) { return v8host::protocol::BuildCreateRuntimeFrame(header, payload); });
+    if (status != v8host_status_ok) {
+      --worker->admissions;
+      --worker->created;
+      v8host::client::UnregisterRuntime(broker, runtime);
+      runtime->Release();
+      runtime = nullptr;
+    }
+  }
+  if (status != v8host_status_ok) {
+    broker->conn->TerminalizeExhaustion();
+    return status;
+  }
+  *out_runtime = runtime;
+  return v8host_status_ok;
+}
+
+void V8HOST_CDECL v8host_runtime_close(v8host_runtime runtime) {
+  if (runtime == nullptr)
+    return;
+  v8host_worker_s* worker = runtime->worker;
+  v8host_broker_s* broker = worker->broker;
+  {
+    std::lock_guard<std::mutex> lock(broker->mutex);
+    if (runtime->released)
+      return;
+    runtime->released = true;
+    if (!runtime->closed) {
+      runtime->closed = runtime->silenced = true;
+      v8host::client::MarkRunsTerminal(runtime);
+      v8host::client::UnregisterRuntime(broker, runtime);
+      if (!broker->terminal && !worker->closed)
+        broker->conn->SubmitControl(
+            {v8host::client::PendingType::kCloseRuntime, runtime->id, 0},
+            [](const auto& header) { return v8host::protocol::BuildCloseRuntimeFrame(header); });
+      v8host::client::ReleaseAdmission(broker, worker);
+    }
+    if (broker->dispatch != nullptr)
+      broker->dispatch->Suppress(0, runtime->id);
+  }
+  runtime->Release();
+}
+
+uint32_t V8HOST_CDECL v8host_runtime_get_id(v8host_runtime runtime) {
+  if (runtime == nullptr)
+    return 0;
+  std::lock_guard<std::mutex> lock(runtime->worker->broker->mutex);
+  return runtime->released || runtime->closed || runtime->orphaned || runtime->worker->released ||
+                 runtime->worker->broker->released
+             ? 0
+             : runtime->id;
+}
+
+v8host_status V8HOST_CDECL v8host_runtime_start_run(
+    v8host_runtime runtime,
+    v8host_configure_run_cb configure,
+    void* user_data,
+    v8host_run* out_run) {
+  if (out_run == nullptr)
+    return v8host_status_invalid_arg;
+  *out_run = nullptr;
+  if (runtime == nullptr)
+    return v8host_status_invalid_arg;
+  std::unique_ptr<v8host_run_config_s> inputs(new (std::nothrow) v8host_run_config_s());
+  if (!inputs)
+    return v8host_status_no_memory;
+  v8host_status status = v8host_status_ok;
+  if (configure != nullptr) {
+    status = configure(user_data, inputs.get());
+    if (status != v8host_status_ok)
+      return status;
+  }
+  if (inputs->status != v8host_status_ok)
+    return inputs->status;
+  // The runtime's profile belongs to its worker (D6), even an equal value.
+  if (inputs->has_tier || inputs->has_engine || inputs->has_snapshot)
+    return v8host_status_profile_already_bound;
+  if (v8host::protocol::kStartRunFixedSize + 2 * sizeof(uint32_t) + inputs->payload.size() >
+      v8host::protocol::kMaxFramePayload)
+    return v8host_status_quota_exceeded;
+  v8host_broker_s* broker = runtime->worker->broker;
+  v8host_run_s* handle = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(broker->mutex);
+    if (runtime->released || runtime->closed || broker->terminal)
+      return v8host_status_invalid_state;
+    size_t live = 0;
+    for (const auto& entry : runtime->runs)
+      if (!entry.second->terminal_local.load(std::memory_order_acquire))
+        ++live;
+    if (live >= v8host::protocol::kMaxInFlightRunsPerSession || runtime->next_run_id == UINT32_MAX)
+      return v8host_status_quota_exceeded;
+    std::unique_ptr<v8host_run_s> run(new (std::nothrow) v8host_run_s());
+    if (!run)
+      return v8host_status_no_memory;
+    run->runtime = runtime;
+    run->run_id = runtime->next_run_id++;
+    handle = run.get();
+    v8host::protocol::StartRunPayload payload;
+    payload.tier_override = -1;
+    payload.guest_payload = std::move(inputs->payload);
+    runtime->runs.emplace(handle->run_id, std::move(run));
+    status = broker->conn->SubmitControl(
+        {v8host::client::PendingType::kStart, runtime->id, handle->run_id},
+        [&](const auto& header) { return v8host::protocol::BuildStartRunFrame(header, payload); });
+    if (status != v8host_status_ok) {
+      runtime->runs.erase(handle->run_id);
+      handle = nullptr;
+    }
+  }
+  if (status != v8host_status_ok) {
+    broker->conn->TerminalizeExhaustion();
+    return status;
+  }
+  *out_run = handle;
+  return v8host_status_ok;
+}
+
+uint32_t V8HOST_CDECL v8host_run_get_id(v8host_run run) {
+  return run != nullptr ? run->run_id : 0;
 }
 
 }  // extern "C"

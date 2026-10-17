@@ -53,8 +53,12 @@ enum class RunState {
 inline bool IsTerminal(RunState s) {
   return s >= RunState::kCompleted;
 }
+// An explicit runtime's lifecycle (design §2.1). A session's runtime is always
+// kReady in slot 0.
+enum class RuntimeState { kQueued, kCreating, kReady };
 struct Connection;
 struct Session;
+struct Worker;
 class Router;
 using SessionConfig = protocol::CreateSessionPayload;
 struct BoundProfile {
@@ -97,6 +101,8 @@ struct Run {
   bool TryTerminal(RunState desired);
 };
 enum class PostOutcome { kWritten, kNotWritten, kAmbiguous };
+// One sandboxed worker process: a session's private worker, or an explicit
+// worker that hosts up to max_runtimes runtimes, each in a slot.
 struct Worker {
   struct Fact {
     sbox_msg_kind kind = sbox_msg_kind_binary;
@@ -104,7 +110,22 @@ struct Worker {
     size_t offset = 0;
     OutputCredit credit;
   };
-  Session *session = nullptr;
+  // A worker-local runtime slot. A closing slot keeps its isolate until the
+  // worker reports RUNTIME_CLOSED, so it stays occupied without a runtime.
+  struct SlotRecord {
+    Session *runtime = nullptr;
+    bool occupied = false;
+    bool create_posted = false;
+    bool closing = false;
+    bool close_posted = false;
+    std::chrono::steady_clock::time_point close_deadline{};
+  };
+  Session *session = nullptr;  // a session's private worker: that session
+  Connection *conn = nullptr;
+  // The owning connection; a session's worker reaches it through its session.
+  Connection &Conn() const;
+  uint32_t worker_id = 0;      // its target ID (the session's for a private worker)
+  bool explicit_worker = false;
   const sbox_broker_api *api = nullptr;
   HANDLE cleanup = nullptr;
   // One core reader produces; the connection strand consumes. Counters wrap unsigned.
@@ -115,21 +136,26 @@ struct Worker {
   std::atomic<size_t> byte_head{0}, byte_tail{0};
   std::atomic<bool> intake_active{false};
   static_assert(std::atomic<RelayLedger *>::is_always_lock_free);
-  std::array<std::atomic<RelayLedger *>, protocol::kMaxInFlightRunsPerSession> published{};
+  // The intake slots, per runtime slot, matched on run_id.
+  std::array<std::array<std::atomic<RelayLedger *>, protocol::kMaxInFlightRunsPerSession>,
+             v8host::kMaxRuntimeSlots> published{};
+  // Each slot's highest admitted run ID, for the reader's late-frame check.
+  std::array<std::atomic<uint32_t>, v8host::kMaxRuntimeSlots> slot_highest_run_id{};
   std::atomic<RelayLedger *> ledger_reader{nullptr};
   // At most the admitted ledgers plus the single reader's hazard are retained.
   std::vector<std::shared_ptr<RelayLedger>> ledger_pins;
-  void Publish(uint32_t id, std::shared_ptr<RelayLedger> ledger);
+  void Publish(uint16_t slot, uint32_t id, std::shared_ptr<RelayLedger> ledger);
   void DiscardMailbox();
   std::atomic<size_t> mailbox_head{0}, mailbox_tail{0};
 #if defined(V8HOST_ROUTER_TESTING)
   std::function<void()> mailbox_readout, ledger_publication, intake_entered, ledger_acquired;
 #endif
-  std::chrono::steady_clock::time_point cancel_deadline{}, retry_deadline{};
+  // The ring is shared, so a blocked post holds every slot's dispatch.
+  std::chrono::steady_clock::time_point retry_deadline{};
   unsigned retry_attempts = 0;
-  uint32_t retry_run_id = 0, pending_cancel_id = 0;
+  uint32_t retry_run_id = 0;
+  uint16_t retry_slot = 0;
   v8host::RunEnvelopeType retry_type = v8host::RunEnvelopeType::kStart;
-  uint32_t engine_busy_run_id = 0;
   uint32_t process_id = 0;
   bool startup = false, security = false;
   static void SBOX_CDECL OnMessage(void *, sbox_msg_kind, const void *, size_t);
@@ -140,11 +166,19 @@ struct Worker {
   bool close_called = false;
   bool wait_called = false;
   HeldFile engine_image;
-  uint32_t active_run_id = 0;
-  std::deque<uint32_t> pending_run_ids;
+  // Explicit workers: the profile bound at CREATE_WORKER.
+  SessionConfig config;
+  BoundProfile profile;
+  uint32_t max_runtimes = 1;
+  bool single_use = false;
+  uint32_t created_runtimes = 0;
+  std::vector<std::string> snapshots;  // payload-relative, canonical
+  std::array<SlotRecord, v8host::kMaxRuntimeSlots> slots{};
 };
+// A run target: a session (which owns its private worker and is its one
+// runtime, in slot 0) or an explicit runtime hosted by an explicit worker.
 struct Session {
-  uint32_t session_id = 0;
+  uint32_t session_id = 0;  // the target ID
   Connection *conn = nullptr;
   // State and worker publication are strand-owned after admission.
   SessionState state = SessionState::kCreating;
@@ -152,7 +186,19 @@ struct Session {
   std::atomic<uint32_t> highest_run_id{0};
   bool profile_bound = false;
   BoundProfile profile;
-  std::unique_ptr<Worker> worker;
+  std::unique_ptr<Worker> worker;  // a session's private worker
+  Worker *host = nullptr;          // the worker this runtime lives in
+  bool explicit_runtime = false;
+  RuntimeState runtime_state = RuntimeState::kReady;
+  uint16_t slot = 0;
+  int32_t snapshot_index = -1;
+  // Per-runtime run serialization: one START at a time, in FIFO order.
+  uint32_t credit = v8host::kRelayCreditWindow;
+  uint32_t engine_busy_run_id = 0;
+  uint32_t active_run_id = 0;
+  uint32_t pending_cancel_id = 0;
+  std::deque<uint32_t> pending_run_ids;
+  std::chrono::steady_clock::time_point cancel_deadline{};
   std::mutex mutex;
   std::unordered_map<uint32_t, std::unique_ptr<Run>> runs;
   // Retain removed objects until their contenders have joined.
@@ -174,9 +220,13 @@ struct Connection {
   protocol::RequestCache request_cache;
   // Lock order: connection, session, output. Callbacks never take these locks.
   std::mutex mutex;
+  // Run targets: sessions and explicit runtimes, keyed by target ID.
   std::unordered_map<uint32_t, std::unique_ptr<Session>> sessions;
+  // The highest target ID this connection has created (one namespace).
   uint32_t highest_session_id = 0;
   std::vector<std::unique_ptr<Session>> retired_sessions;
+  std::unordered_map<uint32_t, std::unique_ptr<Worker>> workers;  // explicit workers
+  std::vector<std::unique_ptr<Worker>> retired_workers;
   std::mutex out_mutex;
   std::deque<OutputFrame> out_queue;
   std::atomic<size_t> out_control_bytes{0}, out_control_requests{0}, out_relay_bytes{0};
@@ -223,7 +273,16 @@ bool PrepareProfile(
     const std::wstring &payload_directory,
     BoundProfile *out);
 protocol::StatusCode BindProfile(Session &session, const BoundProfile &profile);
-bool PrepareSpawnConfig(const SessionConfig &config, const BoundProfile &profile, std::vector<uint8_t> *out);
+// An explicit worker's spawn config passes max_runtimes (1..16) and its
+// payload-relative snapshots; a session passes 0 and none.
+bool PrepareSpawnConfig(const SessionConfig &config, const BoundProfile &profile, std::vector<uint8_t> *out,
+                        uint32_t max_runtimes = 0, const std::vector<std::string> *snapshots = nullptr);
+// Validates and canonicalizes an explicit worker's profile (tier default
+// engine, payload-relative snapshots, the 4 KiB profile bound).
+protocol::StatusCode PrepareWorkerProfile(const protocol::CreateWorkerPayload &payload,
+                                          const std::wstring &payload_directory,
+                                          BoundProfile *profile,
+                                          std::vector<std::string> *snapshots);
 class Router {
  public:
   explicit Router(
@@ -246,11 +305,20 @@ class Router {
  private:
   std::chrono::steady_clock::time_point Now() const;
   void RequestCancel(Session &session, uint32_t id);
-  bool Spawn(Session &session);
-  PostOutcome Post(Session &session, const std::vector<uint8_t> &bytes);
-  bool Send(Session &session, const std::vector<uint8_t> &bytes, uint32_t id, v8host::RunEnvelopeType type);
+  bool Spawn(Worker &worker);
+  PostOutcome Post(Worker &worker, const std::vector<uint8_t> &bytes);
+  bool Send(Worker &worker, const std::vector<uint8_t> &bytes, uint16_t slot, uint32_t id, v8host::RunEnvelopeType type);
   void Dispatch(Session &session);
+  void Dispatch(Worker &worker);
+  bool DispatchRuntime(Session &runtime);
+  void ScheduleRuntimes(Worker &worker);
+  void PumpWorker(Connection &conn, Worker &worker);
+  bool WorkerEnvelope(Connection &conn, Worker &worker, v8host::RunEnvelope &env, Worker::Fact &fact);
+  void RuntimeFailed(Connection &conn, Worker &worker, Session &runtime);
+  void CloseWorkerOf(Worker &worker);
   void CloseSession(Connection &conn, uint32_t id, RunState terminal);
+  void CloseWorker(Connection &conn, uint32_t id, RunState terminal, bool report_exit);
+  void CloseRuntime(Connection &conn, uint32_t id);
   void Reclaim(Connection &conn, bool join);
   BrokerMode mode_;
   sbox_broker broker_;
