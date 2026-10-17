@@ -9,6 +9,8 @@
 # jitless for Untrusted / v8jsi.dll for Trusted), creates a JSI runtime, installs
 # the `host` object, evaluates a guest, and runs the message loop — all under the
 # container-driven ACG lifecycle. Carved from the retired v8host.exe main.
+import("//sandbox_dll/trust.gni")
+
 config("v8host_common_config") {
   include_dirs = [
     "common",
@@ -22,7 +24,10 @@ config("v8host_common_config") {
   # the dev-only sbox_broker_api self-test). Release builds omit this define,
   # which fail-closes every one of those paths. Centralized here so a persona
   # that adds a compile-gated dev path cannot silently miss the flag.
-  defines = [ "SBOX_DEV_ALLOW_UNSIGNED" ]
+  # `sbox_dev_allow_unsigned` (//sandbox_dll/trust.gni) is false for the shipped build.
+  if (sbox_dev_allow_unsigned) {
+    defines = [ "SBOX_DEV_ALLOW_UNSIGNED" ]
+  }
 }
 
 static_library("file_identity") {
@@ -240,10 +245,10 @@ shared_library("v8host") {
     ":coordinator_persona",
     ":engine_persona",
   ]
-  defines = [
-    "SBOX_IMPL",
-    "SBOX_DEV_ALLOW_UNSIGNED",
-  ]
+  defines = [ "SBOX_IMPL" ]
+  if (sbox_dev_allow_unsigned) {
+    defines += [ "SBOX_DEV_ALLOW_UNSIGNED" ]
+  }
   configs -= [ "//build/config/compiler:no_exceptions" ]
   configs += [ "//build/config/compiler:exceptions" ]
 

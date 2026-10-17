@@ -111,6 +111,7 @@ const options = {
   gen: { type: "boolean" as const, default: true },
   build: { type: "boolean" as const, default: true },
   check: { type: "boolean" as const, default: false },
+  "release-trust": { type: "boolean" as const, default: false },
   clean: { type: "boolean" as const, default: false },
   target: { type: "string" as const, default: "generic" },
   "target-cpu": { type: "string" as const, default: "x64" },
@@ -135,7 +136,10 @@ Boolean flags (all support --no- prefix):
                   size-budget + BinSkim gates on the produced binaries
                   (sbox.exe, v8host.dll)
   --clean         Delete the out dir before generating
-
+  --release-trust Build sbox.exe / v8host.dll with the release trust policy
+                  (no SBOX_DEV_ALLOW_UNSIGNED): unsigned payloads and non-
+                  architecture layouts fail closed. For the shipped build; the
+                  suites need signed payloads or the default developer policy.
 String arguments:
   --target <t>    ninja target to build (default: generic)
   --target-cpu <cpu>
@@ -460,6 +464,7 @@ function gnGen(
   clangBasePathForGn: string,
   clangMajor: number,
   targetCpu: TargetCpu,
+  releaseTrust = false,
 ): void {
   console.log(`\n=== gn gen (${outDir}, target_cpu=${targetCpu}) ===\n`);
   ensureGeneratedBuildFiles();
@@ -468,7 +473,8 @@ function gnGen(
   // avoids quoting the embedded double-quotes, and the file is inspectable.
   fs.writeFileSync(
     path.join(outDir, "args.gn"),
-    gnArgsContent(clangBasePathForGn, clangMajor, targetCpu),
+    gnArgsContent(clangBasePathForGn, clangMajor, targetCpu) +
+      (releaseTrust ? "sbox_dev_allow_unsigned = false\n" : ""),
   );
   run(
     `"${gnExe}"`,
@@ -747,22 +753,51 @@ async function runSandboxBinSkim(
   );
 }
 
+// Gate 5 (only with --release-trust): the developer trust policy and its test
+// hooks must be compiled out. The hook names are strings that exist in the
+// binaries only under SBOX_DEV_ALLOW_UNSIGNED (read in the broker and sbox.exe).
+function checkReleaseTrust(outDir: string): boolean {
+  console.log("\n=== Release trust policy (no developer hooks) ===\n");
+  const markers = ["V8HOST_BROKER_API_TEST", "SBOX_TEST_LIFECYCLE_FAILURE", "SBOX_TEST_LIFECYCLE_HELD_EVENT"];
+  let ok = true;
+  for (const file of ["sbox.exe", "v8host.dll"]) {
+    const filePath = path.join(outDir, file);
+    if (!fs.existsSync(filePath)) {
+      console.error(`  MISSING: ${filePath}`);
+      ok = false;
+      continue;
+    }
+    const bytes = fs.readFileSync(filePath);
+    const found = markers.filter((m) =>
+      bytes.includes(Buffer.from(m, "latin1")) || bytes.includes(Buffer.from(m, "utf16le")));
+    if (found.length === 0) {
+      console.log(`  OK   ${file}`);
+    } else {
+      ok = false;
+      console.error(`  FAIL ${file} contains developer-policy strings: ${found.join(", ")}`);
+    }
+  }
+  return ok;
+}
+
 // Orchestrate the sandbox gates and exit non-zero if any fail. BinSkim needs its
 // package feed reachable to install (set BINSKIM_NUGET_SOURCE to point at an
 // available source); a reachable run that finds unaccepted issues fails the gate.
-async function runSandboxGates(outDir: string, toolsPath: string): Promise<void> {
+async function runSandboxGates(outDir: string, toolsPath: string, releaseTrust: boolean): Promise<void> {
   console.log(`\n=== Sandbox hygiene gates (${outDir}) ===`);
   const stelaOk = checkStelaManifests(outDir);
   const crtOk = checkSandboxCrt(outDir);
   const sizeOk = checkSandboxSize(outDir);
+  const trustOk = !releaseTrust || checkReleaseTrust(outDir);
   const binskimOk = await runSandboxBinSkim(outDir, toolsPath);
 
   console.log("\n=== Sandbox gate summary ===");
   console.log(`  stela manifests:  ${stelaOk ? "PASS" : "FAIL"}`);
   console.log(`  hybrid CRT:       ${crtOk ? "PASS" : "FAIL"}`);
   console.log(`  size budget:      ${sizeOk ? "PASS" : "FAIL"}`);
+  if (releaseTrust) console.log(`  release trust:    ${trustOk ? "PASS" : "FAIL"}`);
   console.log(`  binskim:          ${binskimOk ? "PASS" : "FAIL"}`);
-  if (!stelaOk || !crtOk || !sizeOk || !binskimOk) {
+  if (!stelaOk || !crtOk || !sizeOk || !trustOk || !binskimOk) {
     process.exit(1);
   }
 }
@@ -824,7 +859,7 @@ async function main(): Promise<void> {
     generateVersionInfo();
     if (args.gen) {
       const junction = ensureClangJunction(tc.clangBasePath);
-      gnGen(outDir, junction, tc.clangMajor, targetCpu);
+      gnGen(outDir, junction, tc.clangMajor, targetCpu, args["release-trust"]);
     }
     if (args.build) {
       // Write each out-dir link input (the VERSIONINFO and Stela manifest .res
@@ -838,7 +873,7 @@ async function main(): Promise<void> {
   }
 
   if (args.check) {
-    await runSandboxGates(outDir, toolsPath);
+    await runSandboxGates(outDir, toolsPath, args["release-trust"] === true);
   }
 
   const elapsed = Date.now() - startTime;

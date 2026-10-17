@@ -91,6 +91,8 @@ struct SboxSession {
   HANDLE evt_close = nullptr;  // broker signals to ask the target to close (manual-reset)
   HANDLE reader_thread = nullptr;
   HANDLE reader_stop = nullptr;  // manual-reset; set to stop the reader
+  uint32_t t2b_cursor = 0;  // private consumer position: the shared read_idx is untrusted
+  bool channel_corrupt = false;
   SboxMessageCb on_message = nullptr;
   void* on_message_ctx = nullptr;
 };
@@ -558,8 +560,16 @@ void ForwardWorkerFrame(void* context, int kind, const void* data, size_t size) 
 }
 void DrainWorkerFrames(SboxSession* session) {
   auto* header = sbox_msg::Header(session->msg_map);
-  sbox_msg::Drain(&header->t2b, sbox_msg::T2BRing(session->msg_map),
-                  &ForwardWorkerFrame, session);
+  if (session->channel_corrupt)
+    return;
+  if (sbox_msg::Drain(&header->t2b, sbox_msg::T2BRing(session->msg_map),
+                      &ForwardWorkerFrame, session, &session->t2b_cursor) < 0) {
+    // The worker wrote an impossible producer index. Stop reading its frames
+    // and end it; the exit is reported as for any worker exit.
+    session->channel_corrupt = true;
+    BrokerLog("[broker] target message channel corrupt; terminating\n");
+    ::TerminateProcess(session->proc, 0xBAD1);
+  }
 }
 
 // Deliver incoming frames and report process exit. The host still owns wait
@@ -1046,10 +1056,15 @@ SBOX_CORE_API int sbox_broker_wait(SboxSession* session) {
   DWORD ec = 0;
   ::GetExitCodeProcess(session->proc, &ec);
 
-  // Stop the reader thread.
+  // Stop the reader thread. If it is still inside a callback after the wait,
+  // keep the session and its mapping alive (a deliberate leak): freeing them
+  // under a running reader is a use-after-free.
   if (session->reader_thread) {
     ::SetEvent(session->reader_stop);
-    ::WaitForSingleObject(session->reader_thread, 5000);
+    if (::WaitForSingleObject(session->reader_thread, 5000) != WAIT_OBJECT_0) {
+      BrokerLog("[broker] reader thread still running; session retained\n");
+      return static_cast<int>(ec);
+    }
     ::CloseHandle(session->reader_thread);
   }
 
@@ -1394,7 +1409,8 @@ SBOX_CORE_API int sbox_target_drain_messages(SboxTarget* target, SboxMessageCb c
   if (!target || !target->msg_map || !cb)
     return 0;
   sbox_msg::ChannelHeader* h = sbox_msg::Header(target->msg_map);
-  return sbox_msg::Drain(&h->b2t, sbox_msg::B2TRing(target->msg_map), cb, ctx);
+  const int drained = sbox_msg::Drain(&h->b2t, sbox_msg::B2TRing(target->msg_map), cb, ctx);
+  return drained < 0 ? 0 : drained;
 }
 
 #if defined(SBOX_LIFECYCLE_TESTING)

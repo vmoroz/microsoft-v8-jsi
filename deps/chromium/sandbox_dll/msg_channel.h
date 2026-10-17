@@ -82,12 +82,21 @@ inline bool Post(RingControl* ctl, uint8_t* ring, int kind, const void* data,
 
 typedef void (*FrameCb)(void* ctx, int kind, const void* data, size_t len);
 
-// SPSC drain: invoke cb for every available frame. Returns the count drained.
-inline int Drain(RingControl* ctl, uint8_t* ring, FrameCb cb, void* ctx) {
+// SPSC drain: invoke cb for every frame available at entry. The producer's
+// index lives in memory the producer controls, so it is read once and must be
+// within one ring of the consumer's position: anything else is corruption and
+// returns -1 without calling cb. A trusted consumer of an untrusted producer
+// passes `cursor` (a private position; the shared read_idx is only published).
+// Returns the count drained.
+inline int Drain(RingControl* ctl, uint8_t* ring, FrameCb cb, void* ctx,
+                 uint32_t* cursor = nullptr) {
   int n = 0;
-  uint32_t r = ctl->read_idx;
-  while (r != ctl->write_idx) {
-    MemoryBarrier();  // observe the slot after the index
+  uint32_t r = cursor ? *cursor : ctl->read_idx;
+  const uint32_t w = ctl->write_idx;
+  MemoryBarrier();  // observe the slots after the index
+  if (w - r > kSlots)
+    return -1;
+  while (r != w) {
     uint8_t* slot = ring + (r % kSlots) * kSlotSize;
     uint32_t len = 0, kind = 0;
     std::memcpy(&len, slot + 0, 4);
@@ -96,8 +105,10 @@ inline int Drain(RingControl* ctl, uint8_t* ring, FrameCb cb, void* ctx) {
       len = kMaxPayload;  // defensive clamp on untrusted input
     cb(ctx, static_cast<int>(kind), slot + 8, len);
     MemoryBarrier();
-    ctl->read_idx = r + 1;
-    r = ctl->read_idx;
+    ++r;
+    ctl->read_idx = r;
+    if (cursor)
+      *cursor = r;
     ++n;
   }
   return n;

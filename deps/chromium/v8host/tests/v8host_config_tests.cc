@@ -11,6 +11,7 @@
 #include "v8host_test_support.h"
 
 #include "sbox_config.h"
+#include "msg_channel.h"
 
 #include <cstdio>
 #include <functional>
@@ -384,10 +385,48 @@ bool MarshalCrossFieldGate(std::string* detail) {
   return true;
 }
 
+// The broker reads a ring whose producer index is worker-controlled.
+bool Fail(std::string* detail, const char* message) {
+  *detail = message;
+  return false;
+}
+bool ChannelDrainBounds(std::string* detail) {
+  using namespace sbox_msg;
+  std::vector<uint8_t> section(kSectionSize, 0);
+  InitHeader(section.data());
+  ChannelHeader* h = Header(section.data());
+  uint8_t* ring = T2BRing(section.data());
+  struct Count { int frames = 0; } count;
+  const FrameCb cb = [](void* ctx, int, const void*, size_t) { ++static_cast<Count*>(ctx)->frames; };
+  const uint8_t payload[4] = {1, 2, 3, 4};
+  uint32_t cursor = 0;
+  for (int i = 0; i < 3; ++i)
+    if (!Post(&h->t2b, ring, 1, payload, sizeof(payload))) return Fail(detail, "post");
+  // A tampered read_idx doesn't move the private cursor.
+  h->t2b.read_idx = 0xDEADBEEFu;
+  if (Drain(&h->t2b, ring, cb, &count, &cursor) != 3 || count.frames != 3 || cursor != 3)
+    return Fail(detail, "drain from the private cursor");
+  // Exactly one ring ahead is the most a producer can legitimately be.
+  h->t2b.write_idx = cursor + kSlots;
+  count.frames = 0;
+  if (Drain(&h->t2b, ring, cb, &count, &cursor) != static_cast<int>(kSlots) || cursor != 3 + kSlots)
+    return Fail(detail, "a full ring was rejected");
+  // Behind the consumer, or more than a ring ahead: corruption, no callback, no movement.
+  for (uint32_t bad : {cursor - 1, cursor + kSlots + 1, cursor + 0x80000000u}) {
+    h->t2b.write_idx = bad;
+    count.frames = 0;
+    const uint32_t before = cursor;
+    if (Drain(&h->t2b, ring, cb, &count, &cursor) != -1 || count.frames != 0 || cursor != before)
+      return Fail(detail, "an impossible producer index was accepted");
+  }
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   const std::vector<TestCase> tests = {
+      {"channel", "drain_bounds", ChannelDrainBounds},
       {"setters", "success", SettersSuccess},
       {"setters", "null_arg", SettersNullArg},
       {"setters", "integrity_invalid", IntegrityInvalid},

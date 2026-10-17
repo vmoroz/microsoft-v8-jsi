@@ -287,8 +287,14 @@ bool ClientStep(const Options& o) {
   if (!Pump([&] { return capture.terminals || capture.disconnects; }, o.missing ? 14000 : 15000))
     return Fail("terminal/disconnect timeout");
   if (o.missing) {
-    return capture.disconnects || (!capture.statuses.empty() &&
-        capture.statuses.back() != v8host_status_ok) || Fail("missing native payload succeeded");
+    // No worker came up: no readiness, no completed run, no message.
+    const bool failed = capture.disconnects || (!capture.statuses.empty() &&
+        capture.statuses.back() != v8host_status_ok);
+    bool completed = false;
+    for (int event : capture.events) completed |= event == v8host_run_event_completed;
+    for (int state : capture.states)
+      completed |= state == v8host_session_state_worker_security_ready;
+    return (failed && !completed && capture.messages.empty()) || Fail("missing native payload succeeded");
   }
   if (!capture.valid || capture.disconnects || capture.terminals != 1 ||
       capture.states != std::vector<int>{v8host_session_state_ready,

@@ -485,23 +485,47 @@ extends:
                 displayName: Cross-arch - ARM64EC client / ARM64 payload, side-by-side update and rollback
                 workingDirectory: $(Build.SourcesDirectory)
 
+              # Shipped build: the release trust policy (no SBOX_DEV_ALLOW_UNSIGNED,
+              # so unsigned payloads and non-architecture layouts fail closed),
+              # built beside the developer build the suites above ran against.
+              # The gate fails if any developer-policy hook is left in the binaries.
+              # Signed after staging (below); an unsigned release build can't run.
+          - ${{ if and(eq(parameters.isPublish, true), eq(parameters.fakeBuild, false)) }}:
+            - pwsh: |
+                $rel = "$(Build.SourcesDirectory)\${{ sb.SboxOutDir }}-release"
+                node scripts/sbox-build.ts --target-cpu ${{ sb.BuildPlatform }} --out-dir $rel --release-trust --target generic
+                if ($LASTEXITCODE -ne 0) { throw "Release-trust sandbox build FAILED (exit $LASTEXITCODE)" }
+                node scripts/sbox-build.ts --target-cpu ${{ sb.BuildPlatform }} --out-dir $rel --release-trust --no-gen --no-build --check `
+                    --output-path $(Build.StagingDirectory)\out
+                if ($LASTEXITCODE -ne 0) { throw "Release-trust hygiene gates FAILED (exit $LASTEXITCODE)" }
+              displayName: Build shipped sandbox binaries (release trust policy) and run hygiene gates
+              workingDirectory: $(Build.SourcesDirectory)
+
             # Stage the shipped sandbox binaries under a build/native/<rid>/
             # layout so the aggregator can merge the downloaded artifact straight
             # into pkg-staging. v8jsisb.pdb is renamed to v8jsisb.dll.pdb (the
             # nuspec/symbol globs expect <dll>.pdb). Test executables are
             # deliberately excluded. Always runs so the artifact path exists.
+            # Publishing builds stage the release-trust build; PR builds stage the
+            # developer build, whose unsigned packages the consumer smoke can run.
           - pwsh: |
               $sandboxOut = "$(Build.SourcesDirectory)\${{ sb.SboxOutDir }}"
+              if ('${{ and(eq(parameters.isPublish, true), eq(parameters.fakeBuild, false)) }}' -eq 'True') { $sandboxOut = "$sandboxOut-release" }
               $eng = "$(Build.SourcesDirectory)\deps\nodejs\out\Release"
               $dst = "$(Build.StagingDirectory)\sandbox\build\native\${{ sb.Rid }}"
               New-Item -ItemType Directory -Force -Path $dst | Out-Null
-              foreach ($f in 'sbox.exe','sbox.exe.pdb','v8host.dll','v8host.dll.pdb','v8host.dll.lib') {
+              # An x86 client needs only its client DLL: the broker and worker are
+              # always the native x64 payload, so no x86 sbox.exe or engine ships.
+              $native = '${{ sb.BuildPlatform }}' -ne 'x86'
+              $files = @('v8host.dll','v8host.dll.pdb','v8host.dll.lib')
+              if ($native) { $files += 'sbox.exe','sbox.exe.pdb' }
+              foreach ($f in $files) {
                 $p = Join-Path $sandboxOut $f
                 if (Test-Path $p) { Copy-Item $p $dst }
               }
-              if (Test-Path "$eng\v8jsisb.dll") { Copy-Item "$eng\v8jsisb.dll" $dst }
-              if (Test-Path "$eng\v8jsisb.dll.pdb") { Copy-Item "$eng\v8jsisb.dll.pdb" $dst }
-              elseif (Test-Path "$eng\v8jsisb.pdb") { Copy-Item "$eng\v8jsisb.pdb" (Join-Path $dst 'v8jsisb.dll.pdb') }
+              if ($native -and (Test-Path "$eng\v8jsisb.dll")) { Copy-Item "$eng\v8jsisb.dll" $dst }
+              if ($native -and (Test-Path "$eng\v8jsisb.dll.pdb")) { Copy-Item "$eng\v8jsisb.dll.pdb" $dst }
+              elseif ($native -and (Test-Path "$eng\v8jsisb.pdb")) { Copy-Item "$eng\v8jsisb.pdb" (Join-Path $dst 'v8jsisb.dll.pdb') }
               # mkv8snapshot.exe: the offline snapshot builder (vcbuild output,
               # same dir as the engine — it links no V8). Ships per-RID beside
               # the engine it LoadLibrary's. PDB renamed to <exe>.pdb for the glob.

@@ -1,3 +1,6 @@
+# The trust policy of the product binaries (sbox.exe, v8host.dll).
+import("//sandbox_dll/trust.gni")
+
 # The product single-image sbox.exe (broker + worker, persona by argv) + the
 # broker/target C ABI it links statically. Built with the Chromium toolchain;
 # the EXE loads v8host.dll (the engine payload) at runtime.
@@ -31,7 +34,10 @@ executable("sbox") {
     "sbox_main.cc",
   ]
   include_dirs = [ "." ]  # sbox_core_internal.h, sbox.h, msg_channel.h, sbox_harden.h
-  defines = [ "SBOX_STATIC", "SBOX_DEV_ALLOW_UNSIGNED" ]
+  defines = [ "SBOX_STATIC" ]
+  if (sbox_dev_allow_unsigned) {
+    defines += [ "SBOX_DEV_ALLOW_UNSIGNED" ]
+  }
   deps = [
     ":sbox_config",
     "//base",

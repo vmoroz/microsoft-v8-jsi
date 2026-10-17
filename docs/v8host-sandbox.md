@@ -10,7 +10,13 @@ which provides the client, broker plugin, and worker engine plugin; and engine
 DLLs: `v8jsisb.dll` for the untrusted tier (jitless with Arbitrary Code Guard,
 ACG), and `v8jsi.dll` for the trusted tier (JIT, without ACG).
 From the repository root, build the sandbox container and plugin with
-`node scripts\sbox-build.ts --target-cpu x64 --target generic`.
+`node scripts\sbox-build.ts --target-cpu x64 --target generic`. That default is
+the **developer** trust policy: unsigned payloads and non-architecture layouts
+are accepted so the suites can run on unsigned outputs. The shipped binaries
+are built with `--release-trust`, which compiles the developer policy out:
+every payload file must carry a valid signature, and the layout must be the
+`<install-root>\<native-arch>\` one below. The hygiene gate (`--check`) fails a
+release-trust build that still contains developer hooks.
 The engine DLLs are built separately; see the [project guide](../AGENTS.md).
 The [plugin overview](../deps/chromium/v8host/README.md) describes the internal
 lifecycle. Use the untrusted tier for untrusted JavaScript.
@@ -27,7 +33,10 @@ The deployment architecture contract is:
 | ARM64EC on ARM64 Windows | ARM64 | The process loads the x64-built client DLL; no ARM64EC-compiled client DLL is provided. |
 
 Unsupported combinations include 32-bit Windows and any x86 broker or worker.
-An x64 client on ARM64 Windows is unqualified. There is no weaker-profile or
+An x64 client on ARM64 Windows resolves by the same rule as ARM64EC (the sibling
+`arm64` payload), but it is not qualified. The NuGet `UseV8Sandbox` option
+supports x64 and ARM64 consumers only; x86 and ARM64EC consumers need the
+cross-architecture layout, which the package does not stage yet. There is no weaker-profile or
 other-architecture fallback: a qualification failure fails closed, never falls
 back.
 

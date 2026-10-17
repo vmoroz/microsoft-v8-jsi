@@ -28,6 +28,13 @@
       <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)include\v8host;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
   </ItemDefinitionGroup>
+  <!-- Supported: same-architecture x64 and ARM64 clients. The shipped binaries
+       need the payload and the client DLL in `<install-root>\<arch>\`
+       (docs\v8host-sandbox.md); a flat copy works only with developer builds. -->
+  <Target Name="V8HostSandboxUnsupportedPlatform" BeforeTargets="PrepareForBuild"
+          Condition="'$(UseV8Sandbox)' == 'True' AND ('$(V8Platform)' == 'x86' OR '$(Platform)' == 'ARM64EC')">
+    <Error Text="UseV8Sandbox supports x64 and ARM64 consumers only. x86 and ARM64EC clients need the cross-architecture install layout described in docs\v8host-sandbox.md, which this package does not stage." />
+  </Target>
   <ItemGroup Condition="'$(UseV8Sandbox)' == 'True'">
     <ReferenceCopyLocalPaths Include="$(MSBuildThisFileDirectory)$(V8JsiRuntimeIdentifier)\sbox.exe" />
     <ReferenceCopyLocalPaths Include="$(MSBuildThisFileDirectory)$(V8JsiRuntimeIdentifier)\v8host.dll" />

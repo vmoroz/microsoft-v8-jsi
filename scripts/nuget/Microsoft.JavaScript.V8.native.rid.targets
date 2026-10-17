@@ -55,7 +55,16 @@
   </ItemGroup>
 
   <!-- Sandbox opt-in requires all three shipped binaries. Test executables
-       are never packaged. -->
+       are never packaged.
+       Supported: same-architecture x64 and ARM64 clients. The shipped binaries
+       require the payload and the client DLL in `<install-root>\<arch>\`
+       (docs\v8host-sandbox.md); a flat copy into the output folder works only
+       with developer builds. x86 and ARM64EC consumers need a cross-architecture
+       layout this package does not stage yet. -->
+  <Target Name="V8HostSandboxUnsupportedPlatform_$rid$" BeforeTargets="PrepareForBuild"
+          Condition=" '$(V8JsiRuntimeIdentifier)' == '$rid$' AND '$(UseV8Sandbox)' == 'True' AND ('$rid$' == 'win-x86' OR '$(Platform)' == 'ARM64EC') ">
+    <Error Text="UseV8Sandbox supports x64 and ARM64 consumers only. x86 and ARM64EC clients need the cross-architecture install layout described in docs\v8host-sandbox.md, which this package does not stage." />
+  </Target>
   <ItemGroup Condition=" '$(V8JsiRuntimeIdentifier)' == '$rid$' AND '$(UseV8Sandbox)' == 'True' ">
     <ReferenceCopyLocalPaths Include="$(MSBuildThisFileDirectory)..\..\runtimes\$rid$\native\v8jsisb.dll" />
     <ReferenceCopyLocalPaths Include="$(MSBuildThisFileDirectory)..\..\runtimes\$rid$\native\sbox.exe" />
