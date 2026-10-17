@@ -4607,8 +4607,9 @@ bool DedicatedOwnerExit(std::string* detail) {
     return false;
   const DWORD broker_pid = connection.broker_pid();
   HANDLE broker = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, broker_pid);
-  // The policy test covers post-accept immunity beyond the full expiry.
-  // Here only exercise a live negotiated owner followed by prompt Close.
+  // A dedicated broker leaves its accept loop after the first accept, so the
+  // pre-connect expiry can't apply here; this only checks a live owner and a
+  // prompt Close.
   const bool alive = broker && ::WaitForSingleObject(broker, 500) == WAIT_TIMEOUT;
   if (broker) ::CloseHandle(broker);
   connection.Close();

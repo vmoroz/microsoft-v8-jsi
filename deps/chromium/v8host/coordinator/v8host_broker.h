@@ -6,6 +6,8 @@
 #include <chrono>
 
 inline constexpr auto kDedicatedPreConnectExpiry = std::chrono::seconds(30);
+static_assert(kDedicatedPreConnectExpiry == std::chrono::seconds(30),
+              "the dedicated pre-connect expiry is a tested 30 s contract");
 
 inline bool V8HostBrokerPreConnectExpired(
     bool dedicated, bool first_accept,
