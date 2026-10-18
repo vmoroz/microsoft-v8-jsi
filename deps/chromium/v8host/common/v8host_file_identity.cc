@@ -195,7 +195,11 @@ bool OpenImmutableFile(const std::wstring& path, HeldFile* out, DWORD* error,
       ::CreateFileW(path.c_str(),
                     FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
                     FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL, nullptr);
+                    FILE_ATTRIBUTE_NORMAL
+#if !defined(SBOX_DEV_ALLOW_UNSIGNED)
+                        | FILE_FLAG_OPEN_REPARSE_POINT
+#endif
+                    , nullptr);
   if (result.handle_ == INVALID_HANDLE_VALUE) {
     if (error)
       *error = ::GetLastError();
@@ -208,6 +212,9 @@ bool OpenImmutableFile(const std::wstring& path, HeldFile* out, DWORD* error,
       !::GetFileInformationByHandleEx(result.handle_, FileStandardInfo,
                                       &standard, sizeof(standard)) ||
       standard.Directory || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+#if !defined(SBOX_DEV_ALLOW_UNSIGNED)
+      (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+#endif
       (final_path != FinalPathMode::kOmitForWorkerHold &&
        !ReadFinalPath(result.handle_, &result.final_path_)) ||
       !ReadMachine(result.handle_, &result.machine_) ||
@@ -346,6 +353,14 @@ bool IsStrictDescendant(const std::wstring& root,
   const wchar_t boundary = candidate[root.size()];
   return (root.back() == L'\\' || root.back() == L'/') ||
          boundary == L'\\' || boundary == L'/';
+}
+
+bool IsPayloadFileAllowed(const std::wstring& install_root, const HeldFile& file) {
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
+  return true;
+#else
+  return file && IsStrictDescendant(install_root, file.final_path());
+#endif
 }
 
 bool IsSameFileIdentity(const HeldFile& left, const HeldFile& right) {

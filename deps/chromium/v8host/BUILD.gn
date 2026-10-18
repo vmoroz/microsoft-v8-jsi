@@ -233,6 +233,9 @@ source_set("engine_persona") {
     ":spawn_config",
   ]
   defines = [ "SBOX_IMPL" ]
+  if (sbox_dev_allow_unsigned) {
+    defines += [ "SBOX_DEV_ALLOW_UNSIGNED" ]
+  }
 
   configs -= [ "//build/config/compiler:no_exceptions" ]
   configs += [ "//build/config/compiler:exceptions" ]

@@ -87,6 +87,9 @@ bool EqualSidBytes(const std::vector<uint8_t>& left,
 bool EqualLuid(const LUID& left, const LUID& right);
 bool IsStrictDescendant(const std::wstring& root,
                         const std::wstring& candidate);
+// Release payloads must resolve strictly below the container-derived root.
+// Both arguments use held-file final paths (including volume-GUID prefixes).
+bool IsPayloadFileAllowed(const std::wstring& install_root, const HeldFile& file);
 bool IsSameFileIdentity(const HeldFile& left, const HeldFile& right);
 std::wstring ParentPath(const std::wstring& path);
 

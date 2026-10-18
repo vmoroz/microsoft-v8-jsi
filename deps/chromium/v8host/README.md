@@ -27,7 +27,9 @@ the `LowerToken` boundary and exposed as the plugin vtable:
   and encodes the run profile (engine DLL, jitless flag, optional snapshot path)
   into the opaque `plugin_data` the container carries to the worker. The tier and
   engine are overridable for testing via `SBOX_TIER` / `V8HOST_ENGINE_DLL` /
-  `V8HOST_SNAPSHOT` in the broker's environment.
+  `V8HOST_SNAPSHOT` in the broker's environment in developer builds only.
+  Release-trust builds ignore these overrides and `V8HOST_GUEST_JS`, do not echo
+  worker output, and require held payload paths to remain below the install root.
 - **`warmup` (pre-lockdown):** decodes `plugin_data` (a V1 session profile or a
   V2 worker profile), loads the engine DLL by full path from the app dir
   (`v8jsisb.dll` jitless for Untrusted, `v8jsi.dll` for Trusted), sets

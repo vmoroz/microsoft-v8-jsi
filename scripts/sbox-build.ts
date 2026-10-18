@@ -758,7 +758,9 @@ async function runSandboxBinSkim(
 // binaries only under SBOX_DEV_ALLOW_UNSIGNED (read in the broker and sbox.exe).
 function checkReleaseTrust(outDir: string): boolean {
   console.log("\n=== Release trust policy (no developer hooks) ===\n");
-  const markers = ["V8HOST_BROKER_API_TEST", "SBOX_TEST_LIFECYCLE_FAILURE", "SBOX_TEST_LIFECYCLE_HELD_EVENT"];
+  const markers = ["V8HOST_BROKER_API_TEST", "SBOX_TEST_LIFECYCLE_FAILURE", "SBOX_TEST_LIFECYCLE_HELD_EVENT",
+    "V8HOST_GUEST_JS", "SBOX_TIER", "V8HOST_ENGINE_DLL", "V8HOST_SNAPSHOT", "V8HOST_PERF",
+    "SBOX_FORCE_RELOCATE", "--pipe-bench", "sbox_bench"];
   let ok = true;
   for (const file of ["sbox.exe", "v8host.dll"]) {
     const filePath = path.join(outDir, file);

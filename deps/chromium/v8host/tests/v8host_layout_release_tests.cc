@@ -148,6 +148,43 @@ bool ReparseOutsideRoot(std::string* detail) {
   return ok;
 }
 
+bool PayloadFinalPathPolicy(std::string* detail) {
+  namespace fs = std::filesystem;
+  const fs::path base = fs::path(ExecutableDirectory()) / L"layouts-release" /
+                        (L"contain-" + std::to_wstring(::GetCurrentProcessId()));
+  const fs::path root = base / L"root";
+  const fs::path outside = base / L"root-evil";
+  std::error_code ec;
+  fs::create_directories(root / L"x64", ec);
+  fs::create_directories(outside, ec);
+  if (ec) return Fail(detail, "containment fixture directories");
+  wchar_t self[MAX_PATH] = {};
+  ::GetModuleFileNameW(nullptr, self, MAX_PATH);
+  if (!::CreateHardLinkW((root / L"x64" / L"image.dll").c_str(), self, nullptr) ||
+      !::CreateHardLinkW((outside / L"image.dll").c_str(), self, nullptr) ||
+      !CreateJunction(root / L"x64" / L"redirect", outside))
+    return Fail(detail, "containment hard links/junction");
+  bool ok = false;
+  {
+    v8host::HeldFile contained, escaped, redirected, leaf;
+    DWORD error = 0;
+    ok = v8host::OpenImmutableFile((root / L"x64" / L"image.dll").wstring(), &contained, &error) &&
+         v8host::OpenImmutableFile((outside / L"image.dll").wstring(), &escaped, &error) &&
+         v8host::OpenImmutableFile((root / L"x64" / L"redirect" / L"image.dll").wstring(),
+                                   &redirected, &error);
+    const std::wstring canonical_root =
+        v8host::ParentPath(v8host::ParentPath(contained.final_path()));
+    ok = ok && v8host::IsPayloadFileAllowed(canonical_root, contained) &&
+         !v8host::IsPayloadFileAllowed(canonical_root, escaped) &&
+         !v8host::IsPayloadFileAllowed(canonical_root, redirected) &&
+         !v8host::IsPayloadFileAllowed(contained.final_path(), contained) &&
+         !v8host::OpenImmutableFile((root / L"x64" / L"redirect").wstring(), &leaf, &error);
+  }
+  fs::remove_all(root / L"x64" / L"redirect", ec);
+  fs::remove_all(base, ec);
+  return ok || Fail(detail, "contained hard link / sibling prefix / parent junction / final reparse policy");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -156,6 +193,7 @@ int main(int argc, char** argv) {
       {"layout-release", "unsigned-payload-rejected", UnsignedPayloadRejected},
       {"layout-release", "install-root-derivation", InstallRootDerivation},
       {"layout-release", "reparse-outside-root", ReparseOutsideRoot},
+      {"layout-release", "payload-final-path-policy", PayloadFinalPathPolicy},
   };
   return v8host::test::RunTests(argc, argv, tests);
 }

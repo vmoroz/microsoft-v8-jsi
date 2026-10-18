@@ -128,9 +128,8 @@ bool ValidPolicyExpectation(const SboxTrustTransitionPolicyExpectation& policy) 
 }
 #endif
 
-// Broker diagnostics: mirror to stdout (console test harnesses) and to
-// the debugger via OutputDebugString, so broker failures are visible from GUI
-// hosts that have no console. Capture with DebugView/DBWIN.
+// Developer diagnostics only. Test-only capture remains independent of whether
+// stdout / OutputDebugString echo is enabled.
 void BrokerLog(const char* fmt, ...) {
   char buf[1024];
   va_list ap;
@@ -145,8 +144,10 @@ void BrokerLog(const char* fmt, ...) {
     g_trust_transition_last_output.append(buf);
   }
 #endif
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
   ::fputs(buf, stdout);
   ::OutputDebugStringA(buf);
+#endif
 }
 
 // Length-delimited variant for the relayed target output (not NUL-terminated).
@@ -157,6 +158,7 @@ void BrokerLogRaw(const char* data, size_t len) {
     g_trust_transition_last_output.append(data, len);
   }
 #endif
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
   ::fwrite(data, 1, len, stdout);
   char buf[4097];
   while (len) {
@@ -167,6 +169,7 @@ void BrokerLogRaw(const char* data, size_t len) {
     data += n;
     len -= n;
   }
+#endif
 }
 
 // Synchronous launch delegate (run task + reply inline; no thread pool).
@@ -936,6 +939,7 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
   }
 #endif
 
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
   // Base-independence probe (see security note): force the child's sbox.exe to
   // relocate when SBOX_FORCE_RELOCATE is set.
   if (::GetEnvironmentVariableW(L"SBOX_FORCE_RELOCATE", nullptr, 0) > 0) {
@@ -949,7 +953,6 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
            reserved ? 0 : ::GetLastError());
   }
 
-#if defined(SBOX_DEV_ALLOW_UNSIGNED)
   if (failure) {
     wchar_t event_name[256] = {};
     if (::GetEnvironmentVariableW(L"SBOX_TEST_LIFECYCLE_HELD_EVENT", event_name, 256)) {

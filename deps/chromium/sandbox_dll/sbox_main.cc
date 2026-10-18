@@ -224,7 +224,8 @@ sbox_status SBOX_CDECL WkPostMessage(sbox_worker w, sbox_msg_kind kind,
     return sbox_status_invalid_arg;
   // The engine/guest may post only opaque string/binary frames. sbox_msg_kind_lifecycle
   // (and any other kind) is container-only, so reject it here — a readiness marker
-  // can never be forged by the plugin or a guest.
+  // cannot be submitted through this API. Code executing inside the worker can
+  // still forge the underlying channel; readiness is not proof of worker integrity.
   if (kind != sbox_msg_kind_string && kind != sbox_msg_kind_binary)
     return sbox_status_invalid_arg;
   return sbox_target_post_message(w->target, static_cast<int>(kind), data,
@@ -287,6 +288,17 @@ bool LoadPlugin(const std::wstring& plugin_name, bool verify, const char* tag,
     printf("[sbox] %s: signature verification failed\n", tag);
     return false;
   }
+#if !defined(SBOX_DEV_ALLOW_UNSIGNED)
+  if (verify) {
+    v8host::HeldFile container;
+    if (!v8host::OpenImmutableFile(SelfPath(), &container, &error) ||
+        !v8host::IsPayloadFileAllowed(
+            v8host::ParentPath(v8host::ParentPath(container.final_path())), held)) {
+      printf("[sbox] %s: plugin escaped install root\n", tag);
+      return false;
+    }
+  }
+#endif
   HMODULE mod = ::LoadLibraryExW(full.c_str(), nullptr,
                                  LOAD_LIBRARY_SEARCH_SYSTEM32 |
                                      LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
@@ -329,6 +341,9 @@ struct PreparedSandbox {
   const sbox_plugin_api* plugin = nullptr;
   std::wstring plugin_name;
   v8host::HeldFile plugin_file;
+#if !defined(SBOX_DEV_ALLOW_UNSIGNED)
+  std::vector<v8host::HeldFile> engine_files;
+#endif
   sbox_config_s cfg;          // collected by configure()
   SboxConfigMarshal marshal;  // the SboxPolicy + the storage its pointers alias
 
@@ -366,10 +381,24 @@ bool PrepareSandbox(const std::wstring& plugin_name,
   // Verify each engine DLL the worker will LoadLibrary pre-lockdown.
   const std::wstring dir = sbox_harden::ExeDir();
   for (const std::wstring& dll : out.cfg.engine_dlls) {
+#if !defined(SBOX_DEV_ALLOW_UNSIGNED)
+    v8host::HeldFile engine;
+    DWORD error = ERROR_SUCCESS;
+    if (!IsBareFilename(dll) ||
+        !v8host::OpenImmutableFile(dir + dll, &engine, &error) ||
+        !v8host::IsPayloadFileAllowed(
+            v8host::ParentPath(v8host::ParentPath(out.plugin_file.final_path())), engine) ||
+        !v8host::TrustAllowed(v8host::VerifyTrust(engine))) {
+      printf("[sbox] engine DLL verification failed: %ls\n", dll.c_str());
+      return false;
+    }
+    out.engine_files.push_back(std::move(engine));
+#else
     if (!IsBareFilename(dll) || !sbox_harden::CheckTrust(dir + dll, "engine")) {
       printf("[sbox] engine DLL verification failed: %ls\n", dll.c_str());
       return false;
     }
+#endif
   }
 
   // Marshal the collected config into an SboxPolicy. THE DISCARD GATE: if any
@@ -505,7 +534,9 @@ void OnBrokerReply(void* ctx, int kind, const void* data, size_t len) {
   }
   if (kind == SBOX_MSG_STRING) {
     const std::string text(static_cast<const char*>(data), len);
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
     printf("[sbox] broker: worker reply = \"%s\"\n", text.c_str());
+#endif
     // The worker runs real guest JS under lockdown; the built-in demo guest
     // echoes each request as "js echo: <request>" via host.postMessage.
     if (text.rfind("js echo: ", 0) == 0) {
@@ -622,6 +653,7 @@ int RunBroker(const std::wstring& plugin_name) {
 // the main thread times N round-trips. Isolates the pipe transport cost
 // (cross-process scheduling is already in the warm broker<->worker number). No
 // protocol, no auth — just RTT.
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
 DWORD WINAPI PipeServerThread(void* arg) {
   const wchar_t* name = static_cast<const wchar_t*>(arg);
   HANDLE pipe = ::CreateNamedPipeW(
@@ -693,6 +725,8 @@ int RunPipeBench() {
          n ? sum / n : -1.0, mn, n);
   return n > 0 ? 0 : 1;
 }
+
+#endif
 
 // ===== generic plugin coordinator adapter =====
 
@@ -926,14 +960,18 @@ enum class Role {
   kNone,
   kBroker,
   kWorker,
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
   kPipeBench
+#endif
 };
 
 Role ParseRole(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--worker") == 0) return Role::kWorker;
     if (std::strcmp(argv[i], "--broker") == 0) return Role::kBroker;
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
     if (std::strcmp(argv[i], "--pipe-bench") == 0) return Role::kPipeBench;
+#endif
   }
   return Role::kNone;
 }
@@ -961,12 +999,17 @@ int main(int argc, char** argv) {
                  : RunBrokerPlugin(argc, argv, plugin);
     case Role::kWorker:
       return RunWorker(plugin);
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
     case Role::kPipeBench:
       return RunPipeBench();
+#endif
     case Role::kNone:
     default:
-      printf("Usage: sbox.exe --broker|--worker --plugin <filename> | "
-             "--pipe-bench\n");
+      printf("Usage: sbox.exe --broker|--worker --plugin <filename>"
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
+             " | --pipe-bench"
+#endif
+             "\n");
       return 2;
   }
 }

@@ -1236,6 +1236,7 @@ bool Router::Spawn(Worker &worker) {
       count);
   std::vector<uint8_t> spawn_config;
   if (!OpenImmutableFile(payload_directory_ + L"\\" + engine, &worker.engine_image, &error) ||
+      !IsPayloadFileAllowed(ParentPath(payload_directory_), worker.engine_image) ||
       worker.engine_image.machine() != machine_ || !TrustAllowed(VerifyTrust(worker.engine_image)) ||
       !PrepareSpawnConfig(config, profile, &spawn_config, worker.explicit_worker ? worker.max_runtimes : 0,
                           worker.explicit_worker ? &worker.snapshots : nullptr))

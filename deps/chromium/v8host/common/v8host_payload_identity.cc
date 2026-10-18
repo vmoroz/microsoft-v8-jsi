@@ -165,7 +165,9 @@ bool ResolvePayloadIdentity(const std::wstring& directory,
   }
   result.native_machine = result.container.machine();
   if (!DeriveInstallRoot(result.container.final_path(), result.native_machine,
-                         &result.install_root)) {
+                         &result.install_root) ||
+      !IsPayloadFileAllowed(result.install_root, result.container) ||
+      !IsPayloadFileAllowed(result.install_root, result.plugin)) {
     if (error)
       *error = ERROR_BAD_PATHNAME;
     return false;

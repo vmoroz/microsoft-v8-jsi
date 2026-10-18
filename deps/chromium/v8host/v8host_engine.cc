@@ -90,10 +90,9 @@ std::string g_guest_src;                   // guest source, read pre-lockdown
 bool g_use_guest_file = false;             // custom guest vs. built-in demo
 
 // Diagnostics sink. As a sandbox payload this process has no console of its own,
-// so plain stdout is often invisible. Mirror every diagnostic line to the
-// debugger output as well, so a debugger / DebugView captures it regardless of
-// how the process was launched. Used via the `printf` redefine below, so all
-// existing call sites are covered.
+// so plain stdout is often invisible. Developer builds also mirror diagnostic
+// lines to OutputDebugString. Release brokers never echo the worker's output.
+// Used via the `printf` redefine below, so all existing call sites are covered.
 inline void HostLog(const char* fmt, ...) {
   char buf[2048];
   va_list ap;
@@ -103,7 +102,9 @@ inline void HostLog(const char* fmt, ...) {
   if (n < 0)
     return;
   ::fputs(buf, stdout);
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
   ::OutputDebugStringA(buf);
+#endif
 }
 #define printf HostLog
 
@@ -180,11 +181,13 @@ bool ReadFileBytes(const std::wstring& path, std::string& out) {
   return ok;
 }
 
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
 std::wstring EnvW(const wchar_t* name) {
   wchar_t buf[MAX_PATH] = {};
   DWORD n = ::GetEnvironmentVariableW(name, buf, MAX_PATH);
   return (n == 0 || n >= MAX_PATH) ? std::wstring() : std::wstring(buf, n);
 }
+#endif
 
 // UTF-8 <-> UTF-16 bridges between the neutral spawn/worker-profile codec (UTF-8)
 // and the Win32 wide APIs (engine DLL / snapshot paths). Lossless for valid
@@ -217,6 +220,7 @@ std::string WideToUtf8(const std::wstring& wide) {
 }
 
 bool ReadGuestPath(std::wstring& path) {
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
   constexpr wchar_t name[] = L"V8HOST_GUEST_JS";
   ::SetLastError(ERROR_SUCCESS);
   const DWORD required = ::GetEnvironmentVariableW(name, nullptr, 0);
@@ -233,14 +237,17 @@ bool ReadGuestPath(std::wstring& path) {
     return false;
   }
   path.resize(length);
+#else
+  path.clear();
+#endif
   return true;
 }
 
 //==========================================================================
 // QPC timing split. Capture a timestamp at each startup boundary and print the
 // delta as `[v8host][perf] <segment> = N.N ms`. These lines go through HostLog,
-// so they reach BOTH stdout and OutputDebugString. Defaulting on; V8HOST_PERF=0
-// silences. (The `lockdown` segment is not emitted here — LowerToken now runs in
+// so developer builds reach BOTH stdout and OutputDebugString. Developer-only,
+// defaulting on; V8HOST_PERF=0 silences. (The `lockdown` segment is not emitted here — LowerToken now runs in
 // the container between warmup and run, not inside this DLL.)
 //==========================================================================
 struct Perf {
@@ -248,7 +255,11 @@ struct Perf {
   bool on = true;
   void init() {
     ::QueryPerformanceFrequency(&freq);
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
     on = EnvW(L"V8HOST_PERF") != L"0";
+#else
+    on = false;
+#endif
   }
   LONGLONG now() const {
     LARGE_INTEGER t;
@@ -1845,8 +1856,13 @@ void SBOX_CDECL V8HostEngineShutdown(sbox_worker /*w*/) {
 // enforces that jitless<->ACG match). The SBOX_TIER / V8HOST_ENGINE_DLL /
 // V8HOST_SNAPSHOT overrides stay dev-test-only.
 static void BuildDevSpawnConfig(v8host::V8HostSpawnConfigV1& spawn) {
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
   const bool trusted = EnvW(L"SBOX_TIER") == L"trusted";
   std::wstring engine = EnvW(L"V8HOST_ENGINE_DLL");
+#else
+  const bool trusted = false;
+  std::wstring engine;
+#endif
   if (engine.empty())
     engine = trusted ? L"v8jsi.dll" : L"v8jsisb.dll";
   spawn.tier = trusted ? v8host::kTierTrusted : v8host::kTierUntrusted;
@@ -1859,7 +1875,9 @@ static void BuildDevSpawnConfig(v8host::V8HostSpawnConfigV1& spawn) {
   spawn.use_app_container = false;
   spawn.low_privilege_app_container = false;
   spawn.engine_dll = WideToUtf8(engine);
+#if defined(SBOX_DEV_ALLOW_UNSIGNED)
   spawn.snapshot_path = WideToUtf8(EnvW(L"V8HOST_SNAPSHOT"));
+#endif
 }
 
 sbox_status SBOX_CDECL V8HostEngineConfigure(sbox_config cfg,

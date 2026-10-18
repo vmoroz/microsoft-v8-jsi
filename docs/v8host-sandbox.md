@@ -16,7 +16,11 @@ are accepted so the suites can run on unsigned outputs. The shipped binaries
 are built with `--release-trust`, which compiles the developer policy out:
 every payload file must carry a valid signature, and the layout must be the
 `<install-root>\<native-arch>\` one below. The hygiene gate (`--check`) fails a
-release-trust build that still contains developer hooks.
+release-trust build that still contains developer hooks. Release payload opens
+reject final-component reparse points, and the resolved container, plugin and
+engine paths must be strictly below the container-derived install root.
+Environment overrides (`V8HOST_GUEST_JS`, `SBOX_TIER`, `V8HOST_ENGINE_DLL`,
+`V8HOST_SNAPSHOT`), worker-output echo and `--pipe-bench` are developer-only.
 The engine DLLs are built separately; see the [project guide](../AGENTS.md).
 The [plugin overview](../deps/chromium/v8host/README.md) describes the internal
 lifecycle. Use the untrusted tier for untrusted JavaScript.

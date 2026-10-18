@@ -107,9 +107,9 @@ SBOX_ENUM(int32_t, sbox_status){
 /**
  * Message kinds on the duplex worker channel. string and binary are the
  * engine's opaque guest frames. lifecycle is container- or host-emitted and
- * plugin-forbidden (the worker-api post_message rejects it), so a readiness
- * marker can never be forged by the engine or a guest. The values are on the
- * wire.
+ * plugin-forbidden through worker-api post_message. Code executing inside the
+ * worker can still forge the underlying channel; readiness is not proof of
+ * worker integrity. The values are on the wire.
  */
 SBOX_ENUM(int32_t, sbox_msg_kind){
     sbox_msg_kind_string = 0,

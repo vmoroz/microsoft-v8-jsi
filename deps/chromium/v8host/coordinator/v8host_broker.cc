@@ -662,7 +662,9 @@ sbox_status V8HostBrokerRun(sbox_broker broker,
     return sbox_status_failed;
   payload.native_machine = start->native_machine;
   if (!v8host::DeriveInstallRoot(payload.container.final_path(),
-                                 payload.native_machine, &payload.install_root))
+                                 payload.native_machine, &payload.install_root) ||
+      !v8host::IsPayloadFileAllowed(payload.install_root, payload.container) ||
+      !v8host::IsPayloadFileAllowed(payload.install_root, payload.plugin))
     return sbox_status_failed;
   std::vector<uint8_t> sid;
   LUID session = {};
