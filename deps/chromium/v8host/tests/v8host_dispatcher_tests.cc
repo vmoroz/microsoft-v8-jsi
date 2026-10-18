@@ -40,6 +40,7 @@ bool Fail(std::string* detail, const char* message) {
   return false;
 }
 
+
 // Opaque cookies echoed back to callbacks. Never dereferenced by the dispatcher;
 // they stand in for the real v8host_session_s*/v8host_run_s* a client would pass.
 v8host_session_s* FakeSession(uintptr_t n) {
@@ -77,6 +78,43 @@ void DrainRemaining() {
   int guard = 0;
   while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE) && guard++ < 1000000)
     ::DispatchMessageW(&msg);
+}
+
+bool WindowTokenForgery(std::string* detail) {
+  DrainRemaining();
+  const auto ignored = G().IgnoredTokensForTesting();
+  std::atomic<int> count{0};
+  const auto token = G().PostTokenProbeForTesting(&count);
+  if (!token || !PumpUntil([&] { return count == 1; })) return false;
+  for (uint64_t forged : {uint64_t{0}, uint64_t{0xfedcba9876543210},
+                          uint64_t{reinterpret_cast<uintptr_t>(&count)}, token})
+    G().PostTokenForTesting(forged);
+  DrainRemaining();
+  if (count != 1 || G().IgnoredTokensForTesting() != ignored + 4)
+    return Fail(detail, "forged/replayed drain capability was not ignored");
+  return true;
+}
+
+bool WindowTokenPostFailure(std::string* detail) {
+  v8host::client::WindowTokens tokens;
+  if (!tokens.Initialize()) return false;
+  std::atomic<int> count{0};
+  const auto invoke = [](void* value) { static_cast<std::atomic<int>*>(value)->fetch_add(1); };
+  for (int i = 0; i < 1100; ++i)
+    if (tokens.Post(nullptr, WM_APP, &count, invoke)) return false;
+  HWND window = ::CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0,
+                                  HWND_MESSAGE, nullptr, nullptr, nullptr);
+  if (!window) return false;
+  const auto token = tokens.Post(window, WM_APP, &count, invoke);
+  const auto low = static_cast<WPARAM>(static_cast<uint32_t>(token));
+  const auto high = static_cast<LPARAM>(static_cast<uint32_t>(token >> 32));
+  tokens.Dispatch(WM_APP + 1, low, high);  // bound to the message kind as well
+  const bool wrong_kind_ignored = count == 0;
+  tokens.Dispatch(WM_APP, low, high);
+  tokens.Dispatch(WM_APP, low, high);  // one shot even under reentrancy
+  ::DestroyWindow(window);
+  return (token && wrong_kind_ignored && count == 1 && tokens.ignored() == 2) ||
+         Fail(detail, "post failure retained entries or changed ownership / message binding");
 }
 
 // Minimal manual-reset event for cross-thread test coordination (no pumping).
@@ -979,6 +1017,8 @@ int main(int argc, char** argv) {
   }
 
   const std::vector<TestCase> tests = {
+      {"dispatch", "opaque-window-tokens", WindowTokenForgery},
+      {"dispatch", "window-token-post-failure", WindowTokenPostFailure},
       {"delivery", "app-thread-ordering", AppThreadDeliveryAndOrdering},
       {"delivery", "all-callback-kinds", AllCallbackKinds},
       {"init", "idempotent", IdempotentInit},

@@ -5,6 +5,7 @@
 
 #include "v8host_client_transport.h"
 #include "v8host_dispatcher.h"
+#include "v8host_window_tokens.h"
 #include "v8host_payload_identity.h"
 #include "v8host_protocol.h"
 #include "v8host_protocol_messages.h"
@@ -273,6 +274,7 @@ class ClientRuntime {
   };
 
   v8host_status CreateLifecycleWindow() {
+    if (!tokens_.Initialize()) return v8host_status_internal_error;
     class_name_ =
         L"V8HostClientLifecycle_" + std::to_wstring(reinterpret_cast<uintptr_t>(this));
     WNDCLASSEXW wc = {};
@@ -299,7 +301,11 @@ class ClientRuntime {
   bool ScheduleStart(std::shared_ptr<ClientConnection> connection) {
     auto* pending = new (std::nothrow) std::shared_ptr<ClientConnection>(std::move(connection));
     if (!pending) return false;
-    if (::PostMessageW(hwnd_, kStartTransportMessage, reinterpret_cast<WPARAM>(pending), 0)) return true;
+    if (tokens_.Post(hwnd_, kStartTransportMessage, pending, [](void* value) {
+          std::unique_ptr<std::shared_ptr<ClientConnection>> owned(
+              static_cast<std::shared_ptr<ClientConnection>*>(value));
+          StartConnection(owned->get());
+        })) return true;
     delete pending;
     return false;
   }
@@ -314,9 +320,10 @@ class ClientRuntime {
       std::lock_guard<std::mutex> lock(mutex_);
       hwnd = hwnd_;
     }
-    if (hwnd != nullptr &&
-        ::PostMessageW(hwnd, kDestroySessionMessage,
-                       reinterpret_cast<WPARAM>(session), 0)) {
+    if (tokens_.Post(hwnd, kDestroySessionMessage, session, [](void* value) {
+          Instance().last_delete_thread_id_.store(::GetCurrentThreadId(), std::memory_order_release);
+          delete static_cast<v8host_session_s*>(value);
+        })) {
       return;
     }
     // Initialization guarantees a live lifecycle window. If the OS refuses
@@ -331,33 +338,33 @@ class ClientRuntime {
       std::lock_guard<std::mutex> lock(mutex_);
       hwnd = hwnd_;
     }
-    if (hwnd != nullptr &&
-        ::PostMessageW(hwnd, kDestroyObjectMessage, reinterpret_cast<WPARAM>(object),
-                       reinterpret_cast<LPARAM>(destroy))) {
+    if (tokens_.Post(hwnd, kDestroyObjectMessage, object, destroy)) {
       return;
     }
     // As for sessions: leak rather than delete under a callback.
   }
+
+#ifdef V8HOST_CLIENT_TESTING
+  uint64_t PostProbe(UINT message, std::atomic<int>* count) {
+    return tokens_.Post(hwnd_, message, count, [](void* value) {
+      static_cast<std::atomic<int>*>(value)->fetch_add(1);
+    });
+  }
+  void PostToken(UINT message, uint64_t token) {
+    ::PostMessageW(hwnd_, message, static_cast<WPARAM>(static_cast<uint32_t>(token)),
+                  static_cast<LPARAM>(static_cast<uint32_t>(token >> 32)));
+  }
+  uint64_t ignored_tokens() const { return tokens_.ignored(); }
+#endif
 
  private:
   static LRESULT CALLBACK WindowProc(HWND hwnd,
                                      UINT message,
                                      WPARAM wparam,
                                      LPARAM lparam) {
-    if (message == kStartTransportMessage) {
-      std::unique_ptr<std::shared_ptr<ClientConnection>> pending(
-          reinterpret_cast<std::shared_ptr<ClientConnection>*>(wparam));
-      StartConnection(pending->get());
-      return 0;
-    }
-    if (message == kDestroySessionMessage) {
-      Instance().last_delete_thread_id_.store(::GetCurrentThreadId(),
-                                               std::memory_order_release);
-      delete reinterpret_cast<v8host_session_s*>(wparam);
-      return 0;
-    }
-    if (message == kDestroyObjectMessage) {
-      reinterpret_cast<void (*)(void*)>(lparam)(reinterpret_cast<void*>(wparam));
+    if (message == kStartTransportMessage || message == kDestroySessionMessage ||
+        message == kDestroyObjectMessage) {
+      Instance().tokens_.Dispatch(message, wparam, lparam);
       return 0;
     }
     return ::DefWindowProcW(hwnd, message, wparam, lparam);
@@ -372,6 +379,7 @@ class ClientRuntime {
   std::atomic<bool> initialized_{false};
   std::atomic<uint32_t> lifecycle_thread_id_{0};
   std::atomic<uint32_t> last_delete_thread_id_{0};
+  WindowTokens tokens_;
 };
 
 #ifdef V8HOST_CLIENT_TESTING
@@ -1495,6 +1503,15 @@ void SetIdsForTesting(v8host_session_s* session, uint32_t request, uint32_t run)
 void SetBrokerRequestIdForTesting(v8host_broker broker, uint32_t request) {
   std::lock_guard<std::mutex> lock(broker->mutex);
   broker->conn->SetRequestId(request);
+}
+uint64_t PostLifecycleProbeForTesting(uint32_t message, std::atomic<int>* count) {
+  return ClientRuntime::Instance().PostProbe(message, count);
+}
+void PostLifecycleTokenForTesting(uint32_t message, uint64_t token) {
+  ClientRuntime::Instance().PostToken(message, token);
+}
+uint64_t IgnoredLifecycleTokensForTesting() {
+  return ClientRuntime::Instance().ignored_tokens();
 }
 void SetTransportFactoryForTesting(ClientTransportFactory factory) {
   g_test_factory.store(factory, std::memory_order_release);

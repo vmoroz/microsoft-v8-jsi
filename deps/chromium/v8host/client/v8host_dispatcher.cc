@@ -19,8 +19,8 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 namespace v8host::client {
 namespace {
 
-// Private window message carrying a drain request. wParam is a SessionDispatch*
-// with one reference held by the poster (released by DrainFromMessage).
+// Private drain capability. The table, never a message parameter, holds the
+// SessionDispatch reference released by DrainFromMessage.
 constexpr UINT kDrainMessage = WM_APP + 0x1D;
 
 HINSTANCE ModuleInstance() {
@@ -32,9 +32,8 @@ LRESULT CALLBACK DispatchWndProc(HWND hwnd,
                                  WPARAM wparam,
                                  LPARAM lparam) {
   if (message == kDrainMessage) {
-    auto* session = reinterpret_cast<SessionDispatch*>(wparam);
-    if (session)
-      SessionDispatch::DrainFromMessage(session);
+    auto* owner = reinterpret_cast<Dispatcher*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (owner) owner->DispatchToken(message, wparam, lparam);
     return 0;
   }
   return ::DefWindowProcW(hwnd, message, wparam, lparam);
@@ -125,6 +124,7 @@ v8host_status Dispatcher::Initialize() {
 }
 
 bool Dispatcher::CreateDispatchWindow() {
+  if (!tokens_.Initialize()) return false;
   // Captures the calling thread as the callback thread (design 9.1).
   thread_id_.store(::GetCurrentThreadId(), std::memory_order_release);
 
@@ -151,6 +151,7 @@ bool Dispatcher::CreateDispatchWindow() {
     return false;
   }
 
+  ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
   hwnd_.store(hwnd, std::memory_order_release);
   ready_.store(true, std::memory_order_release);
   return true;
@@ -172,9 +173,23 @@ bool Dispatcher::PostDrain(SessionDispatch* session) {
   HWND hwnd = reinterpret_cast<HWND>(hwnd_.load(std::memory_order_acquire));
   if (hwnd == nullptr)
     return false;
-  return ::PostMessageW(hwnd, kDrainMessage,
-                        reinterpret_cast<WPARAM>(session), 0) != 0;
+  return tokens_.Post(hwnd, kDrainMessage, session, [](void* value) {
+    SessionDispatch::DrainFromMessage(static_cast<SessionDispatch*>(value));
+  }) != 0;
 }
+
+#ifdef V8HOST_DISPATCHER_TESTING
+uint64_t Dispatcher::PostTokenProbeForTesting(std::atomic<int>* count) {
+  return tokens_.Post(reinterpret_cast<HWND>(hwnd_.load()), kDrainMessage, count, [](void* value) {
+    static_cast<std::atomic<int>*>(value)->fetch_add(1);
+  });
+}
+void Dispatcher::PostTokenForTesting(uint64_t token) {
+  ::PostMessageW(reinterpret_cast<HWND>(hwnd_.load()), kDrainMessage,
+      static_cast<WPARAM>(static_cast<uint32_t>(token)),
+      static_cast<LPARAM>(static_cast<uint32_t>(token >> 32)));
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Dispatcher -- session registry + id-keyed producer API

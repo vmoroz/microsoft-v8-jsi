@@ -7,6 +7,7 @@
 #include "v8host_client.h"
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <memory>
@@ -76,6 +77,9 @@ void SetSubmissionHooksForTesting(void (*before)(), void (*admitted)());
 v8host_status SubmitCancelForTesting(v8host_session_s* session, uint32_t run);
 void SetIdsForTesting(v8host_session_s* session, uint32_t request, uint32_t run);
 void SetBrokerRequestIdForTesting(v8host_broker broker, uint32_t request);
+uint64_t PostLifecycleProbeForTesting(uint32_t message, std::atomic<int>* count);
+void PostLifecycleTokenForTesting(uint32_t message, uint64_t token);
+uint64_t IgnoredLifecycleTokensForTesting();
 void SetTransportFactoryForTesting(ClientTransportFactory factory);
 void SetInitializeAfterDispatcherHookForTesting(void (*hook)());
 uint32_t LifecycleThreadIdForTesting();

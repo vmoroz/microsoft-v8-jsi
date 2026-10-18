@@ -2034,6 +2034,25 @@ bool ValidateRunPolicyAndOutputs(std::string* detail) {
   return true;
 }
 
+bool LifecycleTokens(std::string* detail) {
+  using namespace v8host::client;
+  Drain();
+  const auto ignored = IgnoredLifecycleTokensForTesting();
+  std::atomic<int> called{0};
+  for (UINT message : {WM_APP + 0x1E, WM_APP + 0x1F, WM_APP + 0x20}) {
+    const auto token = PostLifecycleProbeForTesting(message, &called);
+    if (!token) return Fail(detail, "legitimate lifecycle token post failed");
+    Drain();
+    const auto before = called.load();
+    for (uint64_t forged : {uint64_t{0}, uint64_t{0x0123456789abcdef},
+                            uint64_t{reinterpret_cast<uintptr_t>(&called)}, token})
+      PostLifecycleTokenForTesting(message, forged);
+    Drain();
+    if (called != before) return Fail(detail, "forged/replayed lifecycle token invoked callback");
+  }
+  return called == 3 && IgnoredLifecycleTokensForTesting() == ignored + 12;
+}
+
 bool DefaultInitialToken(std::string* detail) {
   TopologyFixture f;
   v8host_worker w = nullptr;
@@ -3991,6 +4010,7 @@ int main(int argc, char** argv) {
       {"validate", "tier-path-output-nulling", ValidateRunPolicyAndOutputs},
       {"config", "roundtrip-zero-and-64", ConfigRoundTrip},
       {"config", "default-initial-token", DefaultInitialToken},
+      {"lifecycle", "opaque-window-tokens", LifecycleTokens},
       {"boundary", "counts-runs-strings-frame", BoundaryQuotas},
       {"output", "all-failing-paths-null", ExhaustiveFailingOutputNulling},
       {"copy", "run-and-relay-roundtrip", RunAndRelayRoundTrip},

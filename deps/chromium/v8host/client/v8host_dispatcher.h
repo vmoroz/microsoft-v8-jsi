@@ -29,6 +29,7 @@
 #define V8HOST_CLIENT_V8HOST_DISPATCHER_H_
 
 #include "v8host_client.h"  // public Contract C types (handles, callbacks, status)
+#include "v8host_window_tokens.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -109,6 +110,14 @@ class Dispatcher {
   // false if the post failed (not initialized, or the OS message queue is
   // full). Internal; called by SessionDispatch when it schedules a drain.
   bool PostDrain(SessionDispatch* session);
+  void DispatchToken(uint32_t message, uintptr_t low, intptr_t high) {
+    tokens_.Dispatch(message, low, high);
+  }
+#ifdef V8HOST_DISPATCHER_TESTING
+  uint64_t PostTokenProbeForTesting(std::atomic<int>* count);
+  void PostTokenForTesting(uint64_t token);
+  uint64_t IgnoredTokensForTesting() const { return tokens_.ignored(); }
+#endif
 
   // ---- Id-keyed producer API: the ONLY cross-thread producer surface --------
   //
@@ -152,6 +161,7 @@ class Dispatcher {
 
  private:
   bool CreateDispatchWindow();
+  WindowTokens tokens_;
 
   // Resolves `id` to a live session under `sessions_mutex_`, AddRef'ing it
   // before the lock is released (nullptr if unknown). The caller owns the
