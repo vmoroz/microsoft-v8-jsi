@@ -117,12 +117,21 @@ class FakeTransport final : public ClientTransport {
   }
   v8host_status SendFrame(const uint8_t* bytes, size_t len) override {
     std::lock_guard<std::mutex> lock(mutex);
+    FrameHeader h;
+    if (DecodeAndValidateFrame(bytes, len, &h) == DecodeStatus::kOk &&
+        (h.type == MessageType::CLOSE_WORKER || h.type == MessageType::CLOSE_RUNTIME) &&
+        close_failures != 0) {
+      --close_failures;
+      return close_failure_status;  // failure admits no frame
+    }
     auto& frames = hold_until_start && !started ? waiting : outbound;
     frames.emplace_back(bytes, bytes + len);
     return send_status;
   }
   uint32_t conn_id() const override { return 1; }
   void Close() override { closed.store(true); }
+  void Wake() override { ++wakes; }
+  void Pump() { delegate_->OnPump(); }
 
   std::vector<uint8_t> Frame(size_t index) {
     std::lock_guard<std::mutex> lock(mutex);
@@ -151,6 +160,8 @@ class FakeTransport final : public ClientTransport {
   bool hold_until_start = false;
   v8host_status start_status = v8host_status_ok;
   v8host_status send_status = v8host_status_ok;
+  unsigned close_failures = 0, wakes = 0;
+  v8host_status close_failure_status = v8host_status_quota_exceeded;
 };
 
 std::mutex& FakesMutex() {
@@ -841,6 +852,133 @@ bool CloseOrderAndFlags(std::string* detail) {
     }
     Drain();
     if (!f.record.events.empty()) return Fail(detail, "parent close leaked queued callbacks");
+  }
+  return true;
+}
+
+bool MandatoryCloseRetry(std::string* detail) {
+  for (unsigned source = 0; source < 5; ++source) {
+    TopologyFixture f;
+    v8host_worker w = nullptr;
+    v8host_runtime r = nullptr;
+    const uint32_t flags = source == 1 ? 0 : v8host_worker_flags_close_when_empty;
+    if (!f.Open() || f.Worker(&w, WorkerOptions(1, flags)) != v8host_status_ok ||
+        f.Runtime(w, &r) != v8host_status_ok) return Fail(detail, "close-retry graph");
+    const uint32_t worker_id = v8host_worker_get_id(w), runtime_id = v8host_runtime_get_id(r);
+    v8host_run run = nullptr;
+    if (source == 3) {
+      f.Ready(w, r);
+      if (f.Run(r, &run) != v8host_status_ok) return false;
+      f.fake->Inbound(AckFor(f.Request(MessageType::START_RUN, runtime_id, v8host_run_get_id(run))));
+    }
+    f.fake->close_failures = 2;
+    if (source == 0) f.Close(r);
+    if (source == 1) f.Close(w);
+    if (source == 2) f.RuntimeFailed(r);
+    if (source == 3)
+      for (unsigned i = 0; i < 256; ++i) f.Relay(r, run, "x", 1);
+    if (source == 4) f.Refuse(MessageType::CREATE_RUNTIME, runtime_id, StatusCode::ERROR_QUOTA);
+    if (f.Count(MessageType::CLOSE_WORKER) || f.Count(MessageType::CLOSE_RUNTIME) || !f.fake->wakes)
+      return Fail(detail, "failed close was sent or did not wake pump");
+    f.fake->Pump();
+    if (f.Count(MessageType::CLOSE_WORKER) || f.Count(MessageType::CLOSE_RUNTIME) || f.fake->closed)
+      return Fail(detail, "transient failure did not remain pending");
+    f.fake->Pump();
+    const bool runtime_close = source == 0 || source == 3;
+    if (f.Count(MessageType::CLOSE_WORKER) != 1 ||
+        f.Count(MessageType::CLOSE_RUNTIME) != (runtime_close ? 1u : 0u) || f.fake->closed)
+      return Fail(detail, "pump did not retry each mandatory close exactly once");
+    auto worker_close = f.Request(MessageType::CLOSE_WORKER, worker_id);
+    if (runtime_close) {
+      auto close = f.Request(MessageType::CLOSE_RUNTIME, runtime_id);
+      if (close.empty()) return Fail(detail, "released runtime target lost");
+      f.fake->Inbound(AckFor(close));
+    }
+    if (worker_close.empty()) return Fail(detail, "released worker target lost");
+    f.fake->Inbound(AckFor(worker_close));
+    f.fake->Pump();
+    if (f.Count(MessageType::CLOSE_WORKER) != 1 ||
+        f.Count(MessageType::CLOSE_RUNTIME) != (runtime_close ? 1u : 0u))
+      return Fail(detail, "ACK or later pump replayed a close");
+  }
+  return true;
+}
+
+bool MandatoryClosePendingLimit(std::string* detail) {
+  TopologyFixture f;
+  if (!f.Open()) return false;
+  v8host_worker w = nullptr;
+  v8host_runtime first = nullptr;
+  for (uint32_t i = 0; i < kMaxControlQueueRequests; ++i) {
+    if (i % 16 == 0) {
+      if (f.Worker(&w, WorkerOptions(16)) != v8host_status_ok) return false;
+    } else {
+      v8host_runtime r = nullptr;
+      if (f.Runtime(w, &r) != v8host_status_ok) return false;
+      if (!first) first = r;
+    }
+  }
+  const uint32_t id = v8host_runtime_get_id(first);
+  f.Close(first);
+  f.fake->Pump();
+  if (f.Count(MessageType::CLOSE_RUNTIME) || f.fake->closed)
+    return Fail(detail, "pending-table saturation dropped close or disconnected");
+  f.fake->Inbound(AckFor(f.Request(MessageType::CREATE_RUNTIME, id)));
+  f.fake->Pump();
+  if (f.Count(MessageType::CLOSE_RUNTIME) != 1 || f.fake->closed)
+    return Fail(detail, "returned pending-table credit did not release close");
+  return true;
+}
+
+bool MandatoryCloseBufferBound(std::string* detail) {
+  TopologyFixture f;
+  if (!f.Open()) return false;
+  f.fake->close_failures = UINT32_MAX;
+  for (uint32_t i = 0; i <= kMaxControlQueueRequests; ++i) {
+    v8host_worker w = nullptr;
+    if (f.Worker(&w) != v8host_status_ok) return false;
+    f.fake->Inbound(AckFor(f.Request(MessageType::CREATE_WORKER, v8host_worker_get_id(w))));
+    f.Close(w);
+  }
+  f.fake->Pump();
+  Drain();
+  if (!f.fake->closed || f.record.events.empty() ||
+      f.record.events.back().code != v8host_broker_state_disconnected)
+    return Fail(detail, "overflowing bounded mandatory-close storage did not tear down");
+  return true;
+}
+
+bool MandatoryCloseFailure(std::string* detail) {
+  for (v8host_status failure : {v8host_status_connect_failed, v8host_status_protocol_error,
+                                v8host_status_no_memory, v8host_status_quota_exceeded}) {
+    for (bool retry_first : {false, true}) {
+      TopologyFixture f;
+      v8host_worker w = nullptr;
+      v8host_runtime r = nullptr;
+      if (!f.Open() || f.Worker(&w) != v8host_status_ok ||
+          f.Runtime(w, &r) != v8host_status_ok) return false;
+      if (failure == v8host_status_quota_exceeded && !retry_first)
+        v8host::client::SetBrokerRequestIdForTesting(f.broker, UINT32_MAX);
+      f.fake->close_failures = 1;
+      f.fake->close_failure_status = retry_first ? v8host_status_quota_exceeded : failure;
+      f.Close(r);
+      if (retry_first) {
+        f.fake->close_failures = 1;
+        f.fake->close_failure_status = failure;
+        if (failure == v8host_status_quota_exceeded)
+          v8host::client::SetBrokerRequestIdForTesting(f.broker, UINT32_MAX);
+      }
+      f.fake->Pump();
+      Drain();
+      if (!f.fake->closed || f.record.events.empty() ||
+          f.record.events.back().kind != 'b' ||
+          f.record.events.back().code != v8host_broker_state_disconnected ||
+          f.record.events.back().status != v8host_status_broker_lost)
+        return Fail(detail, "permanent close failure did not tear down connection");
+      const auto count = f.fake->FrameCount();
+      f.fake->Pump();
+      if (f.fake->FrameCount() != count) return Fail(detail, "failed connection replayed close");
+    }
   }
   return true;
 }
@@ -3805,6 +3943,10 @@ int main(int argc, char** argv) {
       {"transport", "startup-registration-failure", StartupRegistrationFailure},
       {"transport", "id-exhaustion", ClientIdExhaustion},
       {"transport", "admission-rollback", AdmissionRollback},
+      {"transport", "mandatory-close-retry", MandatoryCloseRetry},
+      {"transport", "mandatory-close-failure", MandatoryCloseFailure},
+      {"transport", "mandatory-close-pending-limit", MandatoryClosePendingLimit},
+      {"transport", "mandatory-close-buffer-bound", MandatoryCloseBufferBound},
       {"transport", "preconnect-fifo-version", TransportFifo},
       {"transport", "read-write-stop", TransportReadWriteStop},
       {"transport", "write-loss-no-replay", TransportWriteLoss},

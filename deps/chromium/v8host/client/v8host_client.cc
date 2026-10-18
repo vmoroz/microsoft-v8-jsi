@@ -583,6 +583,55 @@ class ClientConnection final
     return status;
   }
 
+  v8host_status SendClose(PendingControl pending) {
+    return SubmitControl(pending, [&](const auto& header) {
+      return pending.type == PendingType::kCloseWorker
+          ? protocol::BuildCloseWorkerFrame(header)
+          : protocol::BuildCloseRuntimeFrame(header);
+    });
+  }
+
+  // A close has no synchronous failure channel. Retain its target, not the
+  // released handle; only quota is retryable. Exhaustion/failed allocation or
+  // transport failure tears down the connection on its pump, outside graph locks.
+  void SubmitClose(PendingControl pending) {
+    {
+      std::lock_guard<std::mutex> lock(close_mutex_);
+      v8host_status status = close_count_ == 0 ? SendClose(pending)
+                                             : v8host_status_quota_exceeded;
+      if (status == v8host_status_quota_exceeded && !exhausted_.load()) {
+        if (close_count_ < deferred_closes_.size()) {
+          deferred_closes_[(close_head_ + close_count_) % deferred_closes_.size()] = pending;
+          ++close_count_;
+        } else {
+          close_failed_.store(true, std::memory_order_release);
+        }
+      } else if (status != v8host_status_ok) {
+        close_failed_.store(true, std::memory_order_release);
+      }
+    }
+    transport_->Wake();
+  }
+
+  void OnPump() override {
+    {
+      std::lock_guard<std::mutex> lock(close_mutex_);
+      while (close_count_ != 0 && !close_failed_.load()) {
+        const v8host_status status = SendClose(deferred_closes_[close_head_]);
+        if (status == v8host_status_quota_exceeded && !exhausted_.load())
+          break;
+        if (status != v8host_status_ok) {
+          close_failed_.store(true, std::memory_order_release);
+          break;
+        }
+        close_head_ = (close_head_ + 1) % deferred_closes_.size();
+        --close_count_;
+      }
+    }
+    if (close_failed_.load(std::memory_order_acquire))
+      OnDisconnect(TransportDisconnect::kBrokerLost);
+  }
+
   void OnConnected(uint32_t, uint16_t major, uint16_t minor) override {
     selected_major_.store(major, std::memory_order_release);
     selected_minor_.store(minor, std::memory_order_release);
@@ -998,6 +1047,10 @@ class ClientConnection final
   std::atomic<uint16_t> selected_minor_{protocol::kWireVersionMinor};
   std::atomic<bool> disconnected_{false};
   std::atomic<bool> exhausted_{false};
+  std::mutex close_mutex_;
+  std::array<PendingControl, protocol::kMaxControlQueueRequests> deferred_closes_{};
+  size_t close_head_ = 0, close_count_ = 0;
+  std::atomic<bool> close_failed_{false};
 };
 
 namespace {
@@ -1131,9 +1184,7 @@ void ReleaseAdmission(v8host_broker_s* b, v8host_worker_s* w) {
       b->terminal || !(w->flags & v8host_worker_flags_close_when_empty))
     return;
   w->closing = true;
-  b->conn->SubmitControl({PendingType::kCloseWorker, w->id, 0}, [](const auto& header) {
-    return protocol::BuildCloseWorkerFrame(header);
-  });
+  b->conn->SubmitClose({PendingType::kCloseWorker, w->id, 0});
 }
 
 // A runtime ended unasked or refused: its runs fail, then it reports closed.
@@ -1204,9 +1255,7 @@ void RuntimeBackpressure(v8host_broker_s* b, v8host_runtime_s* r) {
   MarkRunsTerminal(r);
   v8host_worker_s* w = r->worker;
   if (!w->closed && !b->terminal)
-    b->conn->SubmitControl({PendingType::kCloseRuntime, r->id, 0}, [](const auto& header) {
-      return protocol::BuildCloseRuntimeFrame(header);
-    });
+    b->conn->SubmitClose({PendingType::kCloseRuntime, r->id, 0});
   UnregisterRuntime(b, r);
   ReleaseAdmission(b, w);
 }
@@ -1442,6 +1491,10 @@ void SetIdsForTesting(v8host_session_s* session, uint32_t request, uint32_t run)
   std::lock_guard<std::mutex> lock(session->mutex);
   session->conn->SetRequestId(request);
   session->next_run_id = run;
+}
+void SetBrokerRequestIdForTesting(v8host_broker broker, uint32_t request) {
+  std::lock_guard<std::mutex> lock(broker->mutex);
+  broker->conn->SetRequestId(request);
 }
 void SetTransportFactoryForTesting(ClientTransportFactory factory) {
   g_test_factory.store(factory, std::memory_order_release);
@@ -2583,9 +2636,7 @@ void V8HOST_CDECL v8host_worker_close(v8host_worker worker) {
       }
       v8host::client::UnregisterWorker(broker, worker);
       if (!broker->terminal && !worker->closing)
-        broker->conn->SubmitControl(
-            {v8host::client::PendingType::kCloseWorker, worker->id, 0},
-            [](const auto& header) { return v8host::protocol::BuildCloseWorkerFrame(header); });
+        broker->conn->SubmitClose({v8host::client::PendingType::kCloseWorker, worker->id, 0});
     }
     // Nothing more is delivered for the worker or anything in it.
     if (broker->dispatch != nullptr)
@@ -2702,9 +2753,7 @@ void V8HOST_CDECL v8host_runtime_close(v8host_runtime runtime) {
       v8host::client::MarkRunsTerminal(runtime);
       v8host::client::UnregisterRuntime(broker, runtime);
       if (!broker->terminal && !worker->closed)
-        broker->conn->SubmitControl(
-            {v8host::client::PendingType::kCloseRuntime, runtime->id, 0},
-            [](const auto& header) { return v8host::protocol::BuildCloseRuntimeFrame(header); });
+        broker->conn->SubmitClose({v8host::client::PendingType::kCloseRuntime, runtime->id, 0});
       v8host::client::ReleaseAdmission(broker, worker);
     }
     if (broker->dispatch != nullptr)

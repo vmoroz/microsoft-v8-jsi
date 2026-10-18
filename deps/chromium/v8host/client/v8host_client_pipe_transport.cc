@@ -124,6 +124,8 @@ struct Pump {
     TransportDisconnect reason = TransportDisconnect::kBrokerLost;
     if (!read.hEvent || !write.hEvent) goto drain;
     while (!Stopped()) {
+      delegate->OnPump();
+      if (Stopped()) break;
       if (!reading) {
         ::ResetEvent(read.hEvent);
         BOOL ok = ::ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), nullptr, &read);
@@ -305,6 +307,7 @@ class PipeClientTransport final : public ClientTransport {
   }
 #endif
   uint32_t conn_id() const override { return state_->conn.load(std::memory_order_acquire); }
+  void Wake() override { ::SetEvent(state_->wake); }
   void Close() override {
     std::lock_guard<std::mutex> lock(state_->mutex);
     state_->closed.store(true, std::memory_order_release);

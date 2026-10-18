@@ -27,6 +27,8 @@ class ClientTransportDelegate {
   virtual void OnConnected(uint32_t conn_id, uint16_t major, uint16_t minor) = 0;
   virtual void OnInboundFrame(const uint8_t* bytes, size_t len) = 0;
   virtual void OnDisconnect(TransportDisconnect reason) = 0;
+  // Pump turn, outside transport locks, also after send credit is returned.
+  virtual void OnPump() {}
 };
 
 class ClientTransport {
@@ -45,6 +47,7 @@ class ClientTransport {
   virtual v8host_status SendFrame(const uint8_t* bytes, size_t len) = 0;
   virtual uint32_t conn_id() const = 0;
   virtual void Close() = 0;
+  virtual void Wake() {}
 #ifdef V8HOST_CLIENT_TESTING
   virtual size_t QueuedBytesForTesting() { return 0; }
 #endif
@@ -72,6 +75,7 @@ ClientTransport* CreateRealPipeClientTransport(const TransportParams& params,
 void SetSubmissionHooksForTesting(void (*before)(), void (*admitted)());
 v8host_status SubmitCancelForTesting(v8host_session_s* session, uint32_t run);
 void SetIdsForTesting(v8host_session_s* session, uint32_t request, uint32_t run);
+void SetBrokerRequestIdForTesting(v8host_broker broker, uint32_t request);
 void SetTransportFactoryForTesting(ClientTransportFactory factory);
 void SetInitializeAfterDispatcherHookForTesting(void (*hook)());
 uint32_t LifecycleThreadIdForTesting();
