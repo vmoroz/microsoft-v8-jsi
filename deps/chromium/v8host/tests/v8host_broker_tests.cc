@@ -6814,14 +6814,25 @@ bool PublicTopologyCallbackComposition(std::string* detail) {
   {
     TopologyPublic c;
     *detail = "complete-stack broker callback cap across 18 runtimes, sticky terminal";
-    if (!c.Open() || !c.AddWorker(16) || !c.AddWorker(2) || !c.Security(0) || !c.Security(1)) return false;
+    // The broker's 256-fact worker mailbox fails closed when the router falls
+    // behind; nothing paces a guest burst to it. One relay per host post keeps
+    // each runtime within the 8-post credit window: at most 16 relays and 8
+    // CREDIT frames, so 9 runtimes stay under the cap however the broker is
+    // scheduled. 18 x 240 relays still pass the 4096-callback broker cap.
+    if (!c.Open() || !c.AddWorker(9) || !c.AddWorker(9) || !c.Security(0) || !c.Security(1)) return false;
     for (size_t i = 0; i < 18; ++i)
-      if (!c.AddRuntime(i < 16 ? 0 : 1) || !c.Ready(i) ||
-          !c.Start(i, "host.postMessage('waiting');host.onmessage=function(){"
-              "for(var i=0;i<240;i++)host.postMessage('b:'+i);host.complete();};") || !c.Started(i)) return false;
+      if (!c.AddRuntime(i < 9 ? 0 : 1) || !c.Ready(i) ||
+          !c.Start(i, "host.postMessage('waiting');host.onmessage=function(){host.postMessage('b');};") ||
+          !c.Started(i)) return false;
     if (!c.HoldProcesses()) return false;
     const size_t fence = c.order.size();
-    for (size_t i = 0; i < 18; ++i) if (!c.Post(i)) return false;
+    bool capped = false;  // the cap may trip before the last post
+    for (int post = 0; post < 240 && !capped; ++post)
+      for (size_t i = 0; i < 18 && !capped; ++i)
+        if (!c.Post(i)) {
+          if (c.api.worker_get_id(c.workers[0].handle) != 0) return false;
+          capped = true;
+        }
     if (!WaitPublicReader([&] { return c.api.worker_get_id(c.workers[0].handle) == 0; }) ||
         !PumpPublic([&] { return c.disconnected; }) || c.disconnects != 1 || c.order.size() != fence + 1 ||
         c.order.back().kind != 'b' || c.order.back().status != v8host_status_callback_backpressure) return false;
