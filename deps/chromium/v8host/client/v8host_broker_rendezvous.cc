@@ -259,7 +259,7 @@ RendezvousStatus BrokerRendezvous::Initialize() {
       return RendezvousStatus::kEndpointInvalid;
     nonce = &nonce_;
   }
-  if (!DeriveEndpoint(sid_, payload_.plugin_set_id, mode_, nonce, &endpoint_,
+  if (!DeriveEndpoint(sid_, payload_.plugin_set_id, payload_.install_root, mode_, nonce, &endpoint_,
                       &endpoint_key_))
     return RendezvousStatus::kEndpointInvalid;
   initialized_ = true;

@@ -84,7 +84,8 @@ a production fallback.
 ## Choose the isolation boundary
 
 - **Broker:** `v8host_broker_open` opens a connection. Shared mode uses one
-  broker process per user and exact native payload set. Dedicated mode gives
+  broker process per user, exact native payload set, and canonical install root.
+  The V2 rendezvous also includes the install root in dedicated mode. Dedicated mode gives
   the opening client connection its own broker; dedicated is the default.
   Sharing a broker does not share workers across connections.
 - **Worker:** `v8host_worker_open` creates one sandboxed OS process with a

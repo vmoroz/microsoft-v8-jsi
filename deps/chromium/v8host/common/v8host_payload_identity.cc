@@ -178,26 +178,54 @@ bool ResolvePayloadIdentity(const std::wstring& directory,
 
 bool DeriveEndpoint(const std::vector<uint8_t>& sid,
                     const std::array<uint8_t, 32>& plugin_set_id,
+                    const std::wstring& install_root,
                     BrokerMode mode,
                     const std::array<uint8_t, 16>* nonce,
                     std::wstring* endpoint,
                     std::array<uint8_t, 32>* key) {
-  static constexpr char kDomain[] = "V8HOST-RENDEZVOUS-V1";
+  static constexpr char kDomain[] = "V8HOST-RENDEZVOUS-V2";
   if (!endpoint || !key || sid.empty() ||
       sid.size() > UINT16_MAX ||
       (mode == BrokerMode::kDedicated && !nonce))
     return false;
+  std::wstring root = install_root;
+  for (wchar_t& c : root)
+    if (c == L'/') c = L'\\';
+  while (!root.empty() && root.back() == L'\\')
+    root.pop_back();
+  if (root.empty() || root.size() > INT_MAX)
+    return false;
+  const int chars = ::LCMapStringEx(
+      LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, root.data(),
+      static_cast<int>(root.size()), nullptr, 0, nullptr, nullptr, 0);
+  if (chars <= 0 || static_cast<uint64_t>(chars) * 2 > UINT32_MAX)
+    return false;
+  std::wstring canonical(chars, L'\0');
+  if (::LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, root.data(),
+                      static_cast<int>(root.size()), canonical.data(), chars,
+                      nullptr, nullptr, 0) != chars)
+    return false;
+  if (canonical.starts_with(L"\\\\?\\UNC\\"))
+    canonical = L"\\\\" + canonical.substr(8);
+  else if (canonical.size() >= 7 && canonical.starts_with(L"\\\\?\\") &&
+           canonical[5] == L':')
+    canonical.erase(0, 4);
   std::vector<uint8_t> bytes(kDomain, kDomain + sizeof(kDomain));
   AppendLe16(&bytes, static_cast<uint16_t>(sid.size()));
   bytes.insert(bytes.end(), sid.begin(), sid.end());
   bytes.insert(bytes.end(), plugin_set_id.begin(), plugin_set_id.end());
+  const uint32_t root_bytes = static_cast<uint32_t>(canonical.size() * 2);
+  for (unsigned shift = 0; shift < 32; shift += 8)
+    bytes.push_back(static_cast<uint8_t>(root_bytes >> shift));
+  for (wchar_t c : canonical)
+    AppendLe16(&bytes, static_cast<uint16_t>(c));
   bytes.push_back(static_cast<uint8_t>(mode));
   if (mode == BrokerMode::kDedicated)
     bytes.insert(bytes.end(), nonce->begin(), nonce->end());
   if (!Sha256(bytes.data(), bytes.size(), key))
     return false;
   static constexpr wchar_t kHex[] = L"0123456789abcdef";
-  *endpoint = L"\\\\.\\pipe\\v8host-rv1-";
+  *endpoint = L"\\\\.\\pipe\\v8host-rv2-";
   endpoint->reserve(endpoint->size() + key->size() * 2);
   for (uint8_t byte : *key) {
     endpoint->push_back(kHex[byte >> 4]);

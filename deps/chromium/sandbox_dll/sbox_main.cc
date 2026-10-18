@@ -127,7 +127,7 @@ bool ParseBrokerMode(int argc, char** argv, sbox_broker_mode* mode) {
 
 bool ParsePipeName(int argc, char** argv, std::wstring* pipe) {
   const std::wstring value = ParseValue(argc, argv, "--pipe");
-  constexpr wchar_t kPrefix[] = L"\\\\.\\pipe\\v8host-rv1-";
+  constexpr wchar_t kPrefix[] = L"\\\\.\\pipe\\v8host-rv2-";
   if (value.size() != (sizeof(kPrefix) / sizeof(kPrefix[0]) - 1) + 64 ||
       value.compare(0, sizeof(kPrefix) / sizeof(kPrefix[0]) - 1, kPrefix) != 0)
     return false;

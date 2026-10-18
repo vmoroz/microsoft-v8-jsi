@@ -679,7 +679,7 @@ sbox_status V8HostBrokerRun(sbox_broker broker,
   std::wstring expected_endpoint;
   std::array<uint8_t, 32> endpoint_key = {};
   if (!v8host::DeriveEndpoint(
-          sid, payload.plugin_set_id,
+          sid, payload.plugin_set_id, payload.install_root,
           start->mode == sbox_broker_mode_shared
               ? v8host::BrokerMode::kShared
               : v8host::BrokerMode::kDedicated,

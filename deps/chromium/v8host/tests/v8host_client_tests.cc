@@ -2917,7 +2917,7 @@ struct LaunchFixture {
       DWORD error = ERROR_SUCCESS;
       if (!v8host::ResolvePayloadIdentity(directory, L"sbox.exe", L"v8host.dll", &payload, &error) ||
           !v8host::QueryCurrentSidAndSession(&sid, &session, &error) ||
-          !v8host::DeriveEndpoint(sid, payload.plugin_set_id, v8host::BrokerMode::kShared,
+          !v8host::DeriveEndpoint(sid, payload.plugin_set_id, payload.install_root, v8host::BrokerMode::kShared,
                                  nullptr, &endpoint, &key))
         return Fail(detail, "shared endpoint identity resolution");
       if (::WaitNamedPipeW(endpoint.c_str(), 0) || ::GetLastError() != ERROR_FILE_NOT_FOUND)

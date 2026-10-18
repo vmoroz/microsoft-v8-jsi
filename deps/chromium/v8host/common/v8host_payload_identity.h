@@ -65,8 +65,16 @@ bool ResolveNativePayloadDirectory(const std::wstring& module_dir,
                                    uint16_t module_machine,
                                    uint16_t native_machine,
                                    std::wstring* out);
+// V2 hashes the NUL-terminated ASCII domain V8HOST-RENDEZVOUS-V2,
+// LE16 SID byte length, SID, plugin-set ID, LE32 root byte length, UTF-16LE
+// root, mode byte, and (dedicated only) nonce. The root comes from HeldFile's
+// normalized volume-GUID final path on both sides (including cross-arch clients);
+// separators are backslashes, trailing separators removed, and case folded by
+// invariant uppercase. DOS/UNC extended prefixes are normalized too; the
+// volume-GUID prefix is retained.
 bool DeriveEndpoint(const std::vector<uint8_t>& sid,
                     const std::array<uint8_t, 32>& plugin_set_id,
+                    const std::wstring& install_root,
                     BrokerMode mode,
                     const std::array<uint8_t, 16>* nonce,
                     std::wstring* endpoint,

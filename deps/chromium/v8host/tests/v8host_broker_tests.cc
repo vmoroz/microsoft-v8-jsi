@@ -2810,7 +2810,7 @@ struct CapturedBroker {
     std::array<uint8_t, 32> key;
     if (!v8host::ResolvePayloadIdentity(ExecutableDirectory(), L"sbox.exe", L"v8host.dll", &payload, &error) ||
         !v8host::QueryCurrentSidAndSession(&sid, &session, &error) ||
-        !v8host::DeriveEndpoint(sid, payload.plugin_set_id, BrokerMode::kShared, nullptr, &endpoint, &key))
+        !v8host::DeriveEndpoint(sid, payload.plugin_set_id, payload.install_root, BrokerMode::kShared, nullptr, &endpoint, &key))
       return false;
     SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
     HANDLE write = nullptr;
@@ -4387,9 +4387,9 @@ bool ExactPayloadSeparation(std::string* detail) {
   std::array<uint8_t, 32> first_key = {};
   std::array<uint8_t, 32> second_key = {};
   const bool ok =
-      v8host::DeriveEndpoint(sid, first, BrokerMode::kShared, nullptr,
+      v8host::DeriveEndpoint(sid, first, L"C:\\payload", BrokerMode::kShared, nullptr,
                              &first_endpoint, &first_key) &&
-      v8host::DeriveEndpoint(sid, second, BrokerMode::kShared, nullptr,
+      v8host::DeriveEndpoint(sid, second, L"C:\\payload", BrokerMode::kShared, nullptr,
                              &second_endpoint, &second_key) &&
       first_endpoint != second_endpoint;
   if (!ok)
@@ -4412,7 +4412,48 @@ bool DedicatedUnique(std::string* detail) {
     *detail = "dedicated endpoint or PID reused";
     return false;
   }
+
   return true;
+}
+
+bool InstallRootDerivation(std::string* detail) {
+    const std::vector<uint8_t> sid{1, 2, 3};
+    const std::array<uint8_t, 32> plugin = {};
+    const std::array<uint8_t, 16> nonce = {};
+    std::wstring endpoint, other;
+    std::array<uint8_t, 32> key = {}, other_key = {};
+    for (BrokerMode mode : {BrokerMode::kShared, BrokerMode::kDedicated}) {
+      if (!v8host::DeriveEndpoint(sid, plugin, L"C:\\payload", mode, &nonce, &endpoint, &key) ||
+          !v8host::DeriveEndpoint(sid, plugin, L"C:\\other", mode, &nonce, &other, &other_key) ||
+          endpoint == other || key == other_key) {
+        *detail = "install roots did not separate endpoints and keys"; return false;
+      }
+      // Independently computed with Node crypto, including the domain's NUL.
+      if (mode == BrokerMode::kShared &&
+          v8host::HexPrefix(key, 32) != "68357446964eaa6defb02bfacd8fd090dbc5f7963529212a6005bf5a3df37a75") {
+        *detail = "V2 fixed vector differs"; return false;
+      }
+      for (const wchar_t* root : {L"c:\\PaYlOaD\\", L"\\\\?\\C:\\PAYLOAD", L"C:/payload///"}) {
+        if (!v8host::DeriveEndpoint(sid, plugin, root, mode, &nonce, &other, &other_key) ||
+            endpoint != other || key != other_key) {
+          *detail = "root case/separator/prefix normalization differs"; return false;
+        }
+      }
+      for (const wchar_t* root : {L"", L"\\", L"///"})
+        if (v8host::DeriveEndpoint(sid, plugin, root, mode, &nonce, &other, &other_key)) {
+          *detail = "empty root accepted"; return false;
+        }
+      for (const auto& roots : {
+          std::pair{L"\\\\?\\UNC\\server\\share\\payload", L"\\\\SERVER\\SHARE\\PAYLOAD\\"},
+          std::pair{L"\\\\?\\Volume{abc}\\payload", L"\\\\?\\VOLUME{ABC}\\PAYLOAD\\"}}) {
+        if (!v8host::DeriveEndpoint(sid, plugin, roots.first, mode, &nonce, &endpoint, &key) ||
+            !v8host::DeriveEndpoint(sid, plugin, roots.second, mode, &nonce, &other, &other_key) ||
+            endpoint != other || key != other_key) {
+          *detail = "UNC/volume-GUID normalization differs"; return false;
+        }
+      }
+    }
+    return true;
 }
 
 bool MixedMode(std::string* detail) {
@@ -4953,7 +4994,7 @@ bool AuthInvalidPipeReject(std::string* detail) {
 bool RunBrokerApiMode(const wchar_t* mode, DWORD* exit_code) {
   ::SetEnvironmentVariableW(L"V8HOST_BROKER_API_TEST", mode);
   const std::wstring pipe =
-      L"\\\\.\\pipe\\v8host-rv1-" + std::wstring(64, L'0');
+      L"\\\\.\\pipe\\v8host-rv2-" + std::wstring(64, L'0');
   const std::wstring command = L"\"" + ExecutableDirectory() +
                                L"\\sbox.exe\" --broker --mode=shared --pipe=" +
                                pipe + L" --plugin v8host.dll";
@@ -5055,7 +5096,7 @@ bool ImmutableMutation(std::string* detail) {
 // wrong ABI version / null entries before driving any lifecycle (exit 3).
 bool HostRejectsBadPluginAbi(std::string* detail) {
   const std::wstring pipe =
-      L"\\\\.\\pipe\\v8host-rv1-" + std::wstring(64, L'0');
+      L"\\\\.\\pipe\\v8host-rv2-" + std::wstring(64, L'0');
   const std::wstring command = L"\"" + ExecutableDirectory() +
                                L"\\sbox.exe\" --broker --mode=shared --pipe=" +
                                pipe + L" --plugin v8host_fake_plugin.dll";
@@ -5216,7 +5257,7 @@ struct PublicDedicatedProcesses {
     std::array<uint8_t, 32> key;
     return v8host::ResolvePayloadIdentity(ExecutableDirectory(), L"sbox.exe", L"v8host.dll", &payload, &error) &&
         v8host::QueryCurrentSidAndSession(&sid, &session, &error) &&
-        v8host::DeriveEndpoint(sid, payload.plugin_set_id, BrokerMode::kShared, nullptr, &shared_endpoint, &key);
+        v8host::DeriveEndpoint(sid, payload.plugin_set_id, payload.install_root, BrokerMode::kShared, nullptr, &shared_endpoint, &key);
   }
   ~PublicDedicatedProcesses() {
     for (HANDLE process : {worker, broker}) {
@@ -7088,7 +7129,7 @@ bool WaitForSharedBrokerRetired(std::string* detail) {
   std::array<uint8_t, 32> key;
   if (!v8host::ResolvePayloadIdentity(ExecutableDirectory(), L"sbox.exe", L"v8host.dll", &identity, &error) ||
       !v8host::QueryCurrentSidAndSession(&sid, &session, &error) ||
-      !v8host::DeriveEndpoint(sid, identity.plugin_set_id, BrokerMode::kShared, nullptr, &endpoint, &key)) {
+      !v8host::DeriveEndpoint(sid, identity.plugin_set_id, identity.install_root, BrokerMode::kShared, nullptr, &endpoint, &key)) {
     *detail = "shared endpoint derivation failed"; return false;
   }
   const ULONGLONG deadline = ::GetTickCount64() + 20000;
@@ -7124,10 +7165,11 @@ struct InstalledLayout {
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
   }
-  bool Create(std::string* detail) {
+  bool Create(std::string* detail, bool sweep = true) {
     static std::atomic<unsigned> sequence{0};
     std::error_code ec;
-    std::filesystem::remove_all(std::filesystem::path(ExecutableDirectory()) / L"layouts", ec);
+    if (sweep)
+      std::filesystem::remove_all(std::filesystem::path(ExecutableDirectory()) / L"layouts", ec);
     root = std::filesystem::path(ExecutableDirectory()) / L"layouts" /
         (L"il-" + std::to_wstring(::GetCurrentProcessId()) + L"-" + std::to_wstring(++sequence));
     arch_dir = root / (v8host::kModuleMachine == IMAGE_FILE_MACHINE_ARM64 ? L"arm64" : L"x64");
@@ -7176,6 +7218,59 @@ bool InstalledLayoutCase(const char* name, std::string* detail) {
 bool InstalledRealJs(std::string* detail) { return InstalledLayoutCase("real-js", detail); }
 bool InstalledDedicatedJs(std::string* detail) { return InstalledLayoutCase("real-dedicated-js", detail); }
 bool InstalledIdleRetirement(std::string* detail) { return InstalledLayoutCase("real-idle-lifecycle", detail); }
+std::wstring LayoutEvent(const std::filesystem::path& root, const wchar_t* suffix) {
+  return L"Local\\v8host-layout-" + root.filename().wstring() + suffix;
+}
+bool InstalledRootHold(std::string* detail) {
+  const auto root = std::filesystem::path(ExecutableDirectory()).parent_path();
+  HANDLE ready = ::OpenEventW(EVENT_MODIFY_STATE, FALSE, LayoutEvent(root, L"-ready").c_str());
+  HANDLE release = ::OpenEventW(SYNCHRONIZE, FALSE, LayoutEvent(root, L"-release").c_str());
+  BrokerConnection connection;
+  HelloResult hello;
+  bool ok = ready && release &&
+      ConnectAndHandshake(BrokerMode::kShared, 1, &connection, &hello, detail) &&
+      ::SetEvent(ready) && ::WaitForSingleObject(release, 30000) == WAIT_OBJECT_0;
+  const DWORD pid = connection.broker_pid();
+  connection.Close();
+  if (ok) ok = v8host::test::WaitForProcessExit(pid, 10000);
+  if (ready) ::CloseHandle(ready);
+  if (release) ::CloseHandle(release);
+  return ok;
+}
+bool InstalledIdenticalRoots(std::string* detail) {
+  InstalledLayout layouts[2];
+  if (!layouts[0].Create(detail) || !layouts[1].Create(detail, false)) return false;
+  HANDLE ready[2] = {}, release[2] = {};
+  ChildResult results[2];
+  std::vector<std::thread> children;
+  bool ok = true;
+  for (size_t i = 0; i < 2; ++i) {
+    ready[i] = ::CreateEventW(nullptr, TRUE, FALSE, LayoutEvent(layouts[i].root, L"-ready").c_str());
+    release[i] = ::CreateEventW(nullptr, TRUE, FALSE, LayoutEvent(layouts[i].root, L"-release").c_str());
+    ok = ok && ready[i] && release[i];
+  }
+  if (ok) {
+    for (size_t i = 0; i < 2; ++i)
+      children.emplace_back([&, i] {
+        results[i] = RunOwnedChild(layouts[i].arch_dir.wstring(), "installed-root-hold", 60000);
+      });
+    ok = ::WaitForMultipleObjects(2, ready, TRUE, 45000) == WAIT_OBJECT_0;
+  }
+  for (HANDLE event : release) if (event) ::SetEvent(event);
+  for (auto& child : children) child.join();
+  for (size_t i = 0; i < 2; ++i) {
+    if (!ChildPassed(results[i], "installed-root-hold")) ok = false;
+    if (ready[i]) ::CloseHandle(ready[i]);
+    if (release[i]) ::CloseHandle(release[i]);
+  }
+  if (!ok) {
+    *detail = "identical payload roots did not hold two simultaneous shared connections";
+    for (const auto& result : results)
+      std::printf("[layout child] launched=%d code=%lu error=%lu output=%s\n",
+          result.launched, result.code, result.error, result.output.c_str());
+  }
+  return ok;
+}
 bool PublicRealTrustedJs(std::string* detail) { return BuildOutputPublicCase("real-trusted-js", detail); }
 bool TimingSamples(std::string* detail) { return BuildOutputPublicCase("timing-samples", detail); }
 // Worker startup (run start to security_ready) for each tier; samples only, no threshold.
@@ -7227,7 +7322,7 @@ int main(int argc, char** argv) {
     if (std::strncmp(argv[i], "--public-child=", 15) != 0) continue;
     std::string name = argv[i] + 15, detail;
     if (name == "build-output-child" || name == "real-lpac-session" || IsSharedLegacyCase(name) ||
-        IsTopologyPublicCase(name) || name.rfind("launch-", 0) == 0) {
+        IsTopologyPublicCase(name) || name == "installed-root-hold" || name.rfind("launch-", 0) == 0) {
       BOOL in_job = FALSE;
       if (!::IsProcessInJob(::GetCurrentProcess(), nullptr, &in_job) || !in_job) return 9;
       if (name == "launch-timeout") { ::Sleep(INFINITE); return 9; }
@@ -7254,6 +7349,7 @@ int main(int argc, char** argv) {
         ok = ok && SharedLegacyBody(name, &detail);
         std::printf("child/%s: %s - %s\n", name.c_str(), ok ? "PASS" : "FAIL", detail.c_str());
       }
+      if (name == "installed-root-hold") ok = ok && InstalledRootHold(&detail);
       if (IsTopologyPublicCase(name)) {
         ok = ok && TopologyPublicBody(name, &detail);
         std::printf("[public topology] %s: %s\n", name.c_str(), detail.c_str());
@@ -7303,6 +7399,7 @@ int main(int argc, char** argv) {
       {"layout", "installed-real-js", InstalledRealJs},
       {"layout", "installed-dedicated-js", InstalledDedicatedJs},
       {"layout", "installed-idle-retirement", InstalledIdleRetirement},
+      {"layout", "installed-identical-roots", InstalledIdenticalRoots},
       {"client", "real-cancel-and-profile", PublicRealCancelAndProfile},
       {"router", "discard-intake-ordering", DiscardIntakeOrdering},
       {"cancel", "terminal-before-fallback", TerminalBeforeFallback},
@@ -7394,6 +7491,7 @@ int main(int argc, char** argv) {
       {"rendezvous", "pending-accept-poll", PendingAcceptPoll},
       {"rendezvous", "shared-fan-in", SharedFanIn},
       {"rendezvous", "exact-payload-separation", ExactPayloadSeparation},
+      {"rendezvous", "install-root-derivation", InstallRootDerivation},
       {"rendezvous", "dedicated-unique", DedicatedUnique},
       {"rendezvous", "mixed-mode", MixedMode},
       {"rendezvous", "idle-exit-relaunch", IdleExitRelaunch},
