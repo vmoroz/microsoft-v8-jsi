@@ -783,7 +783,7 @@ function packNuGet(outputPath: string, platforms: string[], configurations: stri
   // msg_channel.h and the sbox_*internal headers are NOT shipped — they're
   // internal to the sandbox binaries.
   const sboxIncludeDir = path.join(includeDir, "sbox");
-  const sboxHeaderSrc = path.join(repoRoot, "deps", "chromium", "sandbox_dll");
+  const sboxHeaderSrc = path.join(repoRoot, "deps", "chromium", "sbox");
   for (const file of ["sbox.h", "sbox_stela.h", "sbox_harden.h"]) {
     copyFile(file, sboxHeaderSrc, sboxIncludeDir);
   }

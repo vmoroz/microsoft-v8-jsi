@@ -1,7 +1,7 @@
 // sbox_trust_transition_main.cc — the instrumented single-image trust-transition
 // test. ONE binary that is BOTH the sandbox broker/case-runner and the sandbox
 // worker/fault-harness, selected by argv, statically linking the same sandbox
-// core as sbox.exe (via sbox_dll.cc). It folds the former two-image suite (a
+// core as sbox.exe (via sbox_broker.cc). It folds the former two-image suite (a
 // separate case-runner EXE + a fault-injection target EXE joined by the retired
 // export-table relay) onto the same-image seed:
 //
@@ -19,7 +19,7 @@
 // Role dispatch is FIRST in main() so neither persona can fall through into the
 // other's init. testonly; SBOX_TRUST_TRANSITION_TESTING-gated; never shipped.
 
-#define SBOX_DLL_IMPL  // sbox_* are defined in THIS image (sbox_dll.cc).
+#define SBOX_DLL_IMPL  // sbox_* are defined in THIS image (sbox_broker.cc).
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -42,7 +42,7 @@
 #include "sbox_trust_transition_test_private.h"
 
 // The same-image control struct: the broker role seeds it by RVA into the
-// suspended worker (sbox_dll.cc), the worker role reads it. Defined once here;
+// suspended worker (sbox_broker.cc), the worker role reads it. Defined once here;
 // declared extern in the private header so both TUs reference the one symbol.
 // Not exported — addressed by same-image RVA, never by an export lookup.
 extern "C" SboxTrustTransitionTestControl g_sbox_trust_transition_test_control = {};

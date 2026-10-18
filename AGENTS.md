@@ -136,7 +136,7 @@ The binary-stable C ABI for JSI (see "ABI architecture" below).
   `v8host.dll` and run JS in the sandbox (ships in `include\v8host`)
 
 ### Sandbox (`deps/chromium/`)
-- `sandbox_dll/sbox.h` + `sbox_stela.h` — the plugin ABI between `sbox.exe`
+- `sbox/sbox.h` + `sbox_stela.h` — the plugin ABI between `sbox.exe`
   and `v8host.dll`
 - `v8host/` — `v8host.dll`: the client, coordinator, and engine personas (see
   `deps/chromium/v8host/README.md`)
@@ -159,7 +159,7 @@ The binary-stable C ABI for JSI (see "ABI architecture" below).
 
 > The JSI ABI, Node-API hosting, and sandbox surfaces (`src/jsi_abi/*.h`,
 > `src/node-api/v8_node_api.h`, `src/public/v8host_client.h`,
-> `deps/chromium/sandbox_dll/sbox.h`) are **experimental and not yet ABI-stable** — each header
+> `deps/chromium/sbox/sbox.h`) are **experimental and not yet ABI-stable** — each header
 > carries a banner saying so. Nothing depends on it as a stable contract yet,
 > which is why it can still be reshaped freely.
 

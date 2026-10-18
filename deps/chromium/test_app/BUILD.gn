@@ -2,5 +2,5 @@
 # with the two-image sbox.dll + v8host.exe topology. This directory now only hosts
 # the trust-transition test's private header + impl
 # (sbox_trust_transition_test_private.{h,cc}): the header is pulled in via the
-# //test_app include dir by //sandbox_dll:sbox_trust_transition_test, and the impl
+# //test_app include dir by //sbox:sbox_trust_transition_test, and the impl
 # is compiled into //sandbox/win:sandbox_trust_transition_test. No targets here.

@@ -9,14 +9,14 @@
 # jitless for Untrusted / v8jsi.dll for Trusted), creates a JSI runtime, installs
 # the `host` object, evaluates a guest, and runs the message loop — all under the
 # container-driven ACG lifecycle. Carved from the retired v8host.exe main.
-import("//sandbox_dll/trust.gni")
+import("//sbox/trust.gni")
 
 config("v8host_common_config") {
   include_dirs = [
     "common",
     "client",
     "coordinator",
-    "//sandbox_dll",
+    "//sbox",
   ]
 
   # Development posture for the whole identity/persona layer: unsigned payloads
@@ -24,7 +24,7 @@ config("v8host_common_config") {
   # the dev-only sbox_broker_api self-test). Release builds omit this define,
   # which fail-closes every one of those paths. Centralized here so a persona
   # that adds a compile-gated dev path cannot silently miss the flag.
-  # `sbox_dev_allow_unsigned` (//sandbox_dll/trust.gni) is false for the shipped build.
+  # `sbox_dev_allow_unsigned` (//sbox/trust.gni) is false for the shipped build.
   if (sbox_dev_allow_unsigned) {
     defines = [ "SBOX_DEV_ALLOW_UNSIGNED" ]
   }
@@ -212,13 +212,13 @@ source_set("engine_persona") {
     "v8host_spawn_apply.h",
   ]
 
-  # //sandbox_dll for sbox.h (the plugin ABI) + sbox_harden.h (header-only
+  # //sbox for sbox.h (the plugin ABI) + sbox_harden.h (header-only
   # ExeDir); //../../src for the JSI C++ API headers (jsi/jsi.h,
   # jsi_abi/JsiAbiRuntime.h) + the v8jsi config header (jsi_abi/v8_jsi_abi.h).
   # The engine DLL itself is LoadLibrary'd at runtime (resolved by name, no
   # link-time bind).
   include_dirs = [
-    "//sandbox_dll",
+    "//sbox",
     "//../../src",
   ]
 
@@ -321,8 +321,8 @@ executable("v8host_broker_tests") {
     ":v8host",
     ":v8host_fake_plugin",
     ":v8host_abi4_plugin",
-    "//sandbox_dll:sbox",
-    "//sandbox_dll:sbox_lifecycle_tests",
+    "//sbox:sbox",
+    "//sbox:sbox_lifecycle_tests",
   ]
 }
 
@@ -423,7 +423,7 @@ executable("v8host_client_tests") {
   ]
   libs = [ "user32.lib" ]
   # Real rendezvous cases use the adjacent broker and plugin.
-  data_deps = [ ":v8host", "//sandbox_dll:sbox" ]
+  data_deps = [ ":v8host", "//sbox:sbox" ]
 }
 
 executable("v8host_cross_arch_tests") {
@@ -438,7 +438,7 @@ executable("v8host_cross_arch_tests") {
 
 # Deterministic, in-process unit tests for the sbox_config builder: the
 # status-returning sbox_config_api setters + the MarshalSboxConfig discard gate
-# (//sandbox_dll:sbox_config). No pipes or spawned processes — it drives the real
+# (//sbox:sbox_config). No pipes or spawned processes — it drives the real
 # setter vtable and the marshal gate directly, so every setter success/failure,
 # the 64/64 + 4 KiB limits, the AppContainer cross-field rules, and the key safety
 # property "a poisoned builder spawns no worker" are all checked without a worker.
@@ -449,7 +449,7 @@ executable("v8host_config_tests") {
     "tests/v8host_test_support.cc",
     "tests/v8host_test_support.h",
   ]
-  deps = [ "//sandbox_dll:sbox_config" ]
+  deps = [ "//sbox:sbox_config" ]
   public_configs = [ ":v8host_common_config" ]
   defines = [ "SBOX_STATIC" ]
 }
@@ -458,7 +458,7 @@ executable("v8host_config_tests") {
 # codec (:spawn_config) and the engine's real spawn-config -> sbox setter lowering
 # (v8host_spawn_apply.cc, compiled in). No pipes or spawned processes: the codec
 # round-trips/rejects are pure byte vectors, and the lowering is driven onto the
-# real MakeConfigApi builder + MarshalSboxConfig gate (//sandbox_dll:sbox_config)
+# real MakeConfigApi builder + MarshalSboxConfig gate (//sbox:sbox_config)
 # so the configure() path is exercised without a worker. Mirrors
 # v8host_protocol_tests (byte vectors) + v8host_config_tests (real builder).
 executable("v8host_spawn_config_tests") {
@@ -472,7 +472,7 @@ executable("v8host_spawn_config_tests") {
   ]
   deps = [
     ":spawn_config",
-    "//sandbox_dll:sbox_config",
+    "//sbox:sbox_config",
   ]
 
   # v8host_spawn_apply.h lives in the v8host root (next to v8host_engine.cc); put
@@ -513,6 +513,6 @@ shared_library("v8host_fake_plugin") {
 shared_library("v8host_abi4_plugin") {
   testonly = true
   sources = [ "tests/v8host_fake_plugin.cc" ]
-  include_dirs = [ "//sandbox_dll" ]
+  include_dirs = [ "//sbox" ]
   defines = [ "V8HOST_ABI4_FIXTURE" ]
 }

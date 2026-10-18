@@ -837,8 +837,8 @@ SboxSession* SpawnOnLauncherThread(const wchar_t* target_exe,
 
   const uint64_t worker_base = WorkerImageBase(proc);
   // my_base is the base of THIS image (the one holding the sandbox globals we
-  // address below). sbox_dll.cc links into the DLL and into the single-image
-  // test exe, so CURRENT_MODULE() (not the process EXE) is the correct anchor.
+  // address below). sbox_broker.cc links into sbox.exe and the single-image
+  // test exe; CURRENT_MODULE() anchors the globals in either executable.
   const uintptr_t my_base = MyDllBase();
   if (!worker_base || !my_base) {
     BrokerLog("[broker] same-image base read failed (worker=0x%llx my=0x%llx)\n",

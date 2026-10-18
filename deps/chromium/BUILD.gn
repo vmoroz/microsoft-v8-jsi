@@ -10,7 +10,7 @@
 # `ninja -C out/sandbox-x64 generic`.
 group("generic") {
   deps = [
-    "//sandbox_dll:sbox",
+    "//sbox:sbox",
     "//v8host",
   ]
 }
@@ -95,6 +95,6 @@ group("v8host_all_tests") {
 if (current_cpu == "x64") {
   group("sbox_trust_transition_tests") {
     testonly = true
-    deps = [ "//sandbox_dll:sbox_trust_transition_test" ]
+    deps = [ "//sbox:sbox_trust_transition_test" ]
   }
 }

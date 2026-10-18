@@ -18,8 +18,8 @@
       "name": "sbox",
       "prefix": "sbox",
       "macroPrefix": "SBOX",
-      "headers": ["deps/chromium/sandbox_dll/sbox.h"],
-      "stelaHeader": "deps/chromium/sandbox_dll/sbox_stela.h"
+      "headers": ["deps/chromium/sbox/sbox.h"],
+      "stelaHeader": "deps/chromium/sbox/sbox_stela.h"
     },
     {
       "name": "v8host",

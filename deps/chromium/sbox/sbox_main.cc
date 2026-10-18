@@ -1,6 +1,6 @@
 // sbox_main.cc — the product single-image sbox.exe: one binary that is BOTH the
 // sandbox broker and the sandbox worker, selected by argv. It statically links
-// the same Chromium sandbox core as the DLL did (via sbox_dll.cc) so the broker
+// the same Chromium sandbox core as the DLL did (via sbox_broker.cc) so the broker
 // and worker share one image and one set of sandbox globals.
 //
 // Personas (role is chosen first; neither falls through into the other's init).
@@ -597,7 +597,7 @@ int RunBroker(const std::wstring& plugin_name) {
 
   // Time the one-time spawn (process creation + sandbox lockdown setup to
   // resume). Spawns THIS image with --worker --plugin=<name> (appended inside
-  // sbox_dll.cc from the policy's passthrough fields).
+  // sbox_broker.cc from the policy's passthrough fields).
   Perf perf;
   const LONGLONG t_spawn0 = perf.now();
   SboxSession* session =

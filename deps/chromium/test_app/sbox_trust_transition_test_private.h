@@ -77,7 +77,7 @@ constexpr uint32_t kSboxTrustTransitionControlVersion = 2;
 constexpr wchar_t kSboxTrustTransitionCapability[] = L"S-1-15-3-4021848294-1651122667-3873966303-2985905677";
 
 // The instrumented single-image trust-transition test links the control plane
-// (sbox_dll.cc) and the role-by-argv main into ONE image, so these symbols
+// (sbox_broker.cc) and the role-by-argv main into ONE image, so these symbols
 // resolve within the image at link time and are never exported. The broker role
 // seeds g_sbox_trust_transition_test_control into the suspended worker by RVA
 // (same image, same RVA) — the inversion of the retired export-table relay.

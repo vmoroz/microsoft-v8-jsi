@@ -1,6 +1,6 @@
 // Deterministic, in-process unit tests for the sbox_config builder: the
 // status-returning sbox_config_api setters (MakeConfigApi) and the
-// MarshalSboxConfig discard gate (//sandbox_dll:sbox_config). No pipes, no
+// MarshalSboxConfig discard gate (//sbox:sbox_config). No pipes, no
 // spawned worker — the gate these exercise is EXACTLY the one PrepareSandbox
 // calls before sbox_broker_spawn, so "MarshalSboxConfig returns false" is the
 // decision that resumes NO worker. Covers plan §5.2's config cases: every setter

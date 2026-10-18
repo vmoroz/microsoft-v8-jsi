@@ -2,7 +2,7 @@
 //
 // This is NOT the plugin ABI. Plugin authors include sbox.h; this header is
 // compiled only INTO the single-image sbox.exe container (both personas link
-// sbox_dll.cc statically), so the sbox_* symbols resolve at link time and stay
+// sbox_broker.cc statically), so the sbox_* symbols resolve at link time and stay
 // out of the EXE's export table. It is **V8-agnostic** — it knows nothing about
 // v8jsi, JavaScript, jitless, or any guest engine. One image uses it in two
 // personas:
@@ -28,10 +28,10 @@
 
 #if defined(SBOX_STATIC)
 // The broker/target core is linked directly into an executable (the product
-// sbox.exe and the trust-transition test both compile sbox_dll.cc), so the
+// sbox.exe and the trust-transition test both compile sbox_broker.cc), so the
 // sbox_* ABI is resolved at link time, not across a DLL boundary. Plain
 // extern "C" keeps the symbols out of the export table (the EXE must export
-// nothing). Checked BEFORE SBOX_DLL_IMPL because sbox_dll.cc self-defines that.
+// nothing). Checked BEFORE SBOX_DLL_IMPL because sbox_broker.cc self-defines that.
 #define SBOX_CORE_API extern "C"
 #elif defined(SBOX_DLL_IMPL)
 #define SBOX_CORE_API extern "C" __declspec(dllexport)
