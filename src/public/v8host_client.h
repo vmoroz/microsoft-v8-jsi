@@ -302,7 +302,8 @@ V8HOST_API v8host_status V8HOST_CDECL v8host_config_set_integrity_level(
 V8HOST_API v8host_status V8HOST_CDECL v8host_config_set_delayed_integrity_level(
     v8host_config config,
     v8host_integrity_level value);
-/// The worker's initial token level. Default: v8host_token_level_lockdown.
+/// The token the worker starts with. Default: v8host_token_level_restricted_same_access.
+/// A lockdown-level initial token cannot load the DLLs needed to start the process.
 V8HOST_API v8host_status V8HOST_CDECL v8host_config_set_initial_token_level(
     v8host_config config,
     v8host_token_level value);
@@ -402,7 +403,8 @@ V8HOST_API v8host_status V8HOST_CDECL v8host_worker_config_set_integrity_level(
 V8HOST_API v8host_status V8HOST_CDECL
 v8host_worker_config_set_delayed_integrity_level(v8host_worker_config config,
                                                  v8host_integrity_level value);
-/// Default: v8host_token_level_lockdown.
+/// The token the worker starts with. Default: v8host_token_level_restricted_same_access.
+/// A lockdown-level initial token cannot load the DLLs needed to start the process.
 V8HOST_API v8host_status V8HOST_CDECL
 v8host_worker_config_set_initial_token_level(v8host_worker_config config,
                                              v8host_token_level value);

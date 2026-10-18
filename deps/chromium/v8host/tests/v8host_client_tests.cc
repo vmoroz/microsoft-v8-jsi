@@ -2034,6 +2034,22 @@ bool ValidateRunPolicyAndOutputs(std::string* detail) {
   return true;
 }
 
+bool DefaultInitialToken(std::string* detail) {
+  TopologyFixture f;
+  v8host_worker w = nullptr;
+  if (!f.Open() || f.Worker(&w) != v8host_status_ok) return false;
+  const auto frame = f.Request(MessageType::CREATE_WORKER, v8host_worker_get_id(w));
+  FrameHeader h;
+  const uint8_t* body = nullptr;
+  size_t size = 0;
+  CreateWorkerPayload config;
+  if (!DecodeFrame(frame, &h, &body, &size) || !DecodeCreateWorkerPayload(body, size, &config) ||
+      config.session.initial_token != v8host_token_level_restricted_same_access ||
+      config.session.lockdown_token != v8host_token_level_lockdown)
+    return Fail(detail, "worker default token pair");
+  return true;
+}
+
 bool ConfigRoundTrip(std::string* detail) {
   FakeTransport* zero_fake = nullptr;
   v8host_session_s* zero_session = Create(&zero_fake);
@@ -2048,7 +2064,7 @@ bool ConfigRoundTrip(std::string* detail) {
       !DecodeCreateSessionPayload(zero_body, zero_len, &zero) ||
       zero.broker_mode != v8host_broker_mode_shared ||
       zero.tier != v8host_tier_untrusted || zero.integrity != 0 ||
-      zero.delayed_integrity != 0 || zero.initial_token != 0 ||
+      zero.delayed_integrity != 0 || zero.initial_token != v8host_token_level_restricted_same_access ||
       zero.lockdown_token != 0 || !zero.prohibit_dynamic_code ||
       zero.use_app_container || zero.low_privilege_app_container ||
       !zero.app_container_profile.empty() || !zero.file_rules.empty() ||
@@ -3974,6 +3990,7 @@ int main(int argc, char** argv) {
       {"validate", "builder-setters", ValidateBuilderSetters},
       {"validate", "tier-path-output-nulling", ValidateRunPolicyAndOutputs},
       {"config", "roundtrip-zero-and-64", ConfigRoundTrip},
+      {"config", "default-initial-token", DefaultInitialToken},
       {"boundary", "counts-runs-strings-frame", BoundaryQuotas},
       {"output", "all-failing-paths-null", ExhaustiveFailingOutputNulling},
       {"copy", "run-and-relay-roundtrip", RunAndRelayRoundTrip},

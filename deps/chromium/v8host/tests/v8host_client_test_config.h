@@ -29,7 +29,7 @@ struct TestSessionConfig {
   // Raw values so tests can drive out-of-range levels into the setters.
   int32_t integrity = 0;
   int32_t delayed_integrity = 0;
-  int32_t initial_token = 0;
+  int32_t initial_token = v8host_token_level_restricted_same_access;
   int32_t lockdown_token = 0;
   bool prohibit_dynamic_code = false;
   const TestFileRule* file_rules = nullptr;

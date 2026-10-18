@@ -6374,7 +6374,6 @@ struct TopologyPublic {
     TOPOLOGY_SET(worker_config_set_tier(config, v8host_tier_untrusted));
     TOPOLOGY_SET(worker_config_set_max_runtimes(config, c.maximum));
     TOPOLOGY_SET(worker_config_set_flags(config, static_cast<v8host_worker_flags>(c.flags)));
-    TOPOLOGY_SET(worker_config_set_initial_token_level(config, v8host_token_level_restricted_same_access));
     TOPOLOGY_SET(worker_config_set_delayed_integrity_level(config, v8host_integrity_level_untrusted));
     if (c.lpac) {
       TOPOLOGY_SET(worker_config_set_use_app_container(config, true));
@@ -6690,6 +6689,15 @@ bool TopologyRawQuotaComposition(std::string* detail) {
   return f.conn.retired_workers.empty() && f.spawns == 33 && !f.post_after_close && !f.close_before_removal;
 }
 
+bool PublicDefaultToken(std::string* detail) {
+  TopologyPublic c;
+  *detail = "default initial token starts worker; lockdown and ACG remain enabled";
+  return c.Open() && c.AddWorker() && c.Security(0) && c.AddRuntime(0) && c.Ready(0) &&
+      c.HoldProcesses() && c.Start(0, "host.postMessage('default-token');host.complete();") &&
+      c.Terminal(0) && c.runs[0].messages == std::vector<std::string>{"default-token"} &&
+      c.CloseAndReap();
+}
+
 bool PublicTopologyQuotas(std::string* detail) {
   if (!TopologyRawQuotaComposition(detail)) return false;
   TopologyPublic c;
@@ -6714,6 +6722,7 @@ bool PublicTopologyQuotas(std::string* detail) {
   for (size_t i = 0; i < 4; ++i) {
     if (!c.Started(i) || !c.Post(i) || !c.Terminal(i)) return false;
   }
+
   if (!c.CloseAndReap()) return false;
   // single_use counts lifetime admissions, even after local close.
   TopologyPublic once;
@@ -7095,6 +7104,7 @@ bool BuildOutputChild(std::string* detail) { return BuildOutputPublicCase("build
   X(PublicWorkerCrash, "topology", "public-worker-crash") \
   X(PublicBrokerKillReaps, "topology", "public-broker-kill-reaps") \
   X(WorkerRuntimeQuotas, "boundary", "worker-runtime-quotas") \
+  X(DefaultInitialToken, "topology", "default-initial-token") \
   X(RelayCallbackCredit, "boundary", "relay-callback-credit") \
   X(CreateCloseAndRunaway, "failure", "create-close-and-runaway") \
   X(RefusalRuntimeAndDisconnect, "failure", "refusal-runtime-and-disconnect")
@@ -7109,6 +7119,7 @@ bool IsTopologyPublicCase(const std::string& name) {
   return false;
 }
 bool TopologyPublicBody(const std::string& name, std::string* detail) {
+  if (name == "default-initial-token") return PublicDefaultToken(detail);
   if (name == "worker-runtime-quotas") return PublicTopologyQuotas(detail);
   if (name == "relay-callback-credit") return PublicTopologyCallbackComposition(detail);
   if (name == "create-close-and-runaway") return PublicTopologyCloseAndRunaway(detail);

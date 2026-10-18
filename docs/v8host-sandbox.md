@@ -90,6 +90,9 @@ a production fallback.
   Sharing a broker does not share workers across connections.
 - **Worker:** `v8host_worker_open` creates one sandboxed OS process with a
   fixed security and engine profile. A worker belongs to one connection.
+  Its initial token defaults to `restricted_same_access`, so the process can
+  load its startup DLLs; the token applied at lockdown still defaults to
+  `lockdown`. A lockdown-level initial token cannot load startup DLLs.
 - **Runtime:** `v8host_runtime_open` creates one V8 isolate on its own thread
   in that worker, after security readiness. Several runtimes can occupy one
   worker; their separation is by isolates, not by OS processes.
