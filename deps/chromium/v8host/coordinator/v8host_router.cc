@@ -483,13 +483,23 @@ void RetireSessionLocked(Connection &conn, uint32_t id, RunState terminal, bool 
   if (session->worker || !session->retired_runs.empty())
     conn.retired_sessions.push_back(std::move(session));
 }
-// Workers per connection, sessions included; retired ones count until reaped.
+// Logical admissions exclude closed workers. A replacement may wait for the
+// retiring process before it starts, rather than failing asynchronously.
 size_t WorkerCount(const Connection &conn) {
-  size_t count = conn.workers.size() + conn.retired_workers.size();
+  size_t count = conn.workers.size();
   for (const auto &[id, session] : conn.sessions)
     if (!session->explicit_runtime) ++count;
+  return count;
+}
+// Conservative process reservations, including every unreclaimed retiree.
+size_t LiveWorkerCount(const Connection &conn) {
+  size_t count = conn.retired_workers.size();
+  for (const auto &[id, worker] : conn.workers)
+    if (worker->state != WorkerState::kNone) ++count;
+  for (const auto &[id, session] : conn.sessions)
+    if (session->worker && session->worker->state != WorkerState::kNone) ++count;
   for (const auto &session : conn.retired_sessions)
-    if (!session->explicit_runtime) ++count;
+    if (session->worker && session->worker->state != WorkerState::kNone) ++count;
   return count;
 }
 // An explicit worker's admissions: its queued, creating, and ready runtimes.
@@ -1197,6 +1207,10 @@ DWORD WINAPI Worker::Reap(void *context) {
   return 0;
 }
 bool Router::Spawn(Worker &worker) {
+  // Keep the original hard process cap. Pump retries this logical admission
+  // when a cleanup task signals worker_wake and its reservation is reclaimed.
+  if (LiveWorkerCount(worker.Conn()) >= protocol::kMaxSessionsPerConnection)
+    return true;
   Session *session = worker.session;
   if (session) session->state = SessionState::kStartingWorker;
   worker.state = WorkerState::kSpawning;
@@ -1749,6 +1763,7 @@ void Router::PumpWorker(Connection &conn, Worker &worker) {
     worker.session->retired_runs.clear();
 }
 void Router::Pump(Connection &conn) {
+  Reclaim(conn, false);
   std::vector<uint32_t> sessions, workers;
   for (auto &[id, session] : conn.sessions)
     if (session->worker)
@@ -1757,13 +1772,23 @@ void Router::Pump(Connection &conn) {
     workers.push_back(id);
   for (uint32_t id : sessions) {
     auto it = conn.sessions.find(id);
-    if (it != conn.sessions.end() && it->second->worker)
+    if (it != conn.sessions.end() && it->second->worker) {
+      if (it->second->worker->state == WorkerState::kNone && !Spawn(*it->second->worker)) {
+        CloseSession(conn, id, RunState::kWorkerExited);
+        continue;
+      }
       PumpWorker(conn, *it->second->worker);
+    }
   }
   for (uint32_t id : workers) {
     auto it = conn.workers.find(id);
-    if (it != conn.workers.end())
+    if (it != conn.workers.end()) {
+      if (it->second->state == WorkerState::kNone && !Spawn(*it->second)) {
+        CloseWorker(conn, id, RunState::kWorkerExited, true);
+        continue;
+      }
       PumpWorker(conn, *it->second);
+    }
   }
   Reclaim(conn, false);
 #if defined(V8HOST_ROUTER_TESTING)

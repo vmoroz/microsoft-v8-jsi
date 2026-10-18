@@ -867,15 +867,22 @@ bool ReapingSessionQuota(std::string *detail) {
   if (!LocalRoute(*f.service, f.conn, protocol::BuildCreateSessionFrame(ControlHeader(100, 33), LogicalConfig())))
     return false;
   protocol::FrameHeader h;
-  protocol::StatusCode status;
-  if (!PopFrame(f.conn, &h, &status) || h.type != protocol::MessageType::ERROR || status != protocol::StatusCode::ERROR_QUOTA ||
-      f.conn.sessions.contains(33) || ::WaitForSingleObject(f.conn.stop, 0) == WAIT_OBJECT_0) return false;
+  protocol::StartRunPayload replacement;
+  replacement.tier_override = -1;
+  replacement.guest_payload = {'x'};
+  if (!PopFrame(f.conn, &h) || h.type != protocol::MessageType::ACK ||
+      !PopFrame(f.conn, &h) || h.type != protocol::MessageType::SESSION_READY ||
+      !LocalRoute(*f.service, f.conn, protocol::BuildStartRunFrame(ControlHeader(101, 33, 1), replacement)))
+    return false;
+  DrainLocal(f.conn);
+  if (!f.conn.sessions.contains(33) || f.spawns != 32 ||
+      f.conn.sessions.at(33)->worker->state != router::WorkerState::kNone ||
+      ::WaitForSingleObject(f.conn.stop, 0) == WAIT_OBJECT_0) return false;
   ::SetEvent(f.wait_release);
   for (const auto &session : f.conn.retired_sessions)
     if (::WaitForSingleObject(session->worker->cleanup, 5000) != WAIT_OBJECT_0) return false;
-  if (!LocalRoute(*f.service, f.conn, protocol::BuildCreateSessionFrame(ControlHeader(101, 33), LogicalConfig())) ||
-      !PopFrame(f.conn, &h) || h.type != protocol::MessageType::ACK || !PopFrame(f.conn, &h) ||
-      h.type != protocol::MessageType::SESSION_READY || !f.conn.retired_sessions.empty() || f.closes != 32 || f.waits != 32 ||
+  f.service->Pump(f.conn);
+  if (f.spawns != 33 || !f.conn.retired_sessions.empty() || f.closes != 32 || f.waits != 32 ||
       f.close_before_removal || f.post_after_close) {
     *detail = "joined reapers did not release admission credit"; return false;
   }
@@ -3061,6 +3068,38 @@ struct TopologyFixture : RouterFixture {
         posts[1].slot == 1 && Ready(0, 2) && Ready(1, 3);
   }
 };
+
+bool WorkerCloseAtCap(std::string* detail) {
+  TopologyFixture f;
+  f.wait_release = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!f.wait_release) return false;
+  protocol::CreateWorkerPayload config;
+  config.session = LogicalConfig();
+  for (uint32_t id = 1; id <= protocol::kMaxSessionsPerConnection; ++id)
+    if (!f.Reply(protocol::BuildCreateWorkerFrame(TopologyHeader(++f.request, id), config),
+                 protocol::MessageType::ACK)) return false;
+  if (!f.Reply(protocol::BuildCreateWorkerFrame(TopologyHeader(++f.request, 33), config),
+               protocol::MessageType::ERROR, protocol::StatusCode::ERROR_QUOTA) ||
+      !f.Reply(protocol::BuildCloseWorkerFrame(TopologyHeader(++f.request, 1)), protocol::MessageType::ACK) ||
+      !f.Reply(protocol::BuildCreateWorkerFrame(TopologyHeader(++f.request, 33), config),
+               protocol::MessageType::ACK)) return false;
+  for (unsigned i = 0; i < 3; ++i) f.service->Pump(f.conn);
+  if (f.spawns != 32 || f.conn.workers.size() != 32 || f.conn.retired_workers.size() != 1 ||
+      f.conn.workers.at(33)->state != router::WorkerState::kNone) {
+    *detail = "replacement refused or spawned above the hard live-process cap"; return false;
+  }
+  if (!f.Reply(protocol::BuildCreateWorkerFrame(TopologyHeader(++f.request, 34), config),
+               protocol::MessageType::ERROR, protocol::StatusCode::ERROR_QUOTA)) return false;
+  ::SetEvent(f.wait_release);
+  if (::WaitForSingleObject(f.conn.retired_workers.front()->cleanup, 5000) != WAIT_OBJECT_0) return false;
+  f.service->Pump(f.conn);
+  if (f.spawns != 33 || !f.conn.retired_workers.empty() ||
+      f.conn.workers.at(33)->state != router::WorkerState::kWarming) {
+    *detail = "replacement did not resume after retirement"; return false;
+  }
+  *detail = "immediate close/open admitted; spawn waits for reap; 32-process bound retained";
+  return true;
+}
 
 bool RawTwoRuntimeJs(std::string* detail) {
   *detail = "explicit worker startup/security/ACG before runtime admission";
@@ -6620,7 +6659,7 @@ bool PublicTopologyLoss(std::string* detail, bool broker_kill, bool runaway = fa
 }
 
 bool TopologyRawQuotaComposition(std::string* detail) {
-  *detail = "raw shared session/explicit/retired worker admission at 32";
+  *detail = "raw shared session/explicit admission and deferred replacement at 32 live processes";
   TopologyFixture f;
   f.early = true;
   f.wait_release = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -6640,11 +6679,13 @@ bool TopologyRawQuotaComposition(std::string* detail) {
   if (!f.Reply(protocol::BuildCloseWorkerFrame(TopologyHeader(++f.request, 2)), protocol::MessageType::ACK) ||
       f.conn.retired_workers.size() != 1 ||
       !f.Reply(protocol::BuildCreateWorkerFrame(TopologyHeader(++f.request, 34), config),
+          protocol::MessageType::ACK) || f.spawns != 32 ||
+      f.conn.workers.at(34)->state != router::WorkerState::kNone ||
+      !f.Reply(protocol::BuildCreateWorkerFrame(TopologyHeader(++f.request, 35), config),
           protocol::MessageType::ERROR, protocol::StatusCode::ERROR_QUOTA)) return false;
   ::SetEvent(f.wait_release);
-  if (::WaitForSingleObject(f.conn.retired_workers[0]->cleanup, 5000) != WAIT_OBJECT_0 ||
-      !f.Reply(protocol::BuildCreateWorkerFrame(TopologyHeader(++f.request, 35), config),
-          protocol::MessageType::ACK)) return false;
+  if (::WaitForSingleObject(f.conn.retired_workers[0]->cleanup, 5000) != WAIT_OBJECT_0) return false;
+  f.service->Pump(f.conn);
   DrainLocal(f.conn);
   return f.conn.retired_workers.empty() && f.spawns == 33 && !f.post_after_close && !f.close_before_removal;
 }
@@ -7367,6 +7408,7 @@ int main(int argc, char** argv) {
       {"worker", "raw-two-runtime-js", RawTwoRuntimeJs},
       {"worker", "profile-policy-reject", WorkerProfilePolicyReject},
       {"worker", "tenancy-and-ids", WorkerTenancyAndIds},
+      {"worker", "close-at-cap", WorkerCloseAtCap},
       {"runtime", "queued-slot-churn", RuntimeQueuedSlotChurn},
       {"runtime", "pre-ready-start", RuntimePreReadyStart},
       {"runtime", "independent-runs-cancels", RuntimeIndependentRunsCancels},

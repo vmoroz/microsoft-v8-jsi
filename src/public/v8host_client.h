@@ -710,6 +710,8 @@ V8HOST_API void V8HOST_CDECL v8host_broker_close(v8host_broker broker);
 /// the request waits for the connection. Returns v8host_status_quota_exceeded
 /// when the broker already has 32 workers the host hasn't closed, or when the
 /// profile would exceed 4096 bytes. On failure *out_worker = NULL.
+/// A replacement is admitted immediately after a close, but startup waits for
+/// retiring workers when necessary to keep at most 32 live worker processes.
 V8HOST_API v8host_status V8HOST_CDECL v8host_worker_open(
     v8host_broker broker,
     V8HOST_NULLABLE v8host_configure_worker_cb configure,
@@ -718,6 +720,8 @@ V8HOST_API v8host_status V8HOST_CDECL v8host_worker_open(
 
 /// Close the worker and all its runtimes and runs, and suppress their queued
 /// callbacks. Runtime handles stay valid until the host closes them.
+/// Releases the logical worker admission immediately; process retirement is
+/// asynchronous and may delay startup of a replacement at the process cap.
 /// Nonblocking; safe inside a callback.
 V8HOST_API void V8HOST_CDECL v8host_worker_close(v8host_worker worker);
 
