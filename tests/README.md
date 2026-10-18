@@ -36,7 +36,10 @@ auto-skip.
   JSI ABI; with `-UseV8Sandbox` also initializes the client API, opens a dedicated
   broker/session, runs a guest assertion, pumps callbacks with a bounded timeout,
   and closes the session. Requires `sbox.exe`, `v8host.dll`, and `v8jsisb.dll`
-  beside the consumer; signed payloads are required by production verification.
+  beside the consumer in `bin\<Configuration>\<arch>\` (`x64` or
+  `arm64`, case-insensitive); signed payloads are required by production
+  verification. The smoke first checks, with MSBuild only, that an output
+  directory not named for the architecture fails with `V8HOST001`.
   x86 consumers require an installed native payload layout (x64 on x64 Windows),
   not an x86 worker; this package-surface smoke does not qualify cross-arch pairs.
 - `run-snapshot.ps1` — **scenario 2 (startup snapshot):** builds a snapshot with

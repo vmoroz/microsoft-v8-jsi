@@ -14,6 +14,8 @@
 # v8host.dll.lib and copy v8jsisb.dll / sbox.exe / v8host.dll) and the EXE then
 # drives v8jsisb.dll through JSI and runs a session through the client API. Use it
 # only when the restored package actually carries the sandbox binaries.
+# consumer.vcxproj puts the EXE and copy-local payload in
+# bin\<Configuration>\<Platform>\ (x64 or arm64 for sandbox consumers).
 #
 # Exit codes:
 #   0 = smoke green
@@ -41,6 +43,25 @@ if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $harnessDir '..')).Pa
 $PkgDir = Get-PkgDir -RepoRoot $RepoRoot -PkgDir $PkgDir
 $rid = Get-Rid -Platform $Platform
 $pkg = Restore-V8Package -HarnessDir $harnessDir -PkgDir $PkgDir -Rid $rid
+
+if ($UseV8Sandbox) {
+    # Exercise only the package validation target: no compilation or binary copy.
+    $msbuild = Get-MSBuild
+    $invalidOutDir = Join-Path $harnessDir 'bin\invalid-sandbox-layout'
+    $validation = & $msbuild (Join-Path $harnessDir 'consumer.vcxproj') `
+        "/t:V8HostSandboxValidateOutputDirectory_$rid" `
+        "/p:Configuration=$Configuration" "/p:Platform=$Platform" `
+        "/p:V8JsiPackageProps=$($pkg.PkgProps)" `
+        "/p:V8JsiPackageTargets=$($pkg.PkgTargets)" `
+        "/p:V8JsiRuntimeIdentifier=$rid" /p:UseV8Sandbox=true `
+        "/p:OutDir=$invalidOutDir" /nologo /v:minimal 2>&1
+    $validationExit = $LASTEXITCODE
+    $validation | Out-Host
+    if ($validationExit -eq 0 -or ($validation -join "`n") -notmatch 'V8HOST001') {
+        throw 'Expected invalid sandbox output directory to fail with V8HOST001.'
+    }
+    Write-Host 'tests: invalid sandbox output directory rejected (V8HOST001)'
+}
 
 $exe = Build-Consumer -HarnessDir $harnessDir -Configuration $Configuration `
     -Platform $Platform -Rid $rid -PkgProps $pkg.PkgProps -PkgTargets $pkg.PkgTargets `

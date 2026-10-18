@@ -56,6 +56,19 @@ different versions in separate install roots rather than mixing files.
 A cross-architecture client DLL belongs in its own architecture directory,
 beside the native payload directory.
 
+NuGet stages the payload and import library under `build\native\<rid>` before
+packing. The per-RID package puts the binaries in `runtimes\<rid>\native` and
+keeps import libraries in `build\native\<rid>`; the legacy package keeps both
+under `build\native\<rid>`. With `UseV8Sandbox=True`, the targets copy
+`sbox.exe`, `v8host.dll`, and `v8jsisb.dll` beside the application, without
+relocating its output. Set `<OutDir>...\x64\</OutDir>` (or `arm64`) and keep
+`TargetDir` equal to `OutDir`. The directory name is case-insensitive.
+Otherwise the build fails with `V8HOST001`: "UseV8Sandbox requires the
+application and payload together in an output directory named 'x64'"
+(or 'arm64'), followed by the property to set and the same-version-set rule.
+This puts the application beneath the broker's install root for shared mode.
+The same output layout is required for local developer-trust packages.
+
 The required selection rule uses the native OS architecture, not the client's
 pointer size. A same-architecture client uses the directory of its own
 `v8host.dll`; a cross-architecture client uses the sibling
