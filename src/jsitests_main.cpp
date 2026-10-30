@@ -1202,6 +1202,39 @@ TEST(JsiAbiSnapshot, CheckAndCreateArgs) {
   v8_jsi_abi_snapshot_destroy(nullptr);
 }
 
+// RN's RuntimeScheduler retries drainMicrotasks() until it returns true and
+// throws "Hits microtasks retries bound" after 255 attempts.
+TEST(JsiAbiMicrotasks, DrainReportsDrained) {
+  for (bool explicitPolicy : {false, true}) {
+    SCOPED_TRACE(explicitPolicy ? "explicit policy" : "auto policy");
+    jsi_configure_runtime_cb configure = [](void *user_data, jsi_config cfg) -> jsi_status {
+      // The first runtime in the process fixes V8's flags; keep the GC API
+      // that other tests rely on.
+      v8_jsi_abi_config_set_gc_api_enabled(cfg, true);
+      return v8_jsi_abi_config_set_explicit_microtask_policy(cfg, *static_cast<bool *>(user_data));
+    };
+    std::shared_ptr<facebook::jsi::Runtime> runtime =
+        ::jsi::abi::makeJsiAbiRuntime(&v8_jsi_abi_runtime_create, configure, &explicitPolicy);
+    facebook::jsi::Runtime &rt = *runtime;
+
+    EXPECT_TRUE(rt.drainMicrotasks());
+
+    rt.global().setProperty(rt, "count", 0);
+    facebook::jsi::Function microtask =
+        rt.evaluateJavaScript(
+              std::make_shared<facebook::jsi::StringBuffer>("(function () { count++; })"),
+              "microtask.js")
+            .asObject(rt)
+            .asFunction(rt);
+    rt.queueMicrotask(microtask);
+    EXPECT_TRUE(rt.drainMicrotasks());
+    EXPECT_TRUE(rt.drainMicrotasks());
+    // With kAuto, V8 runs pending microtasks when a top-level call returns.
+    rt.evaluateJavaScript(std::make_shared<facebook::jsi::StringBuffer>("0"), "flush.js");
+    EXPECT_EQ(rt.global().getProperty(rt, "count").getNumber(), 1);
+  }
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

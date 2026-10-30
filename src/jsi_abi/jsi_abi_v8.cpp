@@ -1682,9 +1682,12 @@ jsi_status JSI_ABI_CDECL jsi_drain_microtasks(
   auto *state = getState(rt);
   V8Scope scope(state);
 
+  // A checkpoint runs the queue until it is empty, and with kAuto V8 drains it
+  // after each top-level call. RN's RuntimeScheduler retries until it sees true.
   if (state->isolate->GetMicrotasksPolicy() == v8::MicrotasksPolicy::kExplicit)
     state->isolate->PerformMicrotaskCheckpoint();
 
+  *out_drained = true;
   return jsi_status_ok;
 }
 
